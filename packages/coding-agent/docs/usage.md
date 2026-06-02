@@ -113,7 +113,7 @@ Append to the default prompt without replacing it with `APPEND_SYSTEM.md` in tho
 
 ### Project Trust
 
-Interactive startup asks before loading `.pi` in a working directory whose trust has not been set. Decisions are stored in `~/.pi/agent/trust.json` by CWD: `true` loads project config, `false` skips it, and missing/null asks again. Use `/trust yes`, `/trust no`, `/trust reset`, or `/trust` to update the current CWD. Use `--force`/`-f` to load project config for one run regardless of trust.
+Interactive startup asks before loading `.pi` in a working directory whose trust has not been set. Decisions are stored in `~/.pi/agent/trust.json` by CWD: `true` loads project config, `false` skips it, and a missing entry asks again. Use `/trust yes`, `/trust no`, `/trust reset`, or `/trust` to update the current CWD. Use `--force`/`-f` to load project config for one run regardless of trust.
 
 ## Exporting and Sharing Sessions
 

@@ -342,6 +342,19 @@ Content`,
 			expect(loader.getSystemPrompt()).toBe("Global system prompt.");
 		});
 
+		it("should skip .pi extensions when project config is not trusted", async () => {
+			const extensionsDir = join(cwd, ".pi", "extensions");
+			mkdirSync(extensionsDir, { recursive: true });
+			writeFileSync(join(extensionsDir, "project.ts"), `throw new Error("should not load");`);
+			const settingsManager = SettingsManager.create(cwd, agentDir, { projectConfigTrusted: false });
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+			await loader.reload();
+
+			expect(loader.getExtensions().extensions).toHaveLength(0);
+			expect(loader.getExtensions().errors).toEqual([]);
+		});
+
 		it("should discover APPEND_SYSTEM.md", async () => {
 			const piDir = join(cwd, ".pi");
 			mkdirSync(piDir, { recursive: true });

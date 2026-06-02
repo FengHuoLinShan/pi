@@ -45,12 +45,8 @@ import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
-import {
-	handleConfigCommand,
-	handlePackageCommand,
-	packageCommandForcesProjectConfigTrust,
-} from "./package-manager-cli.ts";
-import { canonicalizePath, isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
+import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
+import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
 /**
@@ -441,18 +437,6 @@ function resolveCliPaths(cwd: string, paths: string[] | undefined): string[] | u
 	return paths?.map((value) => (isLocalPath(value) ? resolvePath(value, cwd) : value));
 }
 
-function getSessionTrustOverrideKey(cwd: string): string {
-	return canonicalizePath(resolvePath(cwd));
-}
-
-function isPackageCommandArg(arg: string | undefined): boolean {
-	return arg === "install" || arg === "remove" || arg === "uninstall" || arg === "update" || arg === "list";
-}
-
-function hasForceFlag(args: string[]): boolean {
-	return args.includes("--force") || args.includes("-f");
-}
-
 async function showStartupSelector<T>(
 	settingsManager: SettingsManager,
 	title: string,
@@ -500,59 +484,45 @@ async function promptForMissingSessionCwd(
 	]);
 }
 
-interface ProjectTrustPromptResult {
-	trusted: boolean;
-	remember: boolean;
-}
-
-async function promptForProjectTrust(cwd: string, settingsManager: SettingsManager): Promise<ProjectTrustPromptResult> {
-	const selected = await showStartupSelector(
+async function promptForProjectTrust(cwd: string, settingsManager: SettingsManager): Promise<boolean | undefined> {
+	return showStartupSelector(
 		settingsManager,
 		`Trust project configuration?\nLoad .pi from ${cwd}?\nWarning: Project extensions can execute code.`,
 		[
-			{ label: "Yes (remember)", value: { trusted: true, remember: true } },
-			{ label: "Yes (this session)", value: { trusted: true, remember: false } },
-			{ label: "No (remember)", value: { trusted: false, remember: true } },
-			{ label: "No (this session)", value: { trusted: false, remember: false } },
+			{ label: "Trust", value: true },
+			{ label: "Don't trust", value: false },
 		],
 	);
-	return selected ?? { trusted: false, remember: false };
-}
-
-interface ProjectTrustResolution {
-	trusted: boolean;
-	sessionOverride?: boolean;
 }
 
 async function resolveProjectConfigTrusted(options: {
 	cwd: string;
-	agentDir: string;
-	sessionTrustOverride: boolean | undefined;
+	trustStore: ProjectTrustStore;
+	force: boolean;
 	appMode: AppMode;
 	settingsManagerForPrompt: SettingsManager;
-}): Promise<ProjectTrustResolution> {
-	if (options.sessionTrustOverride !== undefined) {
-		return { trusted: options.sessionTrustOverride };
+}): Promise<boolean> {
+	if (options.force) {
+		return true;
 	}
 	if (!hasProjectConfig(options.cwd)) {
-		return { trusted: false };
+		return false;
 	}
 
-	const trustStore = new ProjectTrustStore(options.agentDir);
-	const decision = trustStore.get(options.cwd);
+	const decision = options.trustStore.get(options.cwd);
 	if (decision !== null) {
-		return { trusted: decision };
+		return decision;
 	}
 	if (options.appMode !== "interactive") {
-		return { trusted: false };
+		return false;
 	}
 
-	const result = await promptForProjectTrust(options.cwd, options.settingsManagerForPrompt);
-	if (result.remember) {
-		trustStore.set(options.cwd, result.trusted);
-		return { trusted: result.trusted };
+	const selected = await promptForProjectTrust(options.cwd, options.settingsManagerForPrompt);
+	if (selected !== undefined) {
+		options.trustStore.set(options.cwd, selected);
+		return selected;
 	}
-	return { trusted: result.trusted, sessionOverride: result.trusted };
+	return false;
 }
 
 export interface MainOptions {
@@ -571,27 +541,12 @@ export async function main(args: string[], options?: MainOptions) {
 		cleanupWindowsSelfUpdateQuarantine(getPackageDir());
 	}
 
-	if (isPackageCommandArg(args[0]) || args[0] === "config") {
-		const cwd = process.cwd();
-		const agentDir = getAgentDir();
-		const projectConfigExists = hasProjectConfig(cwd);
-		const forceProjectConfigTrusted =
-			args[0] === "config" ? hasForceFlag(args) : packageCommandForcesProjectConfigTrust(args);
-		const promptSettingsManager = SettingsManager.create(cwd, agentDir, { projectConfigTrusted: false });
-		const projectTrustResolution = await resolveProjectConfigTrusted({
-			cwd,
-			agentDir,
-			sessionTrustOverride: forceProjectConfigTrusted ? true : undefined,
-			appMode: process.stdin.isTTY ? "interactive" : "print",
-			settingsManagerForPrompt: promptSettingsManager,
-		});
-		const projectConfigTrusted = forceProjectConfigTrusted || projectTrustResolution.trusted;
-		if (await handlePackageCommand(args, { projectConfigTrusted, projectConfigExists })) {
-			return;
-		}
-		if (await handleConfigCommand(args, { projectConfigTrusted, projectConfigExists })) {
-			return;
-		}
+	if (await handlePackageCommand(args)) {
+		return;
+	}
+
+	if (await handleConfigCommand(args)) {
+		return;
 	}
 
 	const parsed = parseArgs(args);
@@ -643,21 +598,14 @@ export async function main(args: string[], options?: MainOptions) {
 	const promptSettingsManager = SettingsManager.create(cwd, agentDir, { projectConfigTrusted: false });
 	const trustPromptMode: AppMode = parsed.help || parsed.listModels !== undefined ? "print" : appMode;
 	const forceProjectConfigTrusted = parsed.force === true;
-	const sessionTrustOverrides = new Map<string, boolean>();
-	const getSessionTrustOverride = (targetCwd: string): boolean | undefined => {
-		return forceProjectConfigTrusted ? true : sessionTrustOverrides.get(getSessionTrustOverrideKey(targetCwd));
-	};
-	const startupTrustResolution = await resolveProjectConfigTrusted({
+	const trustStore = new ProjectTrustStore(agentDir);
+	const startupProjectConfigTrusted = await resolveProjectConfigTrusted({
 		cwd,
-		agentDir,
-		sessionTrustOverride: getSessionTrustOverride(cwd),
+		trustStore,
+		force: forceProjectConfigTrusted,
 		appMode: trustPromptMode,
 		settingsManagerForPrompt: promptSettingsManager,
 	});
-	if (startupTrustResolution.sessionOverride !== undefined) {
-		sessionTrustOverrides.set(getSessionTrustOverrideKey(cwd), startupTrustResolution.sessionOverride);
-	}
-	const startupProjectConfigTrusted = startupTrustResolution.trusted;
 	// Legacy extension migrations are intentional filesystem housekeeping and run
 	// regardless of trust. Trust gates loading/executing project config, not moving
 	// old Pi config directories to the current layout.
@@ -704,24 +652,15 @@ export async function main(args: string[], options?: MainOptions) {
 	time("createSessionManager");
 
 	const initialRuntimeCwd = sessionManager.getCwd();
-	let runtimeProjectConfigTrusted = startupProjectConfigTrusted;
 	if (initialRuntimeCwd !== cwd) {
-		const runtimeTrustResolution = await resolveProjectConfigTrusted({
+		await resolveProjectConfigTrusted({
 			cwd: initialRuntimeCwd,
-			agentDir,
-			sessionTrustOverride: getSessionTrustOverride(initialRuntimeCwd),
+			trustStore,
+			force: forceProjectConfigTrusted,
 			appMode: trustPromptMode,
 			settingsManagerForPrompt: promptSettingsManager,
 		});
-		if (runtimeTrustResolution.sessionOverride !== undefined) {
-			sessionTrustOverrides.set(
-				getSessionTrustOverrideKey(initialRuntimeCwd),
-				runtimeTrustResolution.sessionOverride,
-			);
-		}
-		runtimeProjectConfigTrusted = runtimeTrustResolution.trusted;
 	}
-	const trustStore = new ProjectTrustStore(agentDir);
 	const resolvedExtensionPaths = resolveCliPaths(cwd, parsed.extensions);
 	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
@@ -733,9 +672,7 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionManager,
 		sessionStartEvent,
 	}) => {
-		const projectConfigTrusted =
-			getSessionTrustOverride(cwd) ??
-			(cwd === initialRuntimeCwd ? runtimeProjectConfigTrusted : trustStore.get(cwd) === true);
+		const projectConfigTrusted = forceProjectConfigTrusted || (hasProjectConfig(cwd) && trustStore.get(cwd) === true);
 		const runtimeSettingsManager = SettingsManager.create(cwd, agentDir, { projectConfigTrusted });
 		const services = await createAgentSessionServices({
 			cwd,
@@ -897,18 +834,6 @@ export async function main(args: string[], options?: MainOptions) {
 			initialMessages: parsed.messages,
 			verbose: parsed.verbose,
 			forceProjectConfigTrust: forceProjectConfigTrusted,
-			setProjectConfigTrustOverride: (overrideCwd, trusted) => {
-				const key = getSessionTrustOverrideKey(overrideCwd);
-				if (trusted === undefined) {
-					sessionTrustOverrides.delete(key);
-				} else {
-					sessionTrustOverrides.set(key, trusted);
-				}
-				if (key === getSessionTrustOverrideKey(initialRuntimeCwd)) {
-					runtimeProjectConfigTrusted =
-						getSessionTrustOverride(initialRuntimeCwd) ?? trustStore.get(initialRuntimeCwd) === true;
-				}
-			},
 		});
 		if (startupBenchmark) {
 			await interactiveMode.init();

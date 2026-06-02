@@ -14,7 +14,7 @@ import {
 } from "./config.ts";
 import { DefaultPackageManager } from "./core/package-manager.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
-import { hasProjectConfig } from "./core/trust-manager.ts";
+import { hasProjectConfig, ProjectTrustStore } from "./core/trust-manager.ts";
 import { spawnProcess } from "./utils/child-process.ts";
 import { getLatestPiRelease, isNewerPackageVersion } from "./utils/version-check.ts";
 import {
@@ -54,11 +54,6 @@ interface PackageCommandOptions {
 	invalidArgument?: string;
 	missingOptionValue?: string;
 	conflictingOptions?: string;
-}
-
-interface ProjectConfigCommandContext {
-	projectConfigTrusted?: boolean;
-	projectConfigExists?: boolean;
 }
 
 function reportSettingsErrors(settingsManager: SettingsManager, context: string): void {
@@ -295,14 +290,6 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 	};
 }
 
-export function packageCommandForcesProjectConfigTrust(args: string[]): boolean {
-	const options = parsePackageCommand(args);
-	return (
-		options?.force === true &&
-		(options.command === "install" || options.command === "remove" || options.command === "list")
-	);
-}
-
 function updateTargetIncludesSelf(target: UpdateTarget): boolean {
 	return target.type === "all" || target.type === "self";
 }
@@ -404,16 +391,20 @@ function prepareWindowsNpmSelfUpdate(): void {
 	quarantineWindowsNativeDependencies(packageDir);
 }
 
-export async function handleConfigCommand(args: string[], context: ProjectConfigCommandContext = {}): Promise<boolean> {
+export async function handleConfigCommand(args: string[]): Promise<boolean> {
 	if (args[0] !== "config") {
 		return false;
 	}
 
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();
-	const settingsManager = SettingsManager.create(cwd, agentDir, {
-		projectConfigTrusted: context.projectConfigTrusted ?? true,
-	});
+	const projectConfigExists = hasProjectConfig(cwd);
+	const projectConfigTrusted =
+		!projectConfigExists ||
+		args.includes("--force") ||
+		args.includes("-f") ||
+		new ProjectTrustStore(agentDir).get(cwd) === true;
+	const settingsManager = SettingsManager.create(cwd, agentDir, { projectConfigTrusted });
 	reportSettingsErrors(settingsManager, "config command");
 	const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
 	const resolvedPaths = await packageManager.resolve();
@@ -428,10 +419,7 @@ export async function handleConfigCommand(args: string[], context: ProjectConfig
 	process.exit(0);
 }
 
-export async function handlePackageCommand(
-	args: string[],
-	context: ProjectConfigCommandContext = {},
-): Promise<boolean> {
+export async function handlePackageCommand(args: string[]): Promise<boolean> {
 	const options = parsePackageCommand(args);
 	if (!options) {
 		return false;
@@ -479,20 +467,22 @@ export async function handlePackageCommand(
 	}
 
 	const cwd = process.cwd();
-	const projectConfigTrusted = context.projectConfigTrusted ?? true;
-	const projectConfigExists = context.projectConfigExists ?? hasProjectConfig(cwd);
+	const agentDir = getAgentDir();
+	const projectConfigExists = hasProjectConfig(cwd);
 	const writesProjectPackageConfig = (options.command === "install" || options.command === "remove") && options.local;
+	const commandForcesProjectConfigTrust =
+		options.force && (options.command === "install" || options.command === "remove" || options.command === "list");
+	const projectConfigTrusted =
+		commandForcesProjectConfigTrust ||
+		(projectConfigExists && new ProjectTrustStore(agentDir).get(cwd) === true) ||
+		(writesProjectPackageConfig && !projectConfigExists);
 	if (!projectConfigTrusted && projectConfigExists && writesProjectPackageConfig) {
 		console.error(chalk.red("Project config is not trusted. Use --force to modify local package config."));
 		process.exitCode = 1;
 		return true;
 	}
 
-	const agentDir = getAgentDir();
-	const effectiveProjectConfigTrusted = projectConfigTrusted || (writesProjectPackageConfig && !projectConfigExists);
-	const settingsManager = SettingsManager.create(cwd, agentDir, {
-		projectConfigTrusted: effectiveProjectConfigTrusted,
-	});
+	const settingsManager = SettingsManager.create(cwd, agentDir, { projectConfigTrusted });
 	reportSettingsErrors(settingsManager, "package command");
 	const selfUpdateNpmCommand = settingsManager.getGlobalSettings().npmCommand;
 

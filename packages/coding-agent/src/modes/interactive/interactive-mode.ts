@@ -258,8 +258,6 @@ export interface InteractiveModeOptions {
 	verbose?: boolean;
 	/** Force project config trust for this process */
 	forceProjectConfigTrust?: boolean;
-	/** Update project config trust override for this session and cwd */
-	setProjectConfigTrustOverride?: (cwd: string, trusted: boolean | undefined) => void;
 }
 
 export class InteractiveMode {
@@ -4949,25 +4947,22 @@ export class InteractiveMode {
 		return "ask";
 	}
 
-	private async selectTrustDecision(): Promise<{ decision: ProjectTrustDecision; remember: boolean } | undefined> {
+	private async selectTrustDecision(): Promise<ProjectTrustDecision | undefined> {
 		const trustStore = new ProjectTrustStore(getAgentDir());
 		const cwd = this.sessionManager.getCwd();
 		const current = this.formatTrustDecision(trustStore.get(cwd));
 		const choice = await this.showExtensionSelector(
 			`Trust project configuration?\nCurrent setting: ${current}\nLoad .pi from ${cwd}?\nWarning: Project extensions can execute code.`,
-			["Yes (remember)", "Yes (this session)", "No (remember)", "No (this session)"],
+			["Trust", "Don't trust", "Reset"],
 		);
-		if (choice === "Yes (remember)") {
-			return { decision: true, remember: true };
+		if (choice === "Trust") {
+			return true;
 		}
-		if (choice === "Yes (this session)") {
-			return { decision: true, remember: false };
+		if (choice === "Don't trust") {
+			return false;
 		}
-		if (choice === "No (remember)") {
-			return { decision: false, remember: true };
-		}
-		if (choice === "No (this session)") {
-			return { decision: false, remember: false };
+		if (choice === "Reset") {
+			return null;
 		}
 		return undefined;
 	}
@@ -4983,40 +4978,31 @@ export class InteractiveMode {
 		}
 
 		const rawArg = text === "/trust" ? "" : text.slice("/trust".length).trim().toLowerCase();
-		let selection: { decision: ProjectTrustDecision; remember: boolean } | undefined;
+		let decision: ProjectTrustDecision | undefined;
 		if (!rawArg) {
-			selection = await this.selectTrustDecision();
+			decision = await this.selectTrustDecision();
 		} else if (rawArg === "yes") {
-			selection = { decision: true, remember: true };
+			decision = true;
 		} else if (rawArg === "no") {
-			selection = { decision: false, remember: true };
+			decision = false;
 		} else if (rawArg === "reset") {
-			selection = { decision: null, remember: true };
+			decision = null;
 		} else {
 			this.showError("Usage: /trust [yes|no|reset]");
 			return;
 		}
 
-		if (selection === undefined) {
+		if (decision === undefined) {
 			return;
 		}
 
 		const trustStore = new ProjectTrustStore(getAgentDir());
 		const cwd = this.sessionManager.getCwd();
-		if (selection.remember) {
-			trustStore.set(cwd, selection.decision);
-			this.options.setProjectConfigTrustOverride?.(cwd, undefined);
-		} else {
-			this.options.setProjectConfigTrustOverride?.(
-				cwd,
-				selection.decision === null ? undefined : selection.decision,
-			);
-		}
-		const projectConfigTrusted = this.options.forceProjectConfigTrust === true || selection.decision === true;
+		trustStore.set(cwd, decision);
+		const projectConfigTrusted = this.options.forceProjectConfigTrust === true || decision === true;
 		this.settingsManager.setProjectConfigTrusted(projectConfigTrusted);
 		await this.handleReloadCommand();
-		const suffix = selection.remember ? "" : " (this session)";
-		this.showStatus(`Project trust: ${this.formatTrustDecision(selection.decision)}${suffix}`);
+		this.showStatus(`Project trust: ${this.formatTrustDecision(decision)}`);
 	}
 
 	private async handleReloadCommand(): Promise<void> {
