@@ -268,6 +268,20 @@ describe("SettingsManager", () => {
 			expect(manager.getTheme()).toBe("global");
 			expect(manager.getProjectSettings()).toEqual({});
 		});
+
+		it("should fail project settings writes when project config is not trusted", async () => {
+			const projectSettingsPath = join(projectDir, ".pi", "settings.json");
+			writeFileSync(projectSettingsPath, JSON.stringify({ packages: ["npm:existing"] }));
+			const manager = SettingsManager.create(projectDir, agentDir, { projectConfigTrusted: false });
+
+			expect(() => manager.setProjectPackages(["npm:new"])).toThrow(
+				"Project config is not trusted; refusing to write project settings",
+			);
+			await manager.flush();
+
+			expect(manager.getProjectSettings()).toEqual({});
+			expect(JSON.parse(readFileSync(projectSettingsPath, "utf-8"))).toEqual({ packages: ["npm:existing"] });
+		});
 	});
 
 	describe("httpIdleTimeoutMs", () => {

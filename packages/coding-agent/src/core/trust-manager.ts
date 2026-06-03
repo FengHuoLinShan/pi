@@ -51,6 +51,47 @@ function writeTrustFile(path: string, data: TrustFile): void {
 	writeFileSync(path, `${JSON.stringify(sorted, null, 2)}\n`, "utf-8");
 }
 
+function acquireTrustLockSync(path: string): () => void {
+	const trustDir = dirname(path);
+	mkdirSync(trustDir, { recursive: true });
+	const maxAttempts = 10;
+	const delayMs = 20;
+	let lastError: unknown;
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		try {
+			return lockfile.lockSync(trustDir, { realpath: false, lockfilePath: `${path}.lock` });
+		} catch (error) {
+			const code =
+				typeof error === "object" && error !== null && "code" in error
+					? String((error as { code?: unknown }).code)
+					: undefined;
+			if (code !== "ELOCKED" || attempt === maxAttempts) {
+				throw error;
+			}
+			lastError = error;
+			const start = Date.now();
+			while (Date.now() - start < delayMs) {
+				// Sleep synchronously to avoid changing trust store callers to async.
+			}
+		}
+	}
+
+	if (lastError instanceof Error) {
+		throw lastError;
+	}
+	throw new Error("Failed to acquire trust store lock");
+}
+
+function withTrustFileLock<T>(path: string, fn: () => T): T {
+	const release = acquireTrustLockSync(path);
+	try {
+		return fn();
+	} finally {
+		release();
+	}
+}
+
 export function hasProjectConfig(cwd: string): boolean {
 	const resolvedCwd = resolvePath(cwd);
 	return existsSync(join(resolvedCwd, CONFIG_DIR_NAME));
@@ -64,19 +105,15 @@ export class ProjectTrustStore {
 	}
 
 	get(cwd: string): ProjectTrustDecision {
-		const data = readTrustFile(this.trustPath);
-		const value = data[normalizeCwd(cwd)];
-		return value === true || value === false ? value : null;
+		return withTrustFileLock(this.trustPath, () => {
+			const data = readTrustFile(this.trustPath);
+			const value = data[normalizeCwd(cwd)];
+			return value === true || value === false ? value : null;
+		});
 	}
 
 	set(cwd: string, decision: ProjectTrustDecision): void {
-		const trustDir = dirname(this.trustPath);
-		mkdirSync(trustDir, { recursive: true });
-		let release: (() => void) | undefined;
-		try {
-			// Lock before reading or creating trust.json so malformed content cannot be
-			// silently replaced by a concurrent or follow-up write.
-			release = lockfile.lockSync(trustDir, { realpath: false, lockfilePath: `${this.trustPath}.lock` });
+		withTrustFileLock(this.trustPath, () => {
 			const data = readTrustFile(this.trustPath);
 			const key = normalizeCwd(cwd);
 			if (decision === null) {
@@ -85,8 +122,6 @@ export class ProjectTrustStore {
 				data[key] = decision;
 			}
 			writeTrustFile(this.trustPath, data);
-		} finally {
-			release?.();
-		}
+		});
 	}
 }

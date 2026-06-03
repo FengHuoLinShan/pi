@@ -224,8 +224,7 @@ export class FileSettingsStorage implements SettingsStorage {
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
 		if (scope === "project" && !this.projectConfigTrusted) {
-			fn(undefined);
-			return;
+			throw new Error("Project config is not trusted; refusing to access project settings");
 		}
 
 		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
@@ -273,8 +272,7 @@ export class InMemorySettingsStorage implements SettingsStorage {
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
 		if (scope === "project" && !this.projectConfigTrusted) {
-			fn(undefined);
-			return;
+			throw new Error("Project config is not trusted; refusing to access project settings");
 		}
 
 		const current = scope === "global" ? this.global : this.project;
@@ -366,6 +364,10 @@ export class SettingsManager {
 	}
 
 	private static loadFromStorage(storage: SettingsStorage, scope: SettingsScope): Settings {
+		if (scope === "project" && storage.isProjectConfigTrusted?.() === false) {
+			return {};
+		}
+
 		let content: string | undefined;
 		storage.withLock(scope, (current) => {
 			content = current;
@@ -531,6 +533,12 @@ export class SettingsManager {
 		}
 	}
 
+	private assertProjectConfigTrustedForWrite(): void {
+		if (!this.projectConfigTrusted) {
+			throw new Error("Project config is not trusted; refusing to write project settings");
+		}
+	}
+
 	private recordError(scope: SettingsScope, error: unknown): void {
 		const normalizedError = error instanceof Error ? error : new Error(String(error));
 		this.errors.push({ scope, error: normalizedError });
@@ -614,6 +622,7 @@ export class SettingsManager {
 	}
 
 	private saveProjectSettings(settings: Settings): void {
+		this.assertProjectConfigTrustedForWrite();
 		this.projectSettings = structuredClone(settings);
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 
@@ -899,6 +908,7 @@ export class SettingsManager {
 	}
 
 	setProjectPackages(packages: PackageSource[]): void {
+		this.assertProjectConfigTrustedForWrite();
 		const projectSettings = structuredClone(this.projectSettings);
 		projectSettings.packages = packages;
 		this.markProjectModified("packages");
@@ -916,6 +926,7 @@ export class SettingsManager {
 	}
 
 	setProjectExtensionPaths(paths: string[]): void {
+		this.assertProjectConfigTrustedForWrite();
 		const projectSettings = structuredClone(this.projectSettings);
 		projectSettings.extensions = paths;
 		this.markProjectModified("extensions");
@@ -933,6 +944,7 @@ export class SettingsManager {
 	}
 
 	setProjectSkillPaths(paths: string[]): void {
+		this.assertProjectConfigTrustedForWrite();
 		const projectSettings = structuredClone(this.projectSettings);
 		projectSettings.skills = paths;
 		this.markProjectModified("skills");
@@ -950,6 +962,7 @@ export class SettingsManager {
 	}
 
 	setProjectPromptTemplatePaths(paths: string[]): void {
+		this.assertProjectConfigTrustedForWrite();
 		const projectSettings = structuredClone(this.projectSettings);
 		projectSettings.prompts = paths;
 		this.markProjectModified("prompts");
@@ -967,6 +980,7 @@ export class SettingsManager {
 	}
 
 	setProjectThemePaths(paths: string[]): void {
+		this.assertProjectConfigTrustedForWrite();
 		const projectSettings = structuredClone(this.projectSettings);
 		projectSettings.themes = paths;
 		this.markProjectModified("themes");
