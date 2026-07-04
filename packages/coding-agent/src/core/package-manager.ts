@@ -774,31 +774,20 @@ function applyPatterns(allPaths: string[], patterns: string[], baseDir: string):
 }
 
 function applyAutoloadDisabledPatterns(allPaths: string[], patterns: string[], baseDir: string): Map<string, boolean> {
-	const includes: string[] = [];
-	const excludes: string[] = [];
-	const forceIncludes: string[] = [];
-	const forceExcludes: string[] = [];
-
-	for (const pattern of patterns) {
-		if (pattern.startsWith("+")) {
-			forceIncludes.push(pattern.slice(1));
-		} else if (pattern.startsWith("-")) {
-			forceExcludes.push(pattern.slice(1));
-		} else if (pattern.startsWith("!")) {
-			excludes.push(pattern.slice(1));
-		} else {
-			includes.push(pattern);
-		}
-	}
-
 	const result = new Map<string, boolean>();
-	for (const filePath of allPaths) {
-		let enabled: boolean | undefined;
-		if (matchesAnyPattern(filePath, includes, baseDir)) enabled = true;
-		if (matchesAnyPattern(filePath, excludes, baseDir)) enabled = false;
-		if (matchesAnyExactPattern(filePath, forceIncludes, baseDir)) enabled = true;
-		if (matchesAnyExactPattern(filePath, forceExcludes, baseDir)) enabled = false;
-		if (enabled !== undefined) result.set(filePath, enabled);
+	for (const pattern of patterns) {
+		const target = pattern.slice(
+			pattern.startsWith("+") || pattern.startsWith("-") || pattern.startsWith("!") ? 1 : 0,
+		);
+		const enabled = !pattern.startsWith("-") && !pattern.startsWith("!");
+		const exact = pattern.startsWith("+") || pattern.startsWith("-");
+		for (const filePath of allPaths) {
+			if (
+				exact ? matchesAnyExactPattern(filePath, [target], baseDir) : matchesAnyPattern(filePath, [target], baseDir)
+			) {
+				result.set(filePath, enabled);
+			}
+		}
 	}
 	return result;
 }
@@ -1256,38 +1245,39 @@ export class DefaultPackageManager implements PackageManager {
 		for (const { pkg, scope } of sources) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 			const filter = typeof pkg === "object" ? pkg : undefined;
-			const parsed = this.parseSource(sourceStr);
+			const deltaBase = this.findAutoloadDeltaBase(pkg, scope, sources);
+			const resolvedSource = deltaBase?.source ?? sourceStr;
+			const resolvedScope = deltaBase?.scope ?? scope;
+			const parsed = this.parseSource(resolvedSource);
 			const metadata: PathMetadata = { source: sourceStr, scope, origin: "package" };
 
 			if (parsed.type === "local") {
-				const baseDir = this.getBaseDirForScope(scope);
+				const baseDir = this.getBaseDirForScope(resolvedScope);
 				this.resolveLocalExtensionSource(parsed, accumulator, filter, metadata, baseDir);
 				continue;
 			}
 
 			const installMissing = async (): Promise<boolean> => {
-				if (isOfflineModeEnabled()) {
-					return false;
-				}
+				if (isOfflineModeEnabled()) return false;
 				if (!onMissing) {
-					await this.installParsedSource(parsed, scope);
+					await this.installParsedSource(parsed, resolvedScope);
 					return true;
 				}
-				const action = await onMissing(sourceStr);
+				const action = await onMissing(resolvedSource);
 				if (action === "skip") return false;
-				if (action === "error") throw new Error(`Missing source: ${sourceStr}`);
-				await this.installParsedSource(parsed, scope);
+				if (action === "error") throw new Error(`Missing source: ${resolvedSource}`);
+				await this.installParsedSource(parsed, resolvedScope);
 				return true;
 			};
 
 			if (parsed.type === "npm") {
-				let installedPath = this.getNpmInstallPath(parsed, scope);
+				let installedPath = this.getNpmInstallPath(parsed, resolvedScope);
 				const needsInstall =
 					!existsSync(installedPath) || !(await this.installedNpmMatchesConfiguredVersion(parsed, installedPath));
 				if (needsInstall) {
 					const installed = await installMissing();
 					if (!installed) continue;
-					installedPath = this.getNpmInstallPath(parsed, scope);
+					installedPath = this.getNpmInstallPath(parsed, resolvedScope);
 				}
 				metadata.baseDir = installedPath;
 				this.collectPackageResources(installedPath, accumulator, filter, metadata);
@@ -1295,17 +1285,32 @@ export class DefaultPackageManager implements PackageManager {
 			}
 
 			if (parsed.type === "git") {
-				const installedPath = this.getGitInstallPath(parsed, scope);
+				const installedPath = this.getGitInstallPath(parsed, resolvedScope);
 				if (!existsSync(installedPath)) {
 					const installed = await installMissing();
 					if (!installed) continue;
-				} else if (scope === "temporary" && !parsed.pinned && !isOfflineModeEnabled()) {
-					await this.refreshTemporaryGitSource(parsed, sourceStr);
+				} else if (resolvedScope === "temporary" && !parsed.pinned && !isOfflineModeEnabled()) {
+					await this.refreshTemporaryGitSource(parsed, resolvedSource);
 				}
 				metadata.baseDir = installedPath;
 				this.collectPackageResources(installedPath, accumulator, filter, metadata);
 			}
 		}
+	}
+
+	private findAutoloadDeltaBase(
+		pkg: PackageSource,
+		scope: SourceScope,
+		sources: Array<{ pkg: PackageSource; scope: SourceScope }>,
+	): { source: string; scope: SourceScope } | undefined {
+		if (scope !== "project" || typeof pkg !== "object" || pkg.autoload !== false) return undefined;
+		const identity = this.getPackageIdentity(pkg.source, scope);
+		const userEntry = sources.find(
+			(entry) =>
+				entry.scope === "user" &&
+				this.getPackageIdentity(this.getPackageSourceString(entry.pkg), "user") === identity,
+		);
+		return userEntry ? { source: this.getPackageSourceString(userEntry.pkg), scope: "user" } : undefined;
 	}
 
 	private resolveLocalExtensionSource(
@@ -1692,26 +1697,21 @@ export class DefaultPackageManager implements PackageManager {
 	private dedupePackages(
 		packages: Array<{ pkg: PackageSource; scope: SourceScope }>,
 	): Array<{ pkg: PackageSource; scope: SourceScope }> {
-		const byIdentity = new Map<string, Array<{ pkg: PackageSource; scope: SourceScope }>>();
-		for (const entry of packages) {
-			const sourceStr = typeof entry.pkg === "string" ? entry.pkg : entry.pkg.source;
-			const identity = this.getPackageIdentity(sourceStr, entry.scope);
-			const group = byIdentity.get(identity);
-			if (group) {
-				group.push(entry);
-			} else {
-				byIdentity.set(identity, [entry]);
-			}
-		}
-
 		const result: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
-		for (const group of byIdentity.values()) {
-			const project = group.find((entry) => entry.scope === "project");
-			const user = group.find((entry) => entry.scope === "user");
-			if (project && user && typeof project.pkg === "object" && project.pkg.autoload === false) {
-				result.push(project, user);
-			} else {
-				result.push(project ?? group[0]);
+		const seen = new Map<string, number>();
+		for (const entry of packages) {
+			const identity = this.getPackageIdentity(this.getPackageSourceString(entry.pkg), entry.scope);
+			const index = seen.get(identity);
+			if (index === undefined) {
+				seen.set(identity, result.length);
+				result.push(entry);
+				continue;
+			}
+			const existing = result[index];
+			if (existing?.scope === "project" && entry.scope === "user") {
+				if (typeof existing.pkg === "object" && existing.pkg.autoload === false) result.push(entry);
+			} else if (entry.scope === "project") {
+				result[index] = entry;
 			}
 		}
 		return result;

@@ -422,7 +422,7 @@ pi update --extensions                  # update packages only
 pi update --self                        # update pi only
 pi update --self --force                # reinstall pi even if current
 pi update npm:@foo/pi-tools             # update one package
-pi config [-l]                          # enable/disable resources, -l for project-local selections
+pi config                               # enable/disable extensions, skills, prompts, themes
 ```
 
 Packages install to `~/.pi/agent/git/` (git) or `~/.pi/agent/npm/` (npm). Use `-l` for project-local installs (`.pi/git/`, `.pi/npm/`). Git `@ref` values are pinned tags or commits; pinned packages are skipped by `pi update --extensions` and `pi update --all`, so use `pi install git:host/user/repo@new-ref` to move an existing package to a new ref. Git packages install dependencies with `npm install --omit=dev` by default, so runtime deps must be listed under `dependencies`; when `npmCommand` is configured, git packages use plain `install` for compatibility with wrappers. If you use a Node version manager and want package installs to reuse a stable npm context, set `npmCommand` in `settings.json`, for example `["mise", "exec", "node@20", "--", "npm"]`.
@@ -523,10 +523,10 @@ pi update --self             # Update pi only
 pi update --self --force     # Reinstall pi even if current
 pi update --extension <src>  # Update one package
 pi list                      # List installed packages
-pi config [-l]               # Enable/disable package resources, -l for project-local selections
+pi config                    # Enable/disable package resources
 ```
 
-`pi config` starts in global settings; press Tab in the TUI to switch to project-local overrides (`.pi/settings.json`), or start there with `pi config -l`. `pi config` and project package commands accept `--approve`/`--no-approve` to trust or ignore project-local settings for one command. `pi update` never prompts for project trust.
+`pi config` and project package commands accept `--approve`/`--no-approve` to trust or ignore project-local settings for one command. `pi update` never prompts for project trust.
 
 ### Modes
 

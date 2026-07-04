@@ -25,6 +25,7 @@ import { keyHint, rawKeyHint } from "./keybinding-hints.ts";
 
 type ResourceType = "extensions" | "skills" | "prompts" | "themes";
 type ConfigWriteScope = "global" | "project";
+type SettingsScope = "user" | "project";
 type ProjectOverrideState = "inherit" | "load" | "unload";
 export type ScopedResolvedPaths = Record<ConfigWriteScope, ResolvedPaths>;
 
@@ -45,7 +46,6 @@ interface ResourceItem {
 	displayName: string;
 	groupKey: string;
 	subgroupKey: string;
-	projectOverride?: boolean;
 }
 
 interface ResourceSubgroup {
@@ -57,7 +57,6 @@ interface ResourceSubgroup {
 interface ResourceGroup {
 	key: string;
 	label: string;
-	displaySource: string;
 	scope: "user" | "project" | "temporary";
 	origin: "package" | "top-level";
 	source: string;
@@ -81,30 +80,9 @@ function formatBaseDir(baseDir: string): string {
 	return displayPath.endsWith("/") ? displayPath : `${displayPath}/`;
 }
 
-function getSettingsBaseDir(scope: ResourceGroup["scope"], cwd: string, agentDir: string): string {
-	if (scope === "project") {
-		return join(cwd, CONFIG_DIR_NAME);
-	}
-	if (scope === "user") {
-		return agentDir;
-	}
-	return cwd;
-}
-
-function getPackageDisplaySource(metadata: PathMetadata, cwd: string, agentDir: string): string {
-	if (!isLocalPath(metadata.source)) {
-		return metadata.source;
-	}
-	return resolvePath(metadata.source, getSettingsBaseDir(metadata.scope, cwd, agentDir), { trim: true }).replace(
-		/\\/g,
-		"/",
-	);
-}
-
-function getGroupLabel(metadata: PathMetadata, cwd: string, agentDir: string): string {
+function getGroupLabel(metadata: PathMetadata, agentDir: string): string {
 	if (metadata.origin === "package") {
-		const scopeLabel = metadata.scope === "user" ? "global" : metadata.scope;
-		return `${getPackageDisplaySource(metadata, cwd, agentDir)} (${scopeLabel})`;
+		return `${metadata.source} (${metadata.scope})`;
 	}
 	// Top-level resources
 	if (metadata.source === "auto") {
@@ -118,45 +96,7 @@ function getGroupLabel(metadata: PathMetadata, cwd: string, agentDir: string): s
 	return metadata.scope === "user" ? "User settings" : "Project settings";
 }
 
-function getResourceItemKey(resourceType: ResourceType, path: string): string {
-	return `${resourceType}:${canonicalizePath(path)}`;
-}
-
-function getEntryResourceItemKey(entry: FlatEntry): string | undefined {
-	return entry.type === "item" ? getResourceItemKey(entry.item.resourceType, entry.item.path) : undefined;
-}
-
-function getPatternEntryTarget(entry: string): string {
-	return entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-") ? entry.slice(1) : entry;
-}
-
-function getOverrideStateFromEntries(
-	entries: string[],
-	patterns: Set<string>,
-	options?: { plainEntryIsLoad?: boolean; emptyArrayIsUnload?: boolean },
-): ProjectOverrideState {
-	if (entries.length === 0 && options?.emptyArrayIsUnload) {
-		return "unload";
-	}
-
-	let state: ProjectOverrideState = "inherit";
-	for (const entry of entries) {
-		if (!patterns.has(getPatternEntryTarget(entry))) continue;
-		if (entry.startsWith("!") || entry.startsWith("-")) {
-			state = "unload";
-		} else if (entry.startsWith("+") || options?.plainEntryIsLoad) {
-			state = "load";
-		}
-	}
-	return state;
-}
-
-function buildGroups(
-	resolved: ResolvedPaths,
-	cwd: string,
-	agentDir: string,
-	writeScope: ConfigWriteScope,
-): ResourceGroup[] {
+function buildGroups(resolved: ResolvedPaths, agentDir: string): ResourceGroup[] {
 	const groupMap = new Map<string, ResourceGroup>();
 
 	const addToGroup = (resources: ResolvedResource[], resourceType: ResourceType) => {
@@ -167,9 +107,7 @@ function buildGroups(
 			if (!groupMap.has(groupKey)) {
 				groupMap.set(groupKey, {
 					key: groupKey,
-					label: getGroupLabel(metadata, cwd, agentDir),
-					displaySource:
-						metadata.origin === "package" ? getPackageDisplaySource(metadata, cwd, agentDir) : metadata.source,
+					label: getGroupLabel(metadata, agentDir),
 					scope: metadata.scope,
 					origin: metadata.origin,
 					source: metadata.source,
@@ -217,22 +155,9 @@ function buildGroups(
 	addToGroup(resolved.prompts, "prompts");
 	addToGroup(resolved.themes, "themes");
 
+	// Sort groups: packages first, then top-level; user before project
 	const groups = Array.from(groupMap.values());
 	groups.sort((a, b) => {
-		if (writeScope === "project") {
-			const projectRank = (group: ResourceGroup): number => {
-				if (group.scope === "project" && group.origin === "top-level") return 0;
-				if (group.scope === "project" && group.origin === "package") return 1;
-				if (group.scope === "user" && group.origin === "package") return 2;
-				if (group.scope === "user" && group.origin === "top-level") return 3;
-				return 4;
-			};
-			const rankDiff = projectRank(a) - projectRank(b);
-			if (rankDiff !== 0) return rankDiff;
-			return a.source.localeCompare(b.source);
-		}
-
-		// Global mode: packages first, then top-level; user before project.
 		if (a.origin !== b.origin) {
 			return a.origin === "package" ? -1 : 1;
 		}
@@ -277,25 +202,19 @@ class ConfigSelectorHeader implements Component {
 	render(width: number): string[] {
 		const title = theme.bold(this.writeScope === "project" ? "Project Local Resources" : "Global Resources");
 		const sep = theme.fg("muted", " · ");
-		const globalMode = this.writeScope === "global" ? theme.fg("accent", "global") : theme.fg("muted", "global");
-		const projectMode =
-			this.writeScope === "project" ? theme.fg("accent", "project local") : theme.fg("muted", "project local");
-		const modeIndicator = `${theme.fg("muted", "Mode: ")}${globalMode}${theme.fg("muted", " | ")}${projectMode}`;
-		const scopeHint =
-			this.writeScope === "project"
-				? theme.fg("muted", `${CONFIG_DIR_NAME}/settings.json · inherited global resources are dimmed`)
-				: theme.fg("muted", `~/${CONFIG_DIR_NAME}/agent/settings.json`);
 		const switchHint = this.projectModeAvailable ? keyHint("tui.input.tab", "switch mode") + sep : "";
 		const actionHint =
 			this.writeScope === "project" ? rawKeyHint("space", "cycle inherit/+/-") : rawKeyHint("space", "toggle");
 		const hint = switchHint + actionHint + sep + rawKeyHint("esc", "close");
-		const hintWidth = visibleWidth(hint);
-		const titleWidth = visibleWidth(title);
-		const spacing = Math.max(1, width - titleWidth - hintWidth);
+		const spacing = Math.max(1, width - visibleWidth(title) - visibleWidth(hint));
+		const scopeHint =
+			this.writeScope === "project"
+				? theme.fg("muted", `${CONFIG_DIR_NAME}/settings.json · inherited global resources are dimmed`)
+				: theme.fg("muted", `~/${CONFIG_DIR_NAME}/agent/settings.json`);
 
 		return [
 			truncateToWidth(`${title}${" ".repeat(spacing)}${hint}`, width, ""),
-			truncateToWidth(`${modeIndicator}${sep}${scopeHint}`, width, ""),
+			truncateToWidth(scopeHint, width, ""),
 		];
 	}
 }
@@ -335,14 +254,11 @@ class ResourceList implements Component, Focusable {
 		terminalHeight?: number,
 		writeScope: ConfigWriteScope = "global",
 	) {
+		this.groupsByScope = groupsByScope;
 		this.settingsManager = settingsManager;
 		this.cwd = cwd;
 		this.agentDir = agentDir;
 		this.writeScope = writeScope;
-		this.groupsByScope = {
-			global: groupsByScope.global,
-			project: this.mergeProjectPackageDeltaGroups(groupsByScope.project),
-		};
 		this.inheritedEnabledByKey = this.buildInheritedEnabledMap(groupsByScope.global);
 		this.searchInput = new Input();
 		// 8 lines of chrome: top spacer + top border + spacer + header (2 lines) + spacer + bottom spacer + bottom border
@@ -353,9 +269,6 @@ class ResourceList implements Component, Focusable {
 	}
 
 	setWriteScope(writeScope: ConfigWriteScope): void {
-		if (this.writeScope === writeScope) {
-			return;
-		}
 		this.writeScope = writeScope;
 		this.buildFlatList();
 		this.filterItems(this.searchInput.getValue());
@@ -370,79 +283,11 @@ class ResourceList implements Component, Focusable {
 		for (const group of groups) {
 			for (const subgroup of group.subgroups) {
 				for (const item of subgroup.items) {
-					result.set(getResourceItemKey(item.resourceType, item.path), item.enabled);
+					result.set(this.getResourceItemKey(item), item.enabled);
 				}
 			}
 		}
 		return result;
-	}
-
-	private mergeProjectPackageDeltaGroups(groups: ResourceGroup[]): ResourceGroup[] {
-		const mergedGroups: ResourceGroup[] = [];
-		for (const group of groups) {
-			if (
-				group.scope === "project" &&
-				group.origin === "package" &&
-				this.projectPackageAutoloadDisabled(group.source)
-			) {
-				const globalGroup = groups.find(
-					(candidate) =>
-						candidate.scope === "user" &&
-						candidate.origin === "package" &&
-						this.packageSourceStringMatches(candidate.source, "user", group.source, "project"),
-				);
-				if (globalGroup) {
-					continue;
-				}
-			}
-			if (group.scope !== "user" || group.origin !== "package") {
-				mergedGroups.push(group);
-				continue;
-			}
-
-			const projectGroup = groups.find(
-				(candidate) =>
-					candidate.scope === "project" &&
-					candidate.origin === "package" &&
-					this.projectPackageAutoloadDisabled(candidate.source) &&
-					this.packageSourceStringMatches(group.source, "user", candidate.source, "project"),
-			);
-			if (!projectGroup) {
-				mergedGroups.push(group);
-				continue;
-			}
-
-			mergedGroups.push(this.mergePackageGroups(group, projectGroup));
-		}
-		return mergedGroups;
-	}
-
-	private mergePackageGroups(globalGroup: ResourceGroup, projectGroup: ResourceGroup): ResourceGroup {
-		const subgroups: ResourceSubgroup[] = [];
-		for (const resourceType of RESOURCE_TYPES) {
-			const items = new Map<string, ResourceItem>();
-			for (const item of globalGroup.subgroups.find((entry) => entry.type === resourceType)?.items ?? []) {
-				items.set(item.path, item);
-			}
-			for (const item of projectGroup.subgroups.find((entry) => entry.type === resourceType)?.items ?? []) {
-				items.set(item.path, { ...item, projectOverride: true });
-			}
-			const mergedItems = Array.from(items.values()).sort((a, b) => a.displayName.localeCompare(b.displayName));
-			if (mergedItems.length > 0) {
-				subgroups.push({
-					type: resourceType,
-					label: RESOURCE_TYPE_LABELS[resourceType],
-					items: mergedItems,
-				});
-			}
-		}
-		return {
-			...globalGroup,
-			key: `${globalGroup.key}:project-delta:${projectGroup.key}`,
-			label: `${globalGroup.displaySource} (global with project-local overrides)`,
-			scope: "temporary",
-			subgroups,
-		};
 	}
 
 	private buildFlatList(): void {
@@ -461,11 +306,6 @@ class ResourceList implements Component, Focusable {
 		if (this.selectedIndex < 0) this.selectedIndex = 0;
 	}
 
-	private getSelectedItemKey(): string | undefined {
-		const entry = this.filteredItems[this.selectedIndex];
-		return entry ? getEntryResourceItemKey(entry) : undefined;
-	}
-
 	private findNextItem(fromIndex: number, direction: 1 | -1): number {
 		let idx = fromIndex + direction;
 		while (idx >= 0 && idx < this.filteredItems.length) {
@@ -477,10 +317,10 @@ class ResourceList implements Component, Focusable {
 		return fromIndex; // Stay at current if no item found
 	}
 
-	private filterItems(query: string, preferredItemKey = this.getSelectedItemKey()): void {
+	private filterItems(query: string): void {
 		if (!query.trim()) {
 			this.filteredItems = [...this.flatItems];
-			this.selectFirstItem(preferredItemKey);
+			this.selectFirstItem();
 			return;
 		}
 
@@ -525,34 +365,23 @@ class ResourceList implements Component, Focusable {
 			}
 		}
 
-		this.selectFirstItem(preferredItemKey);
+		this.selectFirstItem();
 	}
 
-	private selectFirstItem(preferredItemKey?: string): void {
-		if (preferredItemKey) {
-			const preferredIndex = this.filteredItems.findIndex(
-				(entry) => getEntryResourceItemKey(entry) === preferredItemKey,
-			);
-			if (preferredIndex >= 0) {
-				this.selectedIndex = preferredIndex;
-				return;
-			}
-		}
+	private selectFirstItem(): void {
 		const firstItemIndex = this.filteredItems.findIndex((e) => e.type === "item");
 		this.selectedIndex = firstItemIndex >= 0 ? firstItemIndex : 0;
 	}
 
-	updateItem(item: ResourceItem, state: ProjectOverrideState): void {
-		const enabled = state === "inherit" ? this.getInheritedEnabled(item) : state === "load";
-		const projectOverride = this.writeScope === "project" && state !== "inherit";
-		const itemKey = getResourceItemKey(item.resourceType, item.path);
-
+	updateItem(item: ResourceItem, enabled: boolean): void {
+		item.enabled = enabled;
+		// Update in groups too
 		for (const group of this.groups) {
 			for (const subgroup of group.subgroups) {
-				for (const found of subgroup.items) {
-					if (getResourceItemKey(found.resourceType, found.path) !== itemKey) continue;
+				const found = subgroup.items.find((i) => i.path === item.path && i.resourceType === item.resourceType);
+				if (found) {
 					found.enabled = enabled;
-					found.projectOverride = projectOverride;
+					return;
 				}
 			}
 		}
@@ -585,14 +414,13 @@ class ResourceList implements Component, Focusable {
 
 			if (entry.type === "group") {
 				// Main group header (no cursor)
-				const label = theme.bold(this.getGroupDisplayLabel(entry.group));
-				const groupLine = this.isDimmedScope(entry.group.scope)
-					? theme.fg("dim", label)
-					: theme.fg("accent", label);
+				const inherited = this.writeScope === "project" && entry.group.scope === "user";
+				const label = theme.bold(`${entry.group.label}${inherited ? " · inherited global" : ""}`);
+				const groupLine = theme.fg(inherited ? "dim" : "accent", label);
 				lines.push(truncateToWidth(`  ${groupLine}`, width, ""));
 			} else if (entry.type === "subgroup") {
 				// Subgroup header (indented, no cursor)
-				const color = this.isDimmedScope(entry.group.scope) ? "dim" : "muted";
+				const color = this.writeScope === "project" && entry.group.scope === "user" ? "dim" : "muted";
 				const subgroupLine = theme.fg(color, entry.subgroup.label);
 				lines.push(truncateToWidth(`    ${subgroupLine}`, width, ""));
 			} else {
@@ -600,11 +428,15 @@ class ResourceList implements Component, Focusable {
 				const item = entry.item;
 				const cursor = isSelected ? "> " : "  ";
 				const dimmed = this.isDimmedItem(item);
-				const checkbox = this.renderCheckbox(item, dimmed);
 				const nameText = isSelected && !dimmed ? theme.bold(item.displayName) : item.displayName;
 				const name = dimmed ? theme.fg("dim", nameText) : nameText;
-				const suffix = this.getItemSuffix(item);
-				lines.push(truncateToWidth(`${cursor}    ${checkbox} ${name}${suffix}`, width, "..."));
+				lines.push(
+					truncateToWidth(
+						`${cursor}    ${this.renderCheckbox(item)} ${name}${this.getItemSuffix(item)}`,
+						width,
+						"...",
+					),
+				);
 			}
 		}
 
@@ -617,72 +449,6 @@ class ResourceList implements Component, Focusable {
 		}
 
 		return lines;
-	}
-
-	private getGroupDisplayLabel(group: ResourceGroup): string {
-		if (this.writeScope !== "project") {
-			return group.label;
-		}
-		if (
-			group.scope === "project" &&
-			group.origin === "package" &&
-			this.hasMatchingPackageSource(group.source, "project", "user")
-		) {
-			return `${group.displaySource} (project package replaces global package)`;
-		}
-		if (group.scope === "user") {
-			if (group.origin === "package" && this.hasMatchingPackageSource(group.source, "user", "project")) {
-				return `${group.displaySource} (global package shadowed by project override)`;
-			}
-			return `${group.label} · inherited global`;
-		}
-		return group.label;
-	}
-
-	private isDimmedScope(scope: ResourceGroup["scope"]): boolean {
-		return this.writeScope === "project" && scope === "user";
-	}
-
-	private isDimmedItem(item: ResourceItem): boolean {
-		return (
-			this.writeScope === "project" &&
-			this.isInheritedGlobalItem(item) &&
-			this.getProjectOverrideState(item) === "inherit"
-		);
-	}
-
-	private renderCheckbox(item: ResourceItem, dimmed: boolean): string {
-		if (this.writeScope === "project") {
-			const state = this.getProjectOverrideState(item);
-			if (state === "load") {
-				return theme.fg("success", "[+]");
-			}
-			if (state === "unload") {
-				return theme.fg("warning", "[-]");
-			}
-			return theme.fg("dim", item.enabled ? "[x]" : "[ ]");
-		}
-		if (dimmed) {
-			return theme.fg("dim", item.enabled ? "[x]" : "[ ]");
-		}
-		return item.enabled ? theme.fg("success", "[x]") : theme.fg("warning", "[ ]");
-	}
-
-	private getItemSuffix(item: ResourceItem): string {
-		if (this.writeScope !== "project") {
-			return "";
-		}
-		const state = this.getProjectOverrideState(item);
-		if (state === "load") {
-			return theme.fg("muted", "  project load");
-		}
-		if (state === "unload") {
-			return theme.fg("muted", "  project unload");
-		}
-		if (this.isInheritedGlobalItem(item)) {
-			return theme.fg("dim", "  inherited global");
-		}
-		return "";
 	}
 
 	handleInput(data: string): void {
@@ -732,16 +498,11 @@ class ResourceList implements Component, Focusable {
 		}
 		if (data === " " || kb.matches(data, "tui.select.confirm")) {
 			const entry = this.filteredItems[this.selectedIndex];
-			if (entry?.type === "item" && this.canEditItem(entry.item)) {
-				const selectedItemKey = getResourceItemKey(entry.item.resourceType, entry.item.path);
-				const nextState = this.getNextOverrideState(entry.item);
-				if (this.setResourceOverride(entry.item, nextState)) {
-					this.updateItem(entry.item, nextState);
-					this.filterItems(this.searchInput.getValue(), selectedItemKey);
-					this.onToggle?.(
-						entry.item,
-						nextState === "inherit" ? this.getInheritedEnabled(entry.item) : nextState === "load",
-					);
+			if (entry?.type === "item" && (this.writeScope === "project" || this.getItemScope(entry.item) === "user")) {
+				const newEnabled = this.toggleResource(entry.item);
+				if (newEnabled !== undefined) {
+					this.updateItem(entry.item, newEnabled);
+					this.onToggle?.(entry.item, newEnabled);
 				}
 			}
 			return;
@@ -752,121 +513,120 @@ class ResourceList implements Component, Focusable {
 		this.filterItems(this.searchInput.getValue());
 	}
 
-	private setResourceOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
-		if (item.metadata.origin === "top-level") {
-			return this.setTopLevelResourceOverride(item, state);
+	private toggleResource(item: ResourceItem): boolean | undefined {
+		if (this.writeScope === "project") {
+			const state = this.getNextOverrideState(item);
+			if (!this.setProjectResourceOverride(item, state)) return undefined;
+			return state === "inherit" ? this.getInheritedEnabled(item) : state === "load";
 		}
-		return this.setPackageResourceOverride(item, state);
+
+		const enabled = !item.enabled;
+		if (item.metadata.origin === "top-level") {
+			this.toggleTopLevelResource(item, enabled);
+		} else {
+			this.togglePackageResource(item, enabled);
+		}
+		return enabled;
 	}
 
-	private setTopLevelResourceOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
-		const scope = this.getWriteScope();
+	private toggleTopLevelResource(item: ResourceItem, enabled: boolean): void {
+		const scope = item.metadata.scope as "user" | "project";
 		const settings =
 			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
 
 		const arrayKey = item.resourceType as "extensions" | "skills" | "prompts" | "themes";
 		const current = (settings[arrayKey] ?? []) as string[];
-		const patterns = this.getTopLevelOverridePatterns(item, scope);
-		const pattern =
-			scope === "project" ? this.getProjectTopLevelWritePattern(item) : this.getResourcePattern(item, scope);
-		const isInheritedGlobal = scope === "project" && this.isInheritedGlobalItem(item);
 
-		const updated = current.filter((entry) => {
-			const target = getPatternEntryTarget(entry);
-			const isOverride = entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-");
-			if (isOverride && patterns.has(target)) {
-				return false;
-			}
-			return !(state === "inherit" && isInheritedGlobal && target === pattern);
+		// Generate pattern for this resource
+		const pattern = this.getResourcePattern(item);
+		const disablePattern = `-${pattern}`;
+		const enablePattern = `+${pattern}`;
+
+		// Filter out existing patterns for this resource
+		const updated = current.filter((p) => {
+			const stripped = p.startsWith("!") || p.startsWith("+") || p.startsWith("-") ? p.slice(1) : p;
+			return stripped !== pattern;
 		});
 
-		if (state !== "inherit") {
-			if (isInheritedGlobal && !updated.includes(pattern)) {
-				updated.push(pattern);
-			}
-			updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
+		if (enabled) {
+			updated.push(enablePattern);
+		} else {
+			updated.push(disablePattern);
 		}
 
-		this.setTopLevelResourcePaths(scope, arrayKey, updated);
-		return true;
-	}
-
-	private setTopLevelResourcePaths(
-		scope: "user" | "project",
-		arrayKey: "extensions" | "skills" | "prompts" | "themes",
-		paths: string[],
-	): void {
 		if (scope === "project") {
 			if (arrayKey === "extensions") {
-				this.settingsManager.setProjectExtensionPaths(paths);
+				this.settingsManager.setProjectExtensionPaths(updated);
 			} else if (arrayKey === "skills") {
-				this.settingsManager.setProjectSkillPaths(paths);
+				this.settingsManager.setProjectSkillPaths(updated);
 			} else if (arrayKey === "prompts") {
-				this.settingsManager.setProjectPromptTemplatePaths(paths);
+				this.settingsManager.setProjectPromptTemplatePaths(updated);
 			} else if (arrayKey === "themes") {
-				this.settingsManager.setProjectThemePaths(paths);
+				this.settingsManager.setProjectThemePaths(updated);
 			}
-			return;
-		}
-		if (arrayKey === "extensions") {
-			this.settingsManager.setExtensionPaths(paths);
-		} else if (arrayKey === "skills") {
-			this.settingsManager.setSkillPaths(paths);
-		} else if (arrayKey === "prompts") {
-			this.settingsManager.setPromptTemplatePaths(paths);
-		} else if (arrayKey === "themes") {
-			this.settingsManager.setThemePaths(paths);
+		} else {
+			if (arrayKey === "extensions") {
+				this.settingsManager.setExtensionPaths(updated);
+			} else if (arrayKey === "skills") {
+				this.settingsManager.setSkillPaths(updated);
+			} else if (arrayKey === "prompts") {
+				this.settingsManager.setPromptTemplatePaths(updated);
+			} else if (arrayKey === "themes") {
+				this.settingsManager.setThemePaths(updated);
+			}
 		}
 	}
 
-	private setPackageResourceOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
-		const scope = this.getWriteScope();
+	private togglePackageResource(item: ResourceItem, enabled: boolean): void {
+		const scope = item.metadata.scope as "user" | "project";
 		const settings =
 			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
 
 		const packages = [...(settings.packages ?? [])] as PackageSource[];
-		let pkgIndex = packages.findIndex((pkg) =>
-			this.packageSourceStringMatches(
-				item.metadata.source,
-				this.getItemScope(item),
-				typeof pkg === "string" ? pkg : pkg.source,
-				scope,
-			),
-		);
-		if (pkgIndex === -1) {
-			if (scope !== "project" || state === "inherit") {
-				return false;
-			}
-			packages.push(this.createPackageOverrideSource(item));
-			pkgIndex = packages.length - 1;
-		}
+		const pkgIndex = packages.findIndex((pkg) => {
+			const source = typeof pkg === "string" ? pkg : pkg.source;
+			return source === item.metadata.source;
+		});
+
+		if (pkgIndex === -1) return;
 
 		let pkg = packages[pkgIndex];
-		if (pkg === undefined) return false;
 
+		// Convert string to object form if needed
 		if (typeof pkg === "string") {
 			pkg = { source: pkg };
 			packages[pkgIndex] = pkg;
 		}
 
+		// Get the resource array for this type
 		const arrayKey = item.resourceType as "extensions" | "skills" | "prompts" | "themes";
 		const current = (pkg[arrayKey] ?? []) as string[];
-		const pattern = this.getPackageResourcePattern(item);
-		const updated = current.filter((entry) => getPatternEntryTarget(entry) !== pattern);
 
-		if (state !== "inherit") {
-			updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
+		// Generate pattern relative to package root
+		const pattern = this.getPackageResourcePattern(item);
+		const disablePattern = `-${pattern}`;
+		const enablePattern = `+${pattern}`;
+
+		// Filter out existing patterns for this resource
+		const updated = current.filter((p) => {
+			const stripped = p.startsWith("!") || p.startsWith("+") || p.startsWith("-") ? p.slice(1) : p;
+			return stripped !== pattern;
+		});
+
+		if (enabled) {
+			updated.push(enablePattern);
+		} else {
+			updated.push(disablePattern);
 		}
 
 		(pkg as Record<string, unknown>)[arrayKey] = updated.length > 0 ? updated : undefined;
 
-		const hasFilters = RESOURCE_TYPES.some((key) => (pkg as Record<string, unknown>)[key] !== undefined);
+		// Clean up empty filter object
+		const hasFilters = ["extensions", "skills", "prompts", "themes"].some(
+			(k) => (pkg as Record<string, unknown>)[k] !== undefined,
+		);
 		if (!hasFilters) {
-			if (pkg.autoload === false) {
-				packages.splice(pkgIndex, 1);
-			} else {
-				packages[pkgIndex] = pkg.source;
-			}
+			packages[pkgIndex] = (pkg as { source: string }).source;
 		}
 
 		if (scope === "project") {
@@ -874,156 +634,227 @@ class ResourceList implements Component, Focusable {
 		} else {
 			this.settingsManager.setPackages(packages);
 		}
+	}
+
+	private renderCheckbox(item: ResourceItem): string {
+		if (this.writeScope === "project") {
+			const state = this.getProjectOverrideState(item);
+			if (state === "load") return theme.fg("success", "[+]");
+			if (state === "unload") return theme.fg("warning", "[-]");
+			return theme.fg("dim", item.enabled ? "[x]" : "[ ]");
+		}
+		return item.enabled ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
+	}
+
+	private getItemSuffix(item: ResourceItem): string {
+		if (this.writeScope !== "project") return "";
+		const state = this.getProjectOverrideState(item);
+		if (state === "load") return theme.fg("muted", "  project load");
+		if (state === "unload") return theme.fg("muted", "  project unload");
+		return this.isInheritedGlobalItem(item) ? theme.fg("dim", "  inherited global") : "";
+	}
+
+	private isDimmedItem(item: ResourceItem): boolean {
+		return (
+			this.writeScope === "project" &&
+			this.isInheritedGlobalItem(item) &&
+			this.getProjectOverrideState(item) === "inherit"
+		);
+	}
+
+	private setProjectResourceOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
+		return item.metadata.origin === "top-level"
+			? this.setProjectTopLevelOverride(item, state)
+			: this.setProjectPackageOverride(item, state);
+	}
+
+	private setProjectTopLevelOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
+		const current = (this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[];
+		const pattern = this.isInheritedGlobalItem(item) ? item.path : this.getResourcePatternForScope(item, "project");
+		const patterns = this.getTopLevelOverridePatterns(item, "project");
+		const updated = current.filter((entry) => {
+			const target = this.getPatternEntryTarget(entry);
+			if ((entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-")) && patterns.has(target))
+				return false;
+			return !(state === "inherit" && this.isInheritedGlobalItem(item) && target === pattern);
+		});
+		if (state !== "inherit") {
+			if (this.isInheritedGlobalItem(item) && !updated.includes(pattern)) updated.push(pattern);
+			updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
+		}
+		this.setProjectTopLevelPaths(item.resourceType, updated);
+		return true;
+	}
+
+	private setProjectTopLevelPaths(key: ResourceType, paths: string[]): void {
+		if (key === "extensions") this.settingsManager.setProjectExtensionPaths(paths);
+		else if (key === "skills") this.settingsManager.setProjectSkillPaths(paths);
+		else if (key === "prompts") this.settingsManager.setProjectPromptTemplatePaths(paths);
+		else this.settingsManager.setProjectThemePaths(paths);
+	}
+
+	private setProjectPackageOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
+		const packages = [...(this.settingsManager.getProjectSettings().packages ?? [])] as PackageSource[];
+		let pkgIndex = packages.findIndex((pkg) =>
+			this.packageSourceStringMatches(
+				item.metadata.source,
+				this.getItemScope(item),
+				typeof pkg === "string" ? pkg : pkg.source,
+				"project",
+			),
+		);
+		if (pkgIndex === -1) {
+			if (state === "inherit") return false;
+			packages.push(this.createPackageOverrideSource(item));
+			pkgIndex = packages.length - 1;
+		}
+		let pkg = packages[pkgIndex];
+		if (pkg === undefined) return false;
+		if (typeof pkg === "string") {
+			pkg = { source: pkg };
+			packages[pkgIndex] = pkg;
+		}
+		const pattern = this.getPackageResourcePattern(item);
+		const updated = ((pkg[item.resourceType] ?? []) as string[]).filter(
+			(entry) => this.getPatternEntryTarget(entry) !== pattern,
+		);
+		if (state !== "inherit") updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
+		(pkg as Record<string, unknown>)[item.resourceType] = updated.length > 0 ? updated : undefined;
+		if (!RESOURCE_TYPES.some((key) => (pkg as Record<string, unknown>)[key] !== undefined)) {
+			if (pkg.autoload === false) packages.splice(pkgIndex, 1);
+			else packages[pkgIndex] = pkg.source;
+		}
+		this.settingsManager.setProjectPackages(packages);
 		return true;
 	}
 
 	private getNextOverrideState(item: ResourceItem): ProjectOverrideState {
-		if (this.writeScope !== "project") {
-			return item.enabled ? "unload" : "load";
-		}
-
 		const state = this.getProjectOverrideState(item);
 		const inheritedEnabled = this.getInheritedEnabled(item);
-		if (state === "inherit") {
-			return inheritedEnabled ? "unload" : "load";
-		}
-		if (state === "unload") {
-			return inheritedEnabled ? "load" : "inherit";
-		}
+		if (state === "inherit") return inheritedEnabled ? "unload" : "load";
+		if (state === "unload") return inheritedEnabled ? "load" : "inherit";
 		return inheritedEnabled ? "inherit" : "unload";
 	}
 
 	private getProjectOverrideState(item: ResourceItem): ProjectOverrideState {
-		if (this.writeScope !== "project") {
-			return "inherit";
-		}
+		if (this.writeScope !== "project") return "inherit";
 		if (item.metadata.origin === "top-level") {
-			const arrayKey = item.resourceType as "extensions" | "skills" | "prompts" | "themes";
-			const entries = (this.settingsManager.getProjectSettings()[arrayKey] ?? []) as string[];
-			return getOverrideStateFromEntries(entries, this.getTopLevelOverridePatterns(item, "project"));
+			return this.getOverrideStateFromEntries(
+				(this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[],
+				this.getTopLevelOverridePatterns(item, "project"),
+				false,
+			);
 		}
-
-		const pkg = this.findMatchingPackageSource(item.metadata.source, this.getItemScope(item), "project");
-		if (typeof pkg !== "object") {
-			return "inherit";
-		}
-		const arrayKey = item.resourceType as "extensions" | "skills" | "prompts" | "themes";
-		const entries = pkg[arrayKey];
-		if (entries === undefined) {
-			return "inherit";
-		}
-		return getOverrideStateFromEntries(entries, new Set([this.getPackageResourcePattern(item)]), {
-			plainEntryIsLoad: true,
-			emptyArrayIsUnload: true,
-		});
-	}
-
-	private getInheritedEnabled(item: ResourceItem): boolean {
-		const inheritedEnabled = this.inheritedEnabledByKey.get(getResourceItemKey(item.resourceType, item.path));
-		if (inheritedEnabled !== undefined) {
-			return inheritedEnabled;
-		}
-		return this.getItemScope(item) === "user" ? item.enabled : true;
-	}
-
-	private isInheritedGlobalItem(item: ResourceItem): boolean {
-		return (
-			this.getItemScope(item) === "user" ||
-			this.inheritedEnabledByKey.has(getResourceItemKey(item.resourceType, item.path))
+		const pkg = this.findMatchingPackageSource(item, "project");
+		if (typeof pkg !== "object") return "inherit";
+		const entries = pkg[item.resourceType];
+		if (entries === undefined) return "inherit";
+		return this.getOverrideStateFromEntries(
+			entries,
+			new Set([this.getPackageResourcePattern(item)]),
+			pkg.autoload !== false,
 		);
 	}
 
-	private getTopLevelOverridePatterns(item: ResourceItem, targetScope: "user" | "project"): Set<string> {
-		const patterns = new Set<string>([this.getResourcePattern(item, targetScope), item.path]);
-		const targetBaseDir = this.getTopLevelBaseDir(targetScope);
-		patterns.add(relative(targetBaseDir, item.path));
-		if (item.metadata.baseDir) {
-			patterns.add(relative(item.metadata.baseDir, item.path));
+	private getOverrideStateFromEntries(
+		entries: string[],
+		patterns: Set<string>,
+		emptyArrayIsUnload: boolean,
+	): ProjectOverrideState {
+		if (entries.length === 0 && emptyArrayIsUnload) return "unload";
+		let state: ProjectOverrideState = "inherit";
+		for (const entry of entries) {
+			if (!patterns.has(this.getPatternEntryTarget(entry))) continue;
+			if (entry.startsWith("!") || entry.startsWith("-")) state = "unload";
+			else state = "load";
 		}
+		return state;
+	}
+
+	private getInheritedEnabled(item: ResourceItem): boolean {
+		return (
+			this.inheritedEnabledByKey.get(this.getResourceItemKey(item)) ??
+			(this.getItemScope(item) === "user" ? item.enabled : true)
+		);
+	}
+
+	private isInheritedGlobalItem(item: ResourceItem): boolean {
+		return this.getItemScope(item) === "user" || this.inheritedEnabledByKey.has(this.getResourceItemKey(item));
+	}
+
+	private getTopLevelOverridePatterns(item: ResourceItem, scope: SettingsScope): Set<string> {
+		const baseDir = this.getTopLevelBaseDir(scope);
+		const patterns = new Set<string>([
+			this.getResourcePatternForScope(item, scope),
+			item.path,
+			relative(baseDir, item.path),
+		]);
+		if (item.metadata.baseDir) patterns.add(relative(item.metadata.baseDir, item.path));
 		return patterns;
 	}
 
-	private getProjectTopLevelWritePattern(item: ResourceItem): string {
-		return this.isInheritedGlobalItem(item) ? item.path : this.getResourcePattern(item, "project");
-	}
-
-	private canEditItem(item: ResourceItem): boolean {
-		return this.writeScope === "project" || this.getItemScope(item) === "user";
-	}
-
-	private getItemScope(item: ResourceItem): "user" | "project" {
-		return item.metadata.scope === "project" ? "project" : "user";
-	}
-
-	private getWriteScope(): "user" | "project" {
-		return this.writeScope === "project" ? "project" : "user";
-	}
-
-	private getTopLevelBaseDir(scope: "user" | "project"): string {
-		return scope === "project" ? join(this.cwd, CONFIG_DIR_NAME) : this.agentDir;
-	}
-
-	private getResourcePattern(item: ResourceItem, targetScope: "user" | "project"): string {
+	private getResourcePatternForScope(item: ResourceItem, scope: SettingsScope): string {
 		const sourceScope = this.getItemScope(item);
-		if (targetScope !== sourceScope) {
-			return item.path;
-		}
+		if (scope !== sourceScope) return item.path;
 		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(sourceScope);
 		return relative(baseDir, item.path);
 	}
 
-	/** Build an autoload=false project delta entry for a package configured in another scope. */
 	private createPackageOverrideSource(item: ResourceItem): PackageSource {
 		const source = item.metadata.source;
-		if (!isLocalPath(source)) {
-			return { source, autoload: false };
-		}
+		if (!isLocalPath(source)) return { source, autoload: false };
 		const sourcePath = resolvePath(source, this.getTopLevelBaseDir(this.getItemScope(item)), { trim: true });
 		return { source: relative(this.getTopLevelBaseDir("project"), sourcePath) || ".", autoload: false };
 	}
 
 	private packageSourceStringMatches(
 		leftSource: string,
-		leftScope: "user" | "project",
+		leftScope: SettingsScope,
 		rightSource: string,
-		rightScope: "user" | "project",
+		rightScope: SettingsScope,
 	): boolean {
-		if (leftSource === rightSource) {
-			return true;
-		}
-		if (!isLocalPath(leftSource) || !isLocalPath(rightSource)) {
-			return false;
-		}
-		const leftPath = resolvePath(leftSource, this.getTopLevelBaseDir(leftScope), { trim: true });
-		const rightPath = resolvePath(rightSource, this.getTopLevelBaseDir(rightScope), { trim: true });
-		return leftPath === rightPath;
+		if (leftSource === rightSource) return true;
+		if (!isLocalPath(leftSource) || !isLocalPath(rightSource)) return false;
+		const left = resolvePath(leftSource, this.getTopLevelBaseDir(leftScope), { trim: true });
+		const right = resolvePath(rightSource, this.getTopLevelBaseDir(rightScope), { trim: true });
+		return left === right;
 	}
 
-	private findMatchingPackageSource(
-		source: string,
-		sourceScope: "user" | "project",
-		targetScope: "user" | "project",
-	): PackageSource | undefined {
-		const targetSettings =
+	private findMatchingPackageSource(item: ResourceItem, targetScope: SettingsScope): PackageSource | undefined {
+		const settings =
 			targetScope === "project"
 				? this.settingsManager.getProjectSettings()
 				: this.settingsManager.getGlobalSettings();
-		return (targetSettings.packages ?? []).find((pkg) =>
-			this.packageSourceStringMatches(source, sourceScope, typeof pkg === "string" ? pkg : pkg.source, targetScope),
+		return (settings.packages ?? []).find((pkg) =>
+			this.packageSourceStringMatches(
+				item.metadata.source,
+				this.getItemScope(item),
+				typeof pkg === "string" ? pkg : pkg.source,
+				targetScope,
+			),
 		);
 	}
 
-	private hasMatchingPackageSource(
-		source: string,
-		sourceScope: "user" | "project",
-		targetScope: "user" | "project",
-	): boolean {
-		return this.findMatchingPackageSource(source, sourceScope, targetScope) !== undefined;
+	private getPatternEntryTarget(entry: string): string {
+		return entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-") ? entry.slice(1) : entry;
 	}
 
-	private projectPackageAutoloadDisabled(source: string): boolean {
-		const pkg = this.findMatchingPackageSource(source, "project", "project");
-		return typeof pkg === "object" && pkg.autoload === false;
+	private getResourceItemKey(item: ResourceItem): string {
+		return `${item.resourceType}:${canonicalizePath(item.path)}`;
+	}
+
+	private getItemScope(item: ResourceItem): SettingsScope {
+		return item.metadata.scope === "project" ? "project" : "user";
+	}
+
+	private getTopLevelBaseDir(scope: "user" | "project"): string {
+		return scope === "project" ? join(this.cwd, CONFIG_DIR_NAME) : this.agentDir;
+	}
+
+	private getResourcePattern(item: ResourceItem): string {
+		const scope = item.metadata.scope as "user" | "project";
+		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(scope);
+		return relative(baseDir, item.path);
 	}
 
 	private getPackageResourcePattern(item: ResourceItem): string {
@@ -1062,8 +893,8 @@ export class ConfigSelectorComponent extends Container implements Focusable {
 
 		this.writeScope = writeScope;
 		const groupsByScope = {
-			global: buildGroups(resolvedPaths.global, cwd, agentDir, "global"),
-			project: buildGroups(resolvedPaths.project, cwd, agentDir, "project"),
+			global: buildGroups(resolvedPaths.global, agentDir),
+			project: buildGroups(resolvedPaths.project, agentDir),
 		};
 
 		// Add header

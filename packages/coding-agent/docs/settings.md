@@ -267,8 +267,6 @@ Object form filters which resources to load:
 }
 ```
 
-Set `autoload` to `false` for a package entry that starts empty and only applies explicit `+path`, `-path`, plain include, or `!pattern` entries. Project-local `autoload: false` entries for packages that are also configured globally act as deltas over the global package.
-
 See [packages.md](packages.md) for package management details.
 
 ## Example

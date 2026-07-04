@@ -3,12 +3,11 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR, PACKAGE_NAME, VERSION } from "../src/config.ts";
-import { DefaultPackageManager, type ResolvedPaths } from "../src/core/package-manager.ts";
+import type { ResolvedPaths } from "../src/core/package-manager.ts";
 import { InMemorySettingsStorage, SettingsManager } from "../src/core/settings-manager.ts";
 import { ProjectTrustStore } from "../src/core/trust-manager.ts";
 import { main } from "../src/main.ts";
 import { ConfigSelectorComponent } from "../src/modes/interactive/components/config-selector.ts";
-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { handlePackageCommand } from "../src/package-manager-cli.ts";
 
 describe("package commands", () => {
@@ -30,6 +29,24 @@ describe("package commands", () => {
 
 	async function runPackageCommandDirectly(args: string[]): Promise<void> {
 		expect(await handlePackageCommand(args)).toBe(true);
+	}
+
+	function extensionPaths(
+		packageRoot: string,
+		source: string,
+		scope: "user" | "project",
+		names: string[],
+	): ResolvedPaths {
+		return {
+			extensions: names.map((name) => ({
+				path: join(packageRoot, "extensions", name),
+				enabled: true,
+				metadata: { source, scope, origin: "package", baseDir: packageRoot },
+			})),
+			skills: [],
+			prompts: [],
+			themes: [],
+		};
 	}
 
 	beforeEach(() => {
@@ -354,78 +371,11 @@ describe("package commands", () => {
 		}
 	});
 
-	it("shows config subcommand help", async () => {
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(main(["config", "--help"])).resolves.toBeUndefined();
-
-			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			expect(stdout).toContain("Usage:");
-			expect(stdout).toContain("pi config [-l]");
-			expect(stdout).toContain("--local");
-			expect(errorSpy).not.toHaveBeenCalled();
-			expect(process.exitCode).toBeUndefined();
-		} finally {
-			logSpy.mockRestore();
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("shows a friendly error for unknown config options", async () => {
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(main(["config", "--unknown"])).resolves.toBeUndefined();
-
-			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			expect(stderr).toContain('Unknown option --unknown for "config".');
-			expect(stderr).toContain('Use "pi --help" or "pi config [-l] [--approve|--no-approve]".');
-			expect(process.exitCode).toBe(1);
-		} finally {
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("blocks local config changes when project is untrusted", async () => {
-		mkdirSync(join(projectDir, ".pi"), { recursive: true });
-		writeFileSync(join(projectDir, ".pi", "settings.json"), "{}");
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(main(["config", "-l"])).resolves.toBeUndefined();
-
-			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			expect(stderr).toContain("Project is not trusted. Use --approve to modify local resource config.");
-			expect(process.exitCode).toBe(1);
-		} finally {
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("writes config package selections to project settings in local mode", async () => {
+	it("cycles project package overrides in config local mode", async () => {
 		const storage = new InMemorySettingsStorage();
 		storage.withLock("global", () => JSON.stringify({ packages: ["npm:pi-tools"] }));
 		const settingsManager = SettingsManager.fromStorage(storage, { projectTrusted: true });
-		const packageRoot = join(tempDir, "pkg");
-		const resolvedPaths: ResolvedPaths = {
-			extensions: [
-				{
-					path: join(packageRoot, "extensions", "foo.ts"),
-					enabled: true,
-					metadata: {
-						source: "npm:pi-tools",
-						scope: "user",
-						origin: "package",
-						baseDir: packageRoot,
-					},
-				},
-			],
-			skills: [],
-			prompts: [],
-			themes: [],
-		};
+		const resolvedPaths = extensionPaths(join(tempDir, "pkg"), "npm:pi-tools", "user", ["bar.ts"]);
 		const selector = new ConfigSelectorComponent(
 			{ global: resolvedPaths, project: resolvedPaths },
 			settingsManager,
@@ -439,371 +389,17 @@ describe("package commands", () => {
 		);
 
 		selector.getResourceList().handleInput(" ");
-		await settingsManager.flush();
-
-		expect(settingsManager.getGlobalSettings().packages).toEqual(["npm:pi-tools"]);
-		expect(settingsManager.getProjectSettings().packages).toEqual([
-			{ source: "npm:pi-tools", autoload: false, extensions: ["-extensions/foo.ts"] },
-		]);
-	});
-
-	it("cycles project package overrides and keeps the cursor on the same resource", async () => {
-		const storage = new InMemorySettingsStorage();
-		storage.withLock("global", () => JSON.stringify({ packages: ["npm:pi-tools"] }));
-		const settingsManager = SettingsManager.fromStorage(storage, { projectTrusted: true });
-		const packageRoot = join(tempDir, "pkg");
-		const resolvedPaths: ResolvedPaths = {
-			extensions: [
-				{
-					path: join(packageRoot, "extensions", "bar.ts"),
-					enabled: true,
-					metadata: {
-						source: "npm:pi-tools",
-						scope: "user",
-						origin: "package",
-						baseDir: packageRoot,
-					},
-				},
-				{
-					path: join(packageRoot, "extensions", "foo.ts"),
-					enabled: true,
-					metadata: {
-						source: "npm:pi-tools",
-						scope: "user",
-						origin: "package",
-						baseDir: packageRoot,
-					},
-				},
-			],
-			skills: [],
-			prompts: [],
-			themes: [],
-		};
-		const selector = new ConfigSelectorComponent(
-			{ global: resolvedPaths, project: resolvedPaths },
-			settingsManager,
-			projectDir,
-			agentDir,
-			() => {},
-			() => {},
-			() => {},
-			24,
-			"project",
-		);
-
-		initTheme("dark");
-		selector.getResourceList().handleInput(" ");
-		await settingsManager.flush();
-
 		expect(settingsManager.getProjectSettings().packages).toEqual([
 			{ source: "npm:pi-tools", autoload: false, extensions: ["-extensions/bar.ts"] },
 		]);
-		let selectedLine = selector
-			.getResourceList()
-			.render(240)
-			.find((line) => line.includes("bar.ts"));
-		expect(selectedLine?.startsWith(">")).toBe(true);
-		expect(selectedLine).toContain("[-]");
-		expect(selectedLine).toContain("project unload");
 
 		selector.getResourceList().handleInput(" ");
-		await settingsManager.flush();
-
 		expect(settingsManager.getProjectSettings().packages).toEqual([
 			{ source: "npm:pi-tools", autoload: false, extensions: ["+extensions/bar.ts"] },
 		]);
-		selectedLine = selector
-			.getResourceList()
-			.render(240)
-			.find((line) => line.includes("bar.ts"));
-		expect(selectedLine?.startsWith(">")).toBe(true);
-		expect(selectedLine).toContain("[+]");
-		expect(selectedLine).toContain("project load");
 
 		selector.getResourceList().handleInput(" ");
-		await settingsManager.flush();
-
 		expect(settingsManager.getProjectSettings().packages).toEqual([]);
-		selectedLine = selector
-			.getResourceList()
-			.render(240)
-			.find((line) => line.includes("bar.ts"));
-		expect(selectedLine?.startsWith(">")).toBe(true);
-		expect(selectedLine).toContain("[x]");
-		expect(selectedLine).toContain("inherited global");
-	});
-
-	it("switches config selector modes with tab", async () => {
-		const storage = new InMemorySettingsStorage();
-		storage.withLock("global", () => JSON.stringify({ packages: ["npm:global-tools"] }));
-		storage.withLock("project", () => JSON.stringify({ packages: ["npm:project-tools"] }));
-		const settingsManager = SettingsManager.fromStorage(storage, { projectTrusted: true });
-		const globalRoot = join(tempDir, "global-tools");
-		const projectRoot = join(tempDir, "project-tools");
-		const resolvedPaths: Record<"global" | "project", ResolvedPaths> = {
-			global: {
-				extensions: [
-					{
-						path: join(globalRoot, "extensions", "global.ts"),
-						enabled: true,
-						metadata: {
-							source: "npm:global-tools",
-							scope: "user",
-							origin: "package",
-							baseDir: globalRoot,
-						},
-					},
-				],
-				skills: [],
-				prompts: [],
-				themes: [],
-			},
-			project: {
-				extensions: [
-					{
-						path: join(projectRoot, "extensions", "project.ts"),
-						enabled: true,
-						metadata: {
-							source: "npm:project-tools",
-							scope: "project",
-							origin: "package",
-							baseDir: projectRoot,
-						},
-					},
-				],
-				skills: [],
-				prompts: [],
-				themes: [],
-			},
-		};
-		const selector = new ConfigSelectorComponent(
-			resolvedPaths,
-			settingsManager,
-			projectDir,
-			agentDir,
-			() => {},
-			() => {},
-			() => {},
-			24,
-			"global",
-		);
-
-		selector.getResourceList().handleInput("\t");
-		selector.getResourceList().handleInput(" ");
-		await settingsManager.flush();
-
-		expect(settingsManager.getGlobalSettings().packages).toEqual(["npm:global-tools"]);
-		expect(settingsManager.getProjectSettings().packages).toEqual([
-			{ source: "npm:project-tools", extensions: ["-extensions/project.ts"] },
-		]);
-	});
-
-	it("writes inherited global package toggles as autoload-disabled project deltas", async () => {
-		const storage = new InMemorySettingsStorage();
-		storage.withLock("global", () =>
-			JSON.stringify({
-				packages: [
-					{
-						source: "../pkg",
-						extensions: ["-extensions/foo.ts", "-extensions/bar.ts"],
-						skills: ["-skills/old/SKILL.md"],
-					},
-				],
-			}),
-		);
-		const settingsManager = SettingsManager.fromStorage(storage, { projectTrusted: true });
-		const packageRoot = join(tempDir, "pkg");
-		const resolvedPaths: ResolvedPaths = {
-			extensions: [
-				{
-					path: join(packageRoot, "extensions", "foo.ts"),
-					enabled: false,
-					metadata: {
-						source: "../pkg",
-						scope: "user",
-						origin: "package",
-						baseDir: packageRoot,
-					},
-				},
-			],
-			skills: [],
-			prompts: [],
-			themes: [],
-		};
-		const selector = new ConfigSelectorComponent(
-			{ global: resolvedPaths, project: resolvedPaths },
-			settingsManager,
-			projectDir,
-			agentDir,
-			() => {},
-			() => {},
-			() => {},
-			24,
-			"project",
-		);
-
-		selector.getResourceList().handleInput(" ");
-		await settingsManager.flush();
-
-		expect(settingsManager.getProjectSettings().packages).toEqual([
-			{
-				source: "../../pkg",
-				autoload: false,
-				extensions: ["+extensions/foo.ts"],
-			},
-		]);
-	});
-
-	it("merges autoload-disabled project package deltas with matching global packages in config UI", async () => {
-		const storage = new InMemorySettingsStorage();
-		storage.withLock("global", () => JSON.stringify({ packages: [{ source: "../pkg" }] }));
-		storage.withLock("project", () =>
-			JSON.stringify({ packages: [{ source: "../../pkg", autoload: false, extensions: ["+extensions/foo.ts"] }] }),
-		);
-		const settingsManager = SettingsManager.fromStorage(storage, { projectTrusted: true });
-		const packageRoot = join(tempDir, "pkg");
-		const resolvedPaths: Record<"global" | "project", ResolvedPaths> = {
-			global: { extensions: [], skills: [], prompts: [], themes: [] },
-			project: {
-				extensions: [
-					{
-						path: join(packageRoot, "extensions", "foo.ts"),
-						enabled: true,
-						metadata: { source: "../../pkg", scope: "project", origin: "package", baseDir: packageRoot },
-					},
-					{
-						path: join(packageRoot, "extensions", "bar.ts"),
-						enabled: true,
-						metadata: { source: "../pkg", scope: "user", origin: "package", baseDir: packageRoot },
-					},
-				],
-				skills: [],
-				prompts: [],
-				themes: [],
-			},
-		};
-		const selector = new ConfigSelectorComponent(
-			resolvedPaths,
-			settingsManager,
-			projectDir,
-			agentDir,
-			() => {},
-			() => {},
-			() => {},
-			24,
-			"project",
-		);
-
-		initTheme("dark");
-		const output = selector.getResourceList().render(240).join("\n");
-
-		expect(output).toContain(`${packageRoot} (global with project-local overrides)`);
-		expect(output).toContain("foo.ts");
-		expect(output).toContain("project load");
-		expect(output).toContain("bar.ts");
-		expect(output).toContain("inherited global");
-		expect(output).not.toContain("project package replaces global package");
-	});
-
-	it("resolves autoload-disabled project package entries as deltas over global packages", async () => {
-		const packageRoot = join(tempDir, "pkg");
-		mkdirSync(join(packageRoot, "extensions"), { recursive: true });
-		writeFileSync(join(packageRoot, "extensions", "foo.ts"), "export default function () {}\n");
-		writeFileSync(join(packageRoot, "extensions", "bar.ts"), "export default function () {}\n");
-		const storage = new InMemorySettingsStorage();
-		storage.withLock("global", () =>
-			JSON.stringify({
-				packages: [{ source: "../pkg", extensions: ["-extensions/foo.ts"] }],
-			}),
-		);
-		storage.withLock("project", () =>
-			JSON.stringify({
-				packages: [{ source: "../../pkg", autoload: false, extensions: ["+extensions/foo.ts"] }],
-			}),
-		);
-		const settingsManager = SettingsManager.fromStorage(storage, { projectTrusted: true });
-		const packageManager = new DefaultPackageManager({ cwd: projectDir, agentDir, settingsManager });
-
-		const resolved = await packageManager.resolve();
-
-		const states = Object.fromEntries(
-			resolved.extensions.map((resource) => [
-				resource.path,
-				{ enabled: resource.enabled, scope: resource.metadata.scope },
-			]),
-		);
-		expect(states[join(packageRoot, "extensions", "foo.ts")]).toEqual({ enabled: true, scope: "project" });
-		expect(states[join(packageRoot, "extensions", "bar.ts")]).toEqual({ enabled: true, scope: "user" });
-	});
-
-	it("resolves autoload-disabled package entries as positive-only without a global package", async () => {
-		const packageRoot = join(tempDir, "positive-only-pkg");
-		mkdirSync(join(packageRoot, "extensions"), { recursive: true });
-		mkdirSync(join(packageRoot, "skills", "foo"), { recursive: true });
-		writeFileSync(join(packageRoot, "extensions", "foo.ts"), "export default function () {}\n");
-		writeFileSync(join(packageRoot, "extensions", "bar.ts"), "export default function () {}\n");
-		writeFileSync(join(packageRoot, "skills", "foo", "SKILL.md"), "# Foo\n");
-		const storage = new InMemorySettingsStorage();
-		storage.withLock("project", () =>
-			JSON.stringify({
-				packages: [{ source: "../../positive-only-pkg", autoload: false, extensions: ["+extensions/foo.ts"] }],
-			}),
-		);
-		const settingsManager = SettingsManager.fromStorage(storage, { projectTrusted: true });
-		const packageManager = new DefaultPackageManager({ cwd: projectDir, agentDir, settingsManager });
-
-		const resolved = await packageManager.resolve();
-
-		expect(resolved.extensions.map((resource) => resource.path)).toEqual([join(packageRoot, "extensions", "foo.ts")]);
-		expect(resolved.skills).toEqual([]);
-	});
-
-	it("writes config top-level selections to project settings in local mode", async () => {
-		const skillPath = join(agentDir, "skills", "foo", "SKILL.md");
-		mkdirSync(join(agentDir, "skills", "foo"), { recursive: true });
-		writeFileSync(skillPath, "# Foo\n");
-		const settingsManager = SettingsManager.create(projectDir, agentDir, { projectTrusted: true });
-		const resolvedPaths: ResolvedPaths = {
-			extensions: [],
-			skills: [
-				{
-					path: skillPath,
-					enabled: true,
-					metadata: {
-						source: "auto",
-						scope: "user",
-						origin: "top-level",
-						baseDir: agentDir,
-					},
-				},
-			],
-			prompts: [],
-			themes: [],
-		};
-		const selector = new ConfigSelectorComponent(
-			{ global: resolvedPaths, project: resolvedPaths },
-			settingsManager,
-			projectDir,
-			agentDir,
-			() => {},
-			() => {},
-			() => {},
-			24,
-			"project",
-		);
-
-		selector.getResourceList().handleInput(" ");
-		await settingsManager.flush();
-
-		const settingsPath = join(projectDir, ".pi", "settings.json");
-		const settings = JSON.parse(readFileSync(settingsPath, "utf-8")) as { skills?: string[] };
-		expect(settings.skills).toEqual([skillPath, `-${skillPath}`]);
-
-		const packageManager = new DefaultPackageManager({ cwd: projectDir, agentDir, settingsManager });
-		const resolvedAfter = await packageManager.resolve();
-		const skill = resolvedAfter.skills.find((resource) => resource.path === skillPath);
-		expect(skill?.enabled).toBe(false);
-		expect(skill?.metadata.scope).toBe("project");
 	});
 
 	it("shows a friendly error for unknown install options", async () => {

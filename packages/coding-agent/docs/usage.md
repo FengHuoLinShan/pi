@@ -153,10 +153,10 @@ pi update --extensions       # Update packages only; reconcile pinned git refs
 pi update --self             # Update pi only
 pi update --extension <src>  # Update one package
 pi list                      # List installed packages
-pi config [-l]               # Enable/disable package resources, -l for project-local selections
+pi config                    # Enable/disable package resources
 ```
 
-These commands manage pi packages and `pi update` can update the pi CLI installation. To uninstall pi itself, see [Quickstart](quickstart.md#uninstall). `pi config` starts in global settings; press Tab in the TUI to switch to project-local overrides (`.pi/settings.json`), or start there with `pi config -l`. `pi config` and project package commands accept `--approve`/`--no-approve` to trust or ignore project-local settings for one command. `pi update` never prompts for project trust.
+These commands manage pi packages and `pi update` can update the pi CLI installation. To uninstall pi itself, see [Quickstart](quickstart.md#uninstall). `pi config` and project package commands accept `--approve`/`--no-approve` to trust or ignore project-local settings for one command. `pi update` never prompts for project trust.
 
 See [Pi Packages](packages.md) for package sources and security notes.
 
