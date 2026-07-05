@@ -439,8 +439,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) {
-				// partialJson is only a streaming scratch buffer; never persist it.
+				// Streaming scratch buffers are only used during parsing; never persist them.
 				delete (block as { partialJson?: string }).partialJson;
+				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatProviderError(normalizeProviderError(error));
@@ -507,7 +508,11 @@ function buildRequestBody(
 	}
 
 	if (context.tools && context.tools.length > 0) {
-		body.tools = convertResponsesTools(context.tools, { strict: null });
+		body.tools = convertResponsesTools(context.tools, {
+			strict: null,
+			supportsStrictMode: false,
+			supportsGrammarTools: false,
+		});
 	}
 
 	if (options?.reasoningEffort !== undefined) {

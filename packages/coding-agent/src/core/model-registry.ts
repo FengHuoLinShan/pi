@@ -139,6 +139,8 @@ const OpenAIResponsesCompatSchema = Type.Object({
 	supportsDeveloperRole: Type.Optional(Type.Boolean()),
 	sendSessionIdHeader: Type.Optional(Type.Boolean()),
 	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
+	supportsStrictMode: Type.Optional(Type.Boolean()),
+	supportsGrammarTools: Type.Optional(Type.Boolean()),
 });
 
 const AnthropicMessagesCompatSchema = Type.Object({
@@ -146,7 +148,10 @@ const AnthropicMessagesCompatSchema = Type.Object({
 	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
 	sendSessionAffinityHeaders: Type.Optional(Type.Boolean()),
 	supportsCacheControlOnTools: Type.Optional(Type.Boolean()),
+	supportsTemperature: Type.Optional(Type.Boolean()),
 	forceAdaptiveThinking: Type.Optional(Type.Boolean()),
+	allowEmptySignature: Type.Optional(Type.Boolean()),
+	supportsStrictTools: Type.Optional(Type.Boolean()),
 });
 
 const ProviderCompatSchema = Type.Union([

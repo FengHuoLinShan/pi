@@ -35,6 +35,7 @@ const compat: Required<OpenAICompletionsCompat> = {
 	chatTemplateKwargs: {},
 	zaiToolStream: false,
 	supportsStrictMode: true,
+	supportsGrammarTools: false,
 	cacheControlFormat: "anthropic",
 	sendSessionAffinityHeaders: false,
 	supportsLongCacheRetention: true,

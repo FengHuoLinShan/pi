@@ -713,6 +713,8 @@ interface ProviderModelConfig {
     supportsDeveloperRole?: boolean;
     supportsReasoningEffort?: boolean;
     supportsUsageInStreaming?: boolean;
+    supportsStrictMode?: boolean;
+    supportsGrammarTools?: boolean; // openai-completions/openai-responses; false falls back to normal function tools
     maxTokensField?: "max_completion_tokens" | "max_tokens";
     requiresToolResultName?: boolean;
     requiresAssistantAfterToolResult?: boolean;
@@ -729,6 +731,7 @@ interface ProviderModelConfig {
     supportsCacheControlOnTools?: boolean;
     forceAdaptiveThinking?: boolean;
     allowEmptySignature?: boolean;
+    supportsStrictTools?: boolean;
   };
 }
 ```

@@ -333,6 +333,8 @@ Some Anthropic models require adaptive thinking (`thinking.type: "adaptive"` plu
 
 Some Anthropic-compatible providers emit thinking blocks with empty signatures and still expect them on replay. Set `allowEmptySignature` to `true` only for those providers; real Anthropic rejects empty thinking signatures.
 
+Set `supportsStrictTools` to `false` for Anthropic-compatible providers that do not accept strict JSON-schema tool definitions.
+
 ```json
 {
   "providers": {
@@ -366,6 +368,7 @@ Some Anthropic-compatible providers emit thinking blocks with empty signatures a
 | `supportsCacheControlOnTools` | Whether the provider accepts Anthropic-style `cache_control` markers on tool definitions. Default: `true`. |
 | `forceAdaptiveThinking` | Whether to send adaptive thinking (`thinking.type: "adaptive"` plus `output_config.effort`) for this model. Built-in adaptive models set this automatically. Default: `false`. |
 | `allowEmptySignature` | Whether to replay empty thinking signatures as `signature: ""` instead of converting thinking to text. Default: `false`. |
+| `supportsStrictTools` | Whether the provider accepts strict JSON-schema tool definitions. Default: `true` for Anthropic, `false` for Anthropic-compatible providers. |
 
 ## OpenAI Compatibility
 
@@ -404,7 +407,8 @@ For providers with partial OpenAI compatibility, use the `compat` field.
 | `thinkingFormat` | Use `reasoning_effort`, `openrouter`, `deepseek`, `together`, `zai`, `qwen`, `chat-template`, or `qwen-chat-template` thinking parameters |
 | `chatTemplateKwargs` | `chat_template_kwargs` values for `thinkingFormat: "chat-template"`; use `{ "$var": "thinking.enabled" }` or `{ "$var": "thinking.effort" }` for pi-controlled thinking values |
 | `cacheControlFormat` | Use Anthropic-style `cache_control` markers on the system prompt, last tool definition, and last user/assistant text content. Currently only `anthropic` is supported. |
-| `supportsStrictMode` | Include the `strict` field in tool definitions |
+| `supportsStrictMode` | Whether the provider accepts strict JSON-schema function tool definitions. Defaults depend on API/provider. |
+| `supportsGrammarTools` | Whether OpenAI-compatible APIs emit custom Lark/regex grammar tools. When `false`, grammar-constrained tools fall back to normal function tools. Default: `true` for OpenAI, `false` for OpenAI-compatible providers. |
 | `supportsLongCacheRetention` | Whether the provider accepts long cache retention when cache retention is `long`: `prompt_cache_retention: "24h"` for OpenAI prompt caching, or `cache_control.ttl: "1h"` when `cacheControlFormat` is `anthropic`. Default: `true`. |
 | `openRouterRouting` | OpenRouter provider routing preferences. This object is sent as-is in the `provider` field of the [OpenRouter API request](https://openrouter.ai/docs/guides/routing/provider-selection). |
 | `vercelGatewayRouting` | Vercel AI Gateway routing config for provider selection (`only`, `order`) |
