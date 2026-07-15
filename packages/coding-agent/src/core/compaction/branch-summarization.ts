@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
-import type { Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
+import type { Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
@@ -32,6 +32,7 @@ import {
 
 export interface BranchSummaryResult {
 	summary?: string;
+	usage?: Usage;
 	readFiles?: string[];
 	modifiedFiles?: string[];
 	aborted?: boolean;
@@ -365,6 +366,7 @@ export async function generateBranchSummary(
 
 	return {
 		summary: summary || "No summary generated",
+		usage: response.usage,
 		readFiles,
 		modifiedFiles,
 	};

@@ -143,6 +143,28 @@ describe("AgentSession.getSessionStats", () => {
 		}
 	});
 
+	it("includes branch summary usage in session totals", () => {
+		const { session, sessionManager } = createSession();
+
+		try {
+			sessionManager.branchWithSummary(null, "summary", undefined, false, {
+				input: 10,
+				output: 20,
+				cacheRead: 30,
+				cacheWrite: 40,
+				totalTokens: 100,
+				cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 },
+			});
+			syncAgentMessages(session, sessionManager);
+
+			const stats = session.getSessionStats();
+			expect(stats.tokens).toEqual({ input: 10, output: 20, cacheRead: 30, cacheWrite: 40, total: 100 });
+			expect(stats.cost).toBe(1);
+		} finally {
+			session.dispose();
+		}
+	});
+
 	it("ignores zero-usage messages when checking for post-compaction context usage", () => {
 		const { session, sessionManager } = createSession();
 

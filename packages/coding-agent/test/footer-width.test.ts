@@ -21,20 +21,27 @@ function createSession(options: {
 	reasoning?: boolean;
 	thinkingLevel?: string;
 	usage?: AssistantUsage;
+	branchUsage?: AssistantUsage;
 }): AgentSession {
 	const usage = options.usage;
-	const entries =
-		usage === undefined
-			? []
-			: [
-					{
-						type: "message",
-						message: {
-							role: "assistant",
-							usage,
-						},
-					},
-				];
+	const entries: Array<Record<string, unknown>> = [];
+
+	if (usage !== undefined) {
+		entries.push({
+			type: "message",
+			message: {
+				role: "assistant",
+				usage,
+			},
+		});
+	}
+
+	if (options.branchUsage !== undefined) {
+		entries.push({
+			type: "branch_summary",
+			usage: options.branchUsage,
+		});
+	}
 
 	const session = {
 		state: {
@@ -123,6 +130,30 @@ describe("FooterComponent width handling", () => {
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
+	});
+
+	it("includes branch summary usage in the total cost", () => {
+		const session = createSession({
+			sessionName: "",
+			usage: {
+				input: 100,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.5 },
+			},
+			branchUsage: {
+				input: 20,
+				output: 5,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.25 },
+			},
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		const statsLine = stripAnsi(footer.render(120)[1]);
+		expect(statsLine).toContain("$0.750");
 	});
 
 	it("shows the latest cache hit rate when cache usage is present", () => {

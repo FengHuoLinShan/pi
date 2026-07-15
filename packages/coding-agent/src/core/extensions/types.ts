@@ -28,6 +28,7 @@ import type {
 	SimpleStreamOptions,
 	TextContent,
 	ToolResultMessage,
+	Usage,
 } from "@earendil-works/pi-ai";
 import type {
 	AutocompleteItem,
@@ -1102,6 +1103,7 @@ export interface SessionBeforeTreeResult {
 	summary?: {
 		summary: string;
 		details?: unknown;
+		usage?: Usage;
 	};
 	/** Override custom instructions for summarization */
 	customInstructions?: string;

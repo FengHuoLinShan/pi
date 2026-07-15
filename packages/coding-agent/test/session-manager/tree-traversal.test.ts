@@ -319,7 +319,15 @@ describe("SessionManager append and tree traversal", () => {
 			const _id2 = session.appendMessage(assistantMsg("2"));
 			const _id3 = session.appendMessage(userMsg("3"));
 
-			const summaryId = session.branchWithSummary(id1, "Summary of abandoned work");
+			const usage = {
+				input: 10,
+				output: 20,
+				cacheRead: 30,
+				cacheWrite: 40,
+				totalTokens: 100,
+				cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 },
+			};
+			const summaryId = session.branchWithSummary(id1, "Summary of abandoned work", undefined, false, usage);
 
 			expect(session.getLeafId()).toBe(summaryId);
 
@@ -329,6 +337,7 @@ describe("SessionManager append and tree traversal", () => {
 			expect(summaryEntry?.parentId).toBe(id1);
 			if (summaryEntry?.type === "branch_summary") {
 				expect(summaryEntry.summary).toBe("Summary of abandoned work");
+				expect(summaryEntry.usage).toEqual(usage);
 			}
 		});
 

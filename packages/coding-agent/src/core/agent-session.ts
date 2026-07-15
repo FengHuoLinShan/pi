@@ -24,7 +24,7 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage, ImageContent, Message, Model, TextContent, Usage } from "@earendil-works/pi-ai/compat";
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
@@ -2844,7 +2844,7 @@ export class AgentSession {
 		this._branchSummaryAbortController = new AbortController();
 
 		try {
-			let extensionSummary: { summary: string; details?: unknown } | undefined;
+			let extensionSummary: { summary: string; details?: unknown; usage?: Usage } | undefined;
 			let fromExtension = false;
 
 			// Emit session_before_tree event
@@ -2879,6 +2879,7 @@ export class AgentSession {
 			// Run default summarizer if needed
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;
+			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const model = this.model!;
 				const { apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
@@ -2901,6 +2902,7 @@ export class AgentSession {
 					throw new Error(result.error);
 				}
 				summaryText = result.summary;
+				summaryUsage = result.usage;
 				summaryDetails = {
 					readFiles: result.readFiles || [],
 					modifiedFiles: result.modifiedFiles || [],
@@ -2908,6 +2910,7 @@ export class AgentSession {
 			} else if (extensionSummary) {
 				summaryText = extensionSummary.summary;
 				summaryDetails = extensionSummary.details;
+				summaryUsage = extensionSummary.usage;
 			}
 
 			// Determine the new leaf position based on target type
@@ -2943,6 +2946,7 @@ export class AgentSession {
 					summaryText,
 					summaryDetails,
 					fromExtension,
+					summaryUsage,
 				);
 				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
 
@@ -3033,6 +3037,13 @@ export class AgentSession {
 		let totalCost = 0;
 
 		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type === "branch_summary" && entry.usage) {
+				totalInput += entry.usage.input;
+				totalOutput += entry.usage.output;
+				totalCacheRead += entry.usage.cacheRead;
+				totalCacheWrite += entry.usage.cacheWrite;
+				totalCost += entry.usage.cost.total;
+			}
 			if (entry.type !== "message") continue;
 			totalMessages++;
 			const message = entry.message;
