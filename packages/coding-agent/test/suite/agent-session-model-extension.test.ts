@@ -164,6 +164,15 @@ describe("AgentSession model and extension characterization", () => {
 			totalTokens: 10,
 			cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 },
 		};
+		const patchedToolUsage: Usage = {
+			input: 5,
+			output: 6,
+			cacheRead: 7,
+			cacheWrite: 8,
+			totalTokens: 26,
+			cost: { input: 0.5, output: 0.6, cacheRead: 0.7, cacheWrite: 0.8, total: 2.6 },
+		};
+		let observedToolUsage: Usage | undefined;
 		const echoTool: AgentTool = {
 			name: "echo",
 			label: "Echo",
@@ -178,10 +187,14 @@ describe("AgentSession model and extension characterization", () => {
 			tools: [echoTool],
 			extensionFactories: [
 				(pi) => {
-					pi.on("tool_result", async () => ({
-						content: [{ type: "text", text: "patched result" }],
-						details: { patched: true },
-					}));
+					pi.on("tool_result", async (event) => {
+						observedToolUsage = event.usage;
+						return {
+							content: [{ type: "text", text: "patched result" }],
+							details: { patched: true },
+							usage: patchedToolUsage,
+						};
+					});
 				},
 			],
 		});
@@ -207,8 +220,9 @@ describe("AgentSession model and extension characterization", () => {
 		const toolResult = harness.session.messages.find(
 			(message) => message.role === "toolResult" && message.details?.patched === true,
 		);
+		expect(observedToolUsage).toEqual(toolUsage);
 		expect(toolResult).toBeDefined();
-		expect(toolResult?.role === "toolResult" ? toolResult.usage : undefined).toEqual(toolUsage);
+		expect(toolResult?.role === "toolResult" ? toolResult.usage : undefined).toEqual(patchedToolUsage);
 	});
 
 	it("allows extension context handlers to modify messages before the LLM call", async () => {
