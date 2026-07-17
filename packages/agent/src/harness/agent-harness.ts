@@ -25,6 +25,7 @@ import type {
 	AgentHarnessResources,
 	AgentHarnessStreamOptions,
 	AgentHarnessStreamOptionsPatch,
+	CompactResult,
 	ExecutionEnv,
 	NavigateTreeResult,
 	PendingSessionWrite,
@@ -427,9 +428,16 @@ export class AgentHarness<
 					content: result.content,
 					details: result.details,
 					isError,
+					usage: result.usage,
 				});
 				return patch
-					? { content: patch.content, details: patch.details, isError: patch.isError, terminate: patch.terminate }
+					? {
+							content: patch.content,
+							details: patch.details,
+							isError: patch.isError,
+							usage: patch.usage,
+							terminate: patch.terminate,
+						}
 					: undefined;
 			},
 			prepareNextTurn: async () => {
@@ -683,9 +691,7 @@ export class AgentHarness<
 		}
 	}
 
-	async compact(
-		customInstructions?: string,
-	): Promise<{ summary: string; firstKeptEntryId: string; tokensBefore: number; details?: unknown }> {
+	async compact(customInstructions?: string): Promise<CompactResult> {
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "compact() requires idle harness");
 		this.phase = "compaction";
 		try {
@@ -716,6 +722,7 @@ export class AgentHarness<
 				result.tokensBefore,
 				result.details,
 				provided !== undefined,
+				result.usage,
 			);
 			const entry = await this.session.getEntry(entryId);
 			if (entry?.type === "compaction") {
@@ -757,6 +764,7 @@ export class AgentHarness<
 			let summaryEntry: NavigateTreeResult["summaryEntry"];
 			let summaryText: string | undefined = hookResult?.summary?.summary;
 			let summaryDetails: unknown = hookResult?.summary?.details;
+			let summaryUsage = hookResult?.summary?.usage;
 			if (!summaryText && options?.summarize && entries.length > 0) {
 				const model = this.model;
 				if (!model) throw new AgentHarnessError("invalid_state", "No model set for branch summary");
@@ -772,6 +780,7 @@ export class AgentHarness<
 					throw new AgentHarnessError("branch_summary", branchSummary.error.message, branchSummary.error);
 				}
 				summaryText = branchSummary.value.summary;
+				summaryUsage = branchSummary.value.usage;
 				summaryDetails = {
 					readFiles: branchSummary.value.readFiles,
 					modifiedFiles: branchSummary.value.modifiedFiles,
@@ -804,7 +813,12 @@ export class AgentHarness<
 			const summaryId = await this.session.moveTo(
 				newLeafId,
 				summaryText
-					? { summary: summaryText, details: summaryDetails, fromHook: hookResult?.summary !== undefined }
+					? {
+							summary: summaryText,
+							details: summaryDetails,
+							usage: summaryUsage,
+							fromHook: hookResult?.summary !== undefined,
+						}
 					: undefined,
 			);
 			if (summaryId) {
