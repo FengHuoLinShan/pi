@@ -833,11 +833,19 @@ export class InteractiveMode {
 		});
 
 		// Start package update check asynchronously
-		this.checkForPackageUpdates().then((updates) => {
-			if (updates.length > 0) {
-				this.showPackageUpdateNotification(updates);
-			}
-		});
+		this.checkForPackageUpdates()
+			.then((updates) => {
+				if (updates.length > 0) {
+					this.showPackageUpdateNotification(updates);
+				}
+			})
+			.finally(() => {
+				// On Windows, npm can overwrite the shared console title while checking
+				// extension package versions. Restore Pi's title after the startup check.
+				if (process.platform === "win32" && this.isInitialized) {
+					this.updateTerminalTitle();
+				}
+			});
 
 		// Check tmux keyboard setup asynchronously
 		this.checkTmuxKeyboardSetup().then((warning) => {
@@ -4036,10 +4044,12 @@ export class InteractiveMode {
 				await this.session.prompt(message.text);
 			}
 
-			// Send first prompt (starts streaming)
-			const promptPromise = this.session.prompt(firstPrompt.text).catch((error) => {
-				restoreQueue(error);
-			});
+			// Start a prompt when idle, or queue it into a run still finishing compaction.
+			const promptPromise = this.session
+				.prompt(firstPrompt.text, { streamingBehavior: firstPrompt.mode })
+				.catch((error) => {
+					restoreQueue(error);
+				});
 
 			// Queue remaining messages
 			for (const message of rest) {
@@ -4869,7 +4879,10 @@ export class InteractiveMode {
 	}
 
 	private showLoginAuthTypeSelector(providerOptions?: AuthSelectorProvider[]): void {
-		const subscriptionLabel = "Sign in with an account";
+		const oauthProvider = providerOptions?.find((provider) => provider.authType === "oauth");
+		const oauthLoginLabel =
+			oauthProvider?.method && "loginLabel" in oauthProvider.method ? oauthProvider.method.loginLabel : undefined;
+		const subscriptionLabel = oauthLoginLabel ?? "Sign in with an account";
 		const apiKeyLabel = "Sign in with an API key";
 		const availableAuthTypes = providerOptions
 			? new Set(providerOptions.map((provider) => provider.authType))
