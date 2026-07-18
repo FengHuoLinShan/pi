@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a deterministic AgentHarness eval runner with declarative faux-provider scenarios, semantic replay checks, JSON reports, and baseline quality gates for local and CI regression testing.
+- Added privacy-safe telemetry, redacted checksummed trace bundles, and five-level UI/state/model/tool/live replay with explicit recording availability.
+- Added structured `ToolSpec` declarations with explicit retry-safety metadata, deterministic tool policy decisions, exact resolved-action-bound approval requests and grants, one-shot grant tracking, and native fail-closed `AgentHarness`/loop adapters.
+- Added typed, source-aware `AgentHarness` hooks with ordered reducers, cleanup scopes, explicit error policy, and a stable hook context facade.
+- Added optional low-level agent run budgets, absolute deadlines, structured termination events, and configurable repeated-tool-call loop detection.
+- Added a session-backed canonical runtime event store with pure replay/checkpoint reduction, conservative interrupted-run recovery, and partial JSONL tail repair.
+- Added deterministic context compilation with budgeted source selection, repository maps, and freshness-aware evidence ledgers.
+
 ## [0.80.10] - 2026-07-16
 
 ## [0.80.9] - 2026-07-16

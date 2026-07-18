@@ -3,6 +3,7 @@
  */
 
 import { type Content, FinishReason, FunctionCallingConfigMode, type Part } from "@google/genai";
+import { compileToolSchemas } from "../tool-schema.ts";
 import type { Context, ImageContent, Model, StopReason, TextContent, Tool } from "../types.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { transformMessages } from "./transform-messages.ts";
@@ -234,33 +235,6 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 	return contents;
 }
 
-const JSON_SCHEMA_META_DECLARATIONS = new Set([
-	"$schema",
-	"$id",
-	"$anchor",
-	"$dynamicAnchor",
-	"$vocabulary",
-	"$comment",
-	"$defs",
-	"definitions", // pre-draft-2019-09 equivalent of $defs
-]);
-
-/**
- * Strip meta-declarations from a schema obj
- */
-function sanitizeForOpenApi(schema: unknown): unknown {
-	if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
-		return schema;
-	}
-
-	const result: Record<string, unknown> = {};
-	for (const [key, value] of Object.entries(schema)) {
-		if (JSON_SCHEMA_META_DECLARATIONS.has(key)) continue;
-		result[key] = sanitizeForOpenApi(value);
-	}
-	return result;
-}
-
 /**
  * Convert tools to Gemini function declarations format.
  *
@@ -274,14 +248,13 @@ export function convertTools(
 	useParameters = false,
 ): { functionDeclarations: Record<string, unknown>[] }[] | undefined {
 	if (tools.length === 0) return undefined;
+	const compiled = compileToolSchemas(tools, { target: useParameters ? "openapi-3.0" : "json-schema" });
 	return [
 		{
-			functionDeclarations: tools.map((tool) => ({
+			functionDeclarations: compiled.tools.map((tool) => ({
 				name: tool.name,
 				description: tool.description,
-				...(useParameters
-					? { parameters: sanitizeForOpenApi(tool.parameters as unknown) }
-					: { parametersJsonSchema: tool.parameters }),
+				...(useParameters ? { parameters: tool.provider.schema } : { parametersJsonSchema: tool.provider.schema }),
 			})),
 		},
 	];

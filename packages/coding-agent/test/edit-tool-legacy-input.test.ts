@@ -84,7 +84,12 @@ describe("edit tool prepareArguments", () => {
 		});
 
 		const result = await definition.execute("tool-1", prepared, undefined, undefined, {} as ExtensionContext);
-		expect(result.content).toEqual([{ type: "text", text: "Successfully replaced 1 block(s) in legacy.txt." }]);
+		expect(result.content).toHaveLength(1);
+		expect(result.content[0]?.type).toBe("text");
+		if (result.content[0]?.type === "text") {
+			expect(result.content[0].text).toContain("Successfully replaced 1 block(s) in legacy.txt.");
+			expect(result.content[0].text).toContain("Revision: sha256:");
+		}
 		expect(await readFile(filePath, "utf8")).toBe("after\n");
 	});
 });

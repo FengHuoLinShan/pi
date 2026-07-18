@@ -73,10 +73,11 @@ describe("Coding Agent Tools", () => {
 
 			const result = await readTool.execute("test-call-1", { path: testFile });
 
-			expect(getTextOutput(result)).toBe(content);
+			expect(getTextOutput(result)).toContain(content);
+			expect(getTextOutput(result)).toContain(`[Revision: ${result.details?.revision}]`);
 			// No truncation message since file fits within limits
 			expect(getTextOutput(result)).not.toContain("Use offset=");
-			expect(result.details).toBeUndefined();
+			expect(result.details?.revision).toMatch(/^sha256:[0-9a-f]{64}$/);
 		});
 
 		it("should handle non-existent files", async () => {
@@ -246,7 +247,9 @@ describe("Coding Agent Tools", () => {
 
 			expect(getTextOutput(result)).toContain("Successfully wrote");
 			expect(getTextOutput(result)).toContain(testFile);
-			expect(result.details).toBeUndefined();
+			expect(result.details?.beforeRevision).toBe("missing");
+			expect(result.details?.afterRevision).toMatch(/^sha256:[0-9a-f]{64}$/);
+			expect(result.details?.patch).toContain("+Test content");
 		});
 
 		it("should create parent directories", async () => {

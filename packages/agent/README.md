@@ -2,6 +2,8 @@
 
 Stateful agent with tool execution and event streaming. Built on `@earendil-works/pi-ai`.
 
+For the durable Harness architecture, hooks, tool policy, context compilation, privacy-safe trace replay, and deterministic regression gates, see [docs/durable-harness.md](docs/durable-harness.md), [docs/hooks.md](docs/hooks.md), [docs/tool-policy.md](docs/tool-policy.md), [docs/context-compiler.md](docs/context-compiler.md), [docs/trace-replay.md](docs/trace-replay.md), and [docs/evals.md](docs/evals.md). Repository contributors can run the tracked core gate with `npm run eval:harness` from the monorepo root.
+
 ## Installation
 
 ```bash

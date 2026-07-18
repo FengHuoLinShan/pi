@@ -231,6 +231,9 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: AgentHarness eval gate
+        run: npm run eval:harness
+
       - name: Upgrade npm for trusted publishing
         run: |
           npm install -g npm@11.16.0 --ignore-scripts

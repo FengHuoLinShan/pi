@@ -2,7 +2,7 @@
 
 <!-- Synced from jot 3utlzkxy. Edit this file in-repo going forward. -->
 
-Final design.
+Implemented design. The public types and default reducer host live in `src/harness/hooks.ts`; `AgentHarness` accepts a custom host through `AgentHarnessOptions.hooks` and exposes it as `harness.hooks`.
 
 ## Core model
 
@@ -68,10 +68,10 @@ interface AgentHarnessHooks<E extends HookEvent<string, unknown>, Ctx> {
 		handler: HookHandler<Extract<E, { type: TType }>, Ctx>,
 	): () => void;
 
-	emit<TEvent extends E>(
-		event: TEvent,
+	emit<TType extends E["type"]>(
+		event: Extract<E, { type: TType }>,
 		signal?: AbortSignal,
-	): Promise<ResultOf<TEvent> | undefined>;
+	): Promise<ResultOf<Extract<E, { type: TType }>> | undefined>;
 
 	addCleanup(cleanup: () => void | Promise<void>): () => void;
 
@@ -354,7 +354,7 @@ harness.setHooks(nextHooks); // idle-only if supported
 
 ### 1. Error policy must be explicit
 
-Existing coding-agent catches extension errors, reports them, and continues. New hooks need the same policy, likely:
+The default host supports both fail-fast core behavior and coding-agent's report-and-continue extension behavior:
 
 ```ts
 errorMode: "continue" | "throw"
@@ -367,7 +367,7 @@ For coding-agent, default should be `"continue"`.
 
 Existing runner knows which extension produced an error/resource/tool. Plain `on()` loses that unless we add registration metadata or scopes.
 
-Probably needed:
+Implemented through source-aware registration and scopes:
 
 ```ts
 const scope = hooks.createScope({ sourceInfo });

@@ -14,10 +14,16 @@
 			"types": "./dist/node.d.ts",
 			"import": "./dist/node.js"
 		},
+		"./evals": {
+			"types": "./dist/evals/index.d.ts",
+			"import": "./dist/evals/index.js"
+		},
 		"./package.json": "./package.json"
 	},
 	"files": [
 		"dist",
+		"docs",
+		"evals",
 		"README.md"
 	],
 	"scripts": {
@@ -25,6 +31,8 @@
 		"build": "tsgo -p tsconfig.build.json",
 		"test": "vitest --run",
 		"test:harness": "vitest --run --config vitest.harness.config.ts",
+		"eval:harness": "tsx src/evals/cli.ts --suite evals/scenarios/core.json --baseline evals/baseline.json --report ../../.artifacts/agent-harness-evals.json",
+		"eval:harness:update": "tsx src/evals/cli.ts --suite evals/scenarios/core.json --baseline evals/baseline.json --report ../../.artifacts/agent-harness-evals.json --update-baseline",
 		"coverage:harness": "vitest --run --config vitest.harness.config.ts --coverage",
 		"prepublishOnly": "npm run clean && npm run build"
 	},

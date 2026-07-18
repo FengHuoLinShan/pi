@@ -1,11 +1,21 @@
 import { join } from "node:path";
-import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import {
+	Agent,
+	type AgentLoopDetection,
+	type AgentMessage,
+	type AgentOptions,
+	type AgentRunBudget,
+	type ThinkingLevel,
+	type ToolPolicyAdapter,
+} from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Message, type Model } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
+import { CodingAgentHarnessRuntime } from "./coding-agent-harness-runtime.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
+import type { ExecutionBoundary } from "./execution-boundary.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
@@ -17,6 +27,8 @@ import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
 import { time } from "./timings.ts";
 import {
+	allToolNames,
+	createAllTools,
 	createBashTool,
 	createCodingTools,
 	createEditTool,
@@ -25,6 +37,8 @@ import {
 	createLsTool,
 	createReadOnlyTools,
 	createReadTool,
+	createTool,
+	createToolDefinition,
 	createWriteTool,
 	type ToolName,
 	withFileMutationQueue,
@@ -66,6 +80,11 @@ export interface CreateAgentSessionOptions {
 	excludeTools?: string[];
 	/** Custom tools to register (in addition to built-in tools). */
 	customTools?: ToolDefinition[];
+	/**
+	 * Route built-in tools and session bash execution through an attested external boundary.
+	 * Default local behavior is unchanged when omitted.
+	 */
+	executionBoundary?: ExecutionBoundary;
 
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
@@ -77,6 +96,12 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Hard limits applied independently to each user-initiated Harness run. */
+	runBudget?: AgentRunBudget;
+	/** Deterministic repeated-tool-call loop detection for each Harness run. */
+	loopDetection?: AgentLoopDetection;
+	/** Fail-closed tool policy and approval adapter used by the Harness runtime. */
+	toolPolicy?: ToolPolicyAdapter;
 }
 
 /** Result from createAgentSession */
@@ -109,6 +134,7 @@ export type { Tool } from "./tools/index.ts";
 export {
 	withFileMutationQueue,
 	// Tool factories (for custom cwd)
+	createAllTools,
 	createCodingTools,
 	createReadOnlyTools,
 	createReadTool,
@@ -118,6 +144,8 @@ export {
 	createGrepTool,
 	createFindTool,
 	createLsTool,
+	createTool,
+	createToolDefinition,
 };
 
 // Helper Functions
@@ -177,6 +205,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
 		await resourceLoader.reload();
 		time("resourceLoader.reload");
+	}
+
+	if (options.executionBoundary) {
+		if (options.customTools && options.customTools.length > 0) {
+			throw new Error(
+				"customTools cannot be enabled with executionBoundary because they execute in the host process",
+			);
+		}
+		const unsupportedTool = options.tools?.find((toolName) => !allToolNames.has(toolName as ToolName));
+		if (unsupportedTool) {
+			throw new Error(
+				`Tool ${unsupportedTool} cannot be enabled with executionBoundary because it is not a bounded built-in tool`,
+			);
+		}
+		const extensionTool = resourceLoader
+			.getExtensions()
+			.extensions.flatMap((extension) => [...extension.tools.keys()])[0];
+		if (extensionTool) {
+			throw new Error(
+				`Extension tool ${extensionTool} cannot be enabled with executionBoundary because it executes in the host process`,
+			);
+		}
 	}
 
 	// Check if session has existing data to restore
@@ -286,7 +336,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	agent = new Agent({
+	const agentOptions: AgentOptions = {
 		initialState: {
 			systemPrompt: "",
 			model,
@@ -352,7 +402,43 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
-	});
+	};
+	agent = model
+		? new CodingAgentHarnessRuntime({
+				...agentOptions,
+				models: modelRuntime,
+				sessionManager,
+				cwd,
+				runBudget: options.runBudget,
+				loopDetection: options.loopDetection,
+				toolPolicy: options.toolPolicy,
+				getStreamOptions: () => {
+					const providerRetrySettings = settingsManager.getProviderRetrySettings();
+					const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
+					const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2_147_483_647 : httpIdleTimeoutMs;
+					return {
+						timeoutMs: providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
+						websocketConnectTimeoutMs: settingsManager.getWebSocketConnectTimeoutMs(),
+						maxRetries: providerRetrySettings.maxRetries,
+						maxRetryDelayMs: providerRetrySettings.maxRetryDelayMs,
+						transport: settingsManager.getTransport(),
+						thinkingBudgets: settingsManager.getThinkingBudgets(),
+						transformHeaders: async (requestHeaders) => {
+							const headers = mergeProviderAttributionHeaders(
+								agent.state.model,
+								settingsManager,
+								sessionManager.getSessionId(),
+								requestHeaders,
+							);
+							const headerRunner = extensionRunnerRef.current;
+							return headerRunner?.hasHandlers("before_provider_headers")
+								? headerRunner.emitBeforeProviderHeaders(headers ?? {})
+								: (headers ?? {});
+						},
+					};
+				},
+			})
+		: new Agent(agentOptions);
 
 	// Restore messages if session has existing data
 	if (hasExistingSession) {
@@ -370,12 +456,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const session = new AgentSession({
 		agent,
+		agentOwnsSessionPersistence: agent instanceof CodingAgentHarnessRuntime,
 		sessionManager,
 		settingsManager,
 		cwd,
 		scopedModels: options.scopedModels,
 		resourceLoader,
 		customTools: options.customTools,
+		executionBoundary: options.executionBoundary,
 		modelRuntime,
 		initialActiveToolNames,
 		allowedToolNames,
@@ -383,6 +471,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 	});
+	if (agent instanceof CodingAgentHarnessRuntime) await agent.initialize();
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {

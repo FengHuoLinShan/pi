@@ -95,6 +95,14 @@
           "path": "sdk.md"
         },
         {
+          "title": "App Protocol",
+          "path": "app-protocol.md"
+        },
+        {
+          "title": "Artifacts and Processes",
+          "path": "artifacts-and-processes.md"
+        },
+        {
           "title": "RPC Mode",
           "path": "rpc.md"
         },

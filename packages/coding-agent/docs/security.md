@@ -32,6 +32,14 @@ Non-interactive modes (`-p`, `--mode json`, and `--mode rpc`) do not show a trus
 
 Pi does not include a built-in sandbox. Built-in tools can read files, write files, edit files, and run shell commands with the permissions of the pi process. Extensions are TypeScript modules that run with the same permissions. Package installs, shell commands, language servers, test commands, and other developer tools behave as ordinary local processes.
 
+SDK and extension callers may configure `allowedRoots` on the built-in `read`, `edit`, and `write` tool factories. The tools canonicalize paths, reject symlink escapes, and revalidate mutation targets before writing. This is an opt-in defense against accidental or confused-path file access; it is not a sandbox and cannot eliminate filesystem TOCTOU races against a hostile process. Use an OS, container, or VM boundary for adversarial workloads.
+
+SDK callers can also pass an `executionBoundary` to `createAgentSession()` or a `boundary` to the generic built-in tool factories. This does not add an in-process sandbox. It is a fail-closed contract for routing built-in tool operations and session bash execution to a trusted external backend that already enforces an OS, container, VM, or remote-sandbox boundary.
+
+The boundary profile declares workspace mounts and read/write modes, process execution policy, network policy, and the environment-variable/secret names allowed to enter tool processes. The backend must attest that it enforces the exact profile digest and declare matching capabilities. Pi rejects profile mismatches, missing capabilities, missing tool operations, and attempts to replace boundary-owned operations. Canonical `allowedRoots` checks are still applied to bounded file tools as defense in depth, but they are not treated as proof of isolation.
+
+The contract scope is deliberately `built-in-tools`. Model-provider requests, resource discovery, and extension module code still run in the host pi process. `createAgentSession({ executionBoundary })` rejects SDK custom tools and extension-registered tools because those tools would bypass the backend; trusted extensions without tools can still run host-side hooks. To isolate the whole process, run pi inside a container, VM, or OpenShell sandbox instead.
+
 This is intentional. Pi is designed to operate on local source trees, invoke project toolchains, and integrate with the user's existing development environment. A partial in-process sandbox would be easy to misunderstand as a security boundary while still depending on the host shell, filesystem, package managers, credentials, and extension code. Real isolation needs to come from the operating system or a virtualization/container boundary.
 
 Project trust is only an input-loading guard. It prevents a repository from silently changing pi's settings or extensions before you approve it. It does not make untrusted code, untrusted prompts, or untrusted model output safe. Prompt injection from repository files, comments, documentation, context files, or build output is expected local-agent risk and cannot be reliably prevented by pi.
@@ -44,6 +52,7 @@ Common patterns are documented in [Containerization](containerization.md):
 
 - run the whole `pi` process inside a container/sandbox
 - run host pi while routing built-in tool execution into a Gondolin micro-VM
+- use the SDK execution-boundary contract with a backend adapter that can attest the requested policy
 - mount only the workspace paths the agent should access
 - avoid mounting host `~/.pi/agent` unless the container should access host sessions, settings, and credentials
 - pass the minimum required API keys or use short-lived credentials

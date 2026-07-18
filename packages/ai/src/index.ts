@@ -22,6 +22,7 @@ export * from "./auth/context.ts";
 export * from "./auth/credential-store.ts";
 export * from "./auth/helpers.ts";
 export * from "./auth/types.ts";
+export * from "./capabilities.ts";
 export type {
 	OAuthAuthInfo,
 	OAuthDeviceCodeInfo,
@@ -35,7 +36,9 @@ export * from "./models.ts";
 export * from "./models-store.ts";
 export * from "./providers/faux.ts";
 export * from "./session-resources.ts";
+export * from "./tool-schema.ts";
 export * from "./types.ts";
+export * from "./utils/deferred-tools.ts";
 export * from "./utils/diagnostics.ts";
 export * from "./utils/event-stream.ts";
 export * from "./utils/json-parse.ts";

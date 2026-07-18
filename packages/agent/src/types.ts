@@ -48,6 +48,80 @@ export type ToolExecutionMode = "sequential" | "parallel";
  */
 export type QueueMode = "all" | "one-at-a-time";
 
+/** Optional hard limits for one low-level agent-loop invocation. Omitted limits are unlimited. */
+export interface AgentRunBudget {
+	/** Maximum number of assistant turns started. */
+	maxSteps?: number;
+	/** Maximum number of provider requests started. */
+	maxModelCalls?: number;
+	/** Maximum number of tool calls admitted for execution or preflight. */
+	maxToolCalls?: number;
+	/** Maximum elapsed wall-clock time for the run, in milliseconds. */
+	maxWallTimeMs?: number;
+	/** Maximum cumulative model tokens reported by assistant messages. */
+	maxModelTokens?: number;
+	/** Maximum cumulative model cost reported by assistant messages, in the provider's cost units. */
+	maxCost?: number;
+	/** Absolute Unix timestamp in milliseconds after which the run is terminated. */
+	deadline?: number;
+}
+
+/** Deterministic repeated-tool-call loop detection. Omit this config to disable detection. */
+export interface AgentLoopDetection {
+	/** Number of consecutive equivalent tool calls that triggers termination. Must be at least 2. */
+	maxConsecutiveToolCalls: number;
+	/**
+	 * Require equivalent finalized results as well as equivalent names and arguments. Detection then occurs
+	 * after the threshold call completes, avoiding false positives for read-like tools whose result changes.
+	 * Set false to stop before the threshold call executes based only on name and arguments. Default: true.
+	 */
+	includeToolResult?: boolean;
+}
+
+/** Cumulative resource use observed by one agent-loop invocation. */
+export interface AgentRunUsage {
+	steps: number;
+	modelCalls: number;
+	toolCalls: number;
+	modelTokens: number;
+	cost: number;
+	elapsedMs: number;
+}
+
+export type AgentRunBudgetReason =
+	| "max_steps"
+	| "max_model_calls"
+	| "max_tool_calls"
+	| "max_wall_time"
+	| "max_model_tokens"
+	| "max_cost";
+
+/** Structured non-success terminal state produced by run limits or loop detection. */
+export type AgentRunTermination =
+	| {
+			status: "budget_exhausted";
+			reason: AgentRunBudgetReason;
+			limit: number;
+			observed: number;
+			partialResult: boolean;
+	  }
+	| {
+			status: "deadline_exceeded";
+			reason: "deadline";
+			deadline: number;
+			observedAt: number;
+			partialResult: boolean;
+	  }
+	| {
+			status: "loop_detected";
+			reason: "repeated_tool_call";
+			toolName: string;
+			arguments: unknown;
+			repetitions: number;
+			threshold: number;
+			partialResult: boolean;
+	  };
+
 /** A single tool call content block emitted by an assistant message. */
 export type AgentToolCall = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 
@@ -258,6 +332,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	toolExecution?: ToolExecutionMode;
 
+	/** Optional per-invocation hard limits. All limits are disabled by default. */
+	runBudget?: AgentRunBudget;
+
+	/** Optional repeated-tool-call detection. Disabled by default. */
+	loopDetection?: AgentLoopDetection;
+
 	/**
 	 * Called before a tool is executed, after arguments have been validated.
 	 *
@@ -416,6 +496,7 @@ export type AgentEvent =
 	// Agent lifecycle
 	| { type: "agent_start" }
 	| { type: "agent_end"; messages: AgentMessage[] }
+	| { type: "agent_termination"; termination: AgentRunTermination; usage: AgentRunUsage }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }

@@ -12,6 +12,7 @@ import type {
 	CredentialStore,
 	ProviderAuth,
 } from "./auth/types.ts";
+import { type CapabilityProfile, type CapabilityProfileOverrides, deriveCapabilityProfile } from "./capabilities.ts";
 import { InMemoryModelsStore, type ModelsStore, type ProviderModelsStore } from "./models-store.ts";
 import type {
 	Api,
@@ -62,6 +63,7 @@ export interface ModelsStreamTransforms {
 
 export type ModelsApiStreamOptions<TApi extends Api> = ApiStreamOptions<TApi> & ModelsStreamTransforms;
 export type ModelsSimpleStreamOptions = SimpleStreamOptions & ModelsStreamTransforms;
+export type ProviderCapabilityResolver = (model: Model<Api>) => CapabilityProfileOverrides | undefined;
 
 /**
  * A provider is the concrete runtime unit. It owns id/name/base metadata,
@@ -78,6 +80,8 @@ export interface Provider<TApi extends Api = Api> {
 
 	readonly baseUrl?: string;
 	readonly headers?: ProviderHeaders;
+	/** Optional provider/adapter refinements layered over model-derived capabilities. */
+	readonly capabilities?: CapabilityProfileOverrides | ProviderCapabilityResolver;
 
 	/**
 	 * Required: at least one of `apiKey`/`oauth`. Every provider has auth
@@ -119,6 +123,16 @@ export interface Provider<TApi extends Api = Api> {
 	streamSimple(model: Model<TApi>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
 }
 
+/** Resolve a model profile with optional provider/adapter refinements. */
+export function getProviderCapabilityProfile(
+	provider: Pick<Provider, "capabilities"> | undefined,
+	model: Model<Api>,
+): CapabilityProfile {
+	const configured = provider?.capabilities;
+	const overrides = typeof configured === "function" ? configured(model) : configured;
+	return deriveCapabilityProfile(model, overrides);
+}
+
 /**
  * Runtime collection of providers plus auth application and stream
  * convenience. Providers own stream behavior; `Models` resolves auth and
@@ -139,6 +153,9 @@ export interface Models {
 	 * are typed as `Model<Api>`; narrow with the `hasApi()` type guard.
 	 */
 	getModel(provider: string, id: string): Model<Api> | undefined;
+
+	/** Resolve model, API-adapter, compatibility, and provider capability metadata. */
+	getCapabilities?(model: Model<Api>): CapabilityProfile;
 
 	/**
 	 * Refresh every configured dynamic provider concurrently. Provider errors and cancellation
@@ -187,6 +204,7 @@ export interface Models {
 }
 
 export interface MutableModels extends Models {
+	getCapabilities(model: Model<Api>): CapabilityProfile;
 	/** Upsert/replace by provider.id. Provider ids are unique. */
 	setProvider(provider: Provider): void;
 	deleteProvider(id: string): void;
@@ -271,6 +289,10 @@ class ModelsImpl implements MutableModels {
 
 	getModel(provider: string, id: string): Model<Api> | undefined {
 		return this.getModels(provider).find((model) => model.id === id);
+	}
+
+	getCapabilities(model: Model<Api>): CapabilityProfile {
+		return getProviderCapabilityProfile(this.providers.get(model.provider), model);
 	}
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
@@ -536,6 +558,8 @@ export interface CreateProviderOptions<TApi extends Api = Api> {
 	name?: string;
 	baseUrl?: string;
 	headers?: ProviderHeaders;
+	/** Optional provider/adapter refinements layered over model-derived capabilities. */
+	capabilities?: CapabilityProfileOverrides | ProviderCapabilityResolver;
 	/** Required — every provider has auth semantics, even ambient/keyless ones. */
 	auth: ProviderAuth;
 	/** Static baseline model list (empty for purely dynamic providers). */
@@ -591,6 +615,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		name: input.name ?? input.id,
 		baseUrl: input.baseUrl,
 		headers: input.headers,
+		capabilities: input.capabilities,
 		auth: input.auth,
 		getModels: currentModels,
 		refreshModels: fetchModels

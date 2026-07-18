@@ -15,7 +15,7 @@ The intended rule is:
 - runtime config setters update future snapshots without mutating the current provider request
 - session writes made while busy are durably queued and flushed in deterministic order
 - getters return latest harness config, not in-flight snapshots
-- listeners/hooks currently receive no facade; if they close over the raw harness and call settlement APIs such as `waitForIdle()` during the active run, they can deadlock. A future facade should expose `runWhenIdle()` instead.
+- hook handlers receive a stable context facade for environment, session access, phase reads, ordered message appends, and pending-write diagnostics. Structural methods still reject while busy.
 
 `AssistantMessageStream` already decouples provider transport streaming, such as SSE or websocket reads, from downstream event consumption. The harness can therefore await listeners, extension hooks, persistence, and save-point work without blocking the provider transport reader or reintroducing ad hoc event queues. Lifecycle code should prefer explicit awaited sequencing at harness boundaries over fire-and-forget hook/event settlement.
 
@@ -46,6 +46,7 @@ Harness config is the latest runtime configuration set by the application or ext
 - resources
 - stream options
 - system prompt or system prompt provider
+- optional fail-closed tool policy adapter
 
 Getters return harness config. They do not return the snapshot used by an in-flight provider request.
 
@@ -73,7 +74,7 @@ Static option values are used directly. System-prompt provider callbacks are inv
 
 Resource arrays are shallow-copied when a snapshot is created. Individual skill and prompt-template objects are not deep-copied.
 
-Stream options are shallow-copied when a snapshot is created. `headers` and `metadata` maps are shallow-copied; their values are not deep-copied. Credentials from `getApiKeyAndHeaders()` are resolved per provider request so expiring tokens can refresh, but the configured stream options and derived session id come from the current turn snapshot.
+Stream options are shallow-copied when a snapshot is created. `headers` and `metadata` maps are shallow-copied; their values are not deep-copied. The supplied `Models` runtime resolves provider authentication per request so expiring credentials can refresh, while the configured stream options and derived session id come from the current turn snapshot.
 
 ### Session
 
@@ -117,7 +118,7 @@ The following operations are allowed during a turn where appropriate:
 - `abort`
 - runtime config setters
 
-Phase/settlement semantics are still provisional and need a full lifecycle pass.
+The harness remains in `"turn"` through `agent_end` and `settled`; it becomes idle only after terminal callbacks and their pending writes finish. Steering and follow-up input close when terminal settlement begins.
 
 ## Turn execution
 
@@ -156,7 +157,7 @@ The low-level loop converts harness `ThinkingLevel` to provider `reasoning` at t
 - `"off"` -> `undefined`
 - all other thinking levels pass through
 
-No state refresh is needed on `agent_end` except flushing leftover pending session writes and clearing the operation phase. The exact `settled` event timing is still under review.
+No state refresh is needed on `agent_end` except flushing leftover pending session writes. `settled` runs while the phase is still `"turn"`; writes accepted from terminal callbacks are flushed before the public prompt settles, and the phase changes to idle afterward.
 
 If the system-prompt callback throws while starting `prompt`, `skill`, or `promptFromTemplate`, the operation rejects with `AgentHarnessError` and the harness returns to idle. If it throws from the save-point snapshot created by `prepareNextTurn`, the low-level agent run records an assistant error message.
 
@@ -174,6 +175,8 @@ Summary:
 - Hook context should be a plain object of facades, not raw internals or late-bound getter mazes.
 
 Event payloads describe what is happening. Harness getters describe latest config for future snapshots. Hook and listener settlement should be awaited in lifecycle order where possible; transport backpressure is handled below the harness by `AssistantMessageStream`, so the harness does not need a separate async event queue merely to keep SSE or websocket reads flowing.
+
+When `AgentHarnessOptions.toolPolicy` is configured, `tool_call` hooks run before policy authorization so intentional input transformations are evaluated by policy. Hook blocking remains authoritative, but a hook cannot turn a policy denial into an allow. The adapter's ToolSpec also supplies `retrySafe` metadata to canonical `tool_call_started` runtime events; an undeclared tool defaults to `false`.
 
 ## Planned session facade
 
@@ -243,9 +246,9 @@ npm run coverage:harness
 
 `coverage:harness` runs `test/harness/**/*.test.ts` and reports coverage for `src/harness/**/*.ts` plus the non-harness runtime files it directly exercises (`src/agent.ts` and `src/agent-loop.ts`) into `coverage/harness`. Type-only dependencies such as `src/types.ts` are not included because they have no meaningful runtime coverage.
 
-## Implementation todo
+## Implementation status
 
-This list tracks the remaining work before treating `AgentHarness` as migration-ready. Active/planned items are ordered from easiest to hardest. Completed items are archived at the bottom.
+This list records implemented contracts and follow-on hardening work. The default coding-agent migration is complete; remaining items are incremental lifecycle or product-surface improvements rather than prerequisites for using the Harness runtime.
 
 ### 1. Add explicit tool registry read/update semantics
 
@@ -273,20 +276,20 @@ Notes:
 
 - Observability design: [observability.md](./observability.md)
 
-### 2. Design per-`AgentHarness` model registry
+### 2. Per-`AgentHarness` model registry
 
-Status: Planned
+Status: Done
 
 Done:
 
-- Current `setModel()` behavior is preserved.
+- `AgentHarnessOptions.models` is the required provider/model/auth runtime.
+- Turn, compaction, and branch-summary requests all use the same `Models` instance.
+- Durable restore resolves session-selected model references through that registry and fails closed when neither the registry nor the explicitly supplied current model can satisfy the reference.
+- Concrete model changes remain explicit through `setModel()` and are persisted for later restore.
 
 Remaining:
 
-- Decide how applications supply the model registry.
-- Decide whether the harness stores concrete `Model` objects, model references, or both.
-- Validate model selection against the registry.
-- Define model change semantics during active turns and save points.
+- None.
 
 ### 3. Full `AgentHarness` lifecycle/state pass
 
@@ -326,7 +329,7 @@ Remaining:
 
 ### 4. Implement generic hook/event extension mechanism
 
-Status: Designed in [hooks.md](./hooks.md), not implemented
+Status: Done
 
 Done:
 
@@ -334,37 +337,36 @@ Done:
 - Hooks receive only event payloads.
 - `emitHook(event)` derives the hook type from `event.type`.
 - Provider request/payload hooks have ordered transform semantics.
+- Added `HookEvent`, `ResultOf`, source-aware registration options/scopes, cleanup, explicit error policy, and `DefaultAgentHarnessHooks`.
+- Moved result chaining out of `AgentHarness` into ordered event reducers.
+- `AgentHarness` accepts and exposes a concrete hooks instance and supplies a stable hook context facade.
+- Preserved stream-option deletion, sequential payload/context transforms, early tool block/session cancel, and accumulated tool-result patches.
+- Added reducer, provenance, cleanup, lifecycle, terminal-write, and reentrancy tests.
 
 Remaining:
 
-- Add `HookEvent`, `ResultOf`, registration options with generic source metadata, and the single `AgentHarnessHooks` implementation.
-- Move result chaining out of `AgentHarness` into reducer functions.
-- Type-check base harness reducers so every result-producing `AgentHarnessEvent` has reducer semantics.
-- Make `AgentHarness` accept and expose the concrete hooks instance with constructor inference for app-specific hooks.
-- Define the initial harness/context facades exposed through hook context.
-- Preserve current provider hook behavior, including stream option patch deletion semantics.
-- Add parity tests for reducer semantics: transform chaining, patch chaining, early block/cancel, cleanup, source metadata, and typed app-specific reducer coverage.
+- None.
 
 Notes:
 
 - Hook design: [hooks.md](./hooks.md)
 
-### 5. Spike semi-durable harness/session recovery
+### 5. Semi-durable harness/session recovery
 
-Status: Planned
+Status: Done
 
 Done:
 
-- Wrote durability design: [durable-harness.md](./durable-harness.md)
+- Added canonical runtime events, pure reduction, checkpoints, queue and pending-write durability, and conservative interrupted-run recovery.
+- Wired operation, turn, provider-request, tool-call, queue, and pending-write lifecycle events into `AgentHarness`.
+- Added `restoreAgentHarness()` to recover the journal, rebuild queues, apply pending writes, restore model/thinking/tool state, and validate host-provided runtime dependencies.
+- Tool policy metadata identifies retry-safe calls without automatically replaying side effects.
+- Added partial JSONL tail repair and end-to-end crash/reopen tests.
+- Documented the design in [durable-harness.md](./durable-harness.md).
 
 Remaining:
 
-- Decide whether session owns all durable harness state or whether any sidecars are needed for large blobs.
-- Define durable entries for queues, pending writes, operations, turns, provider requests, and tool calls.
-- Define resume requirements for app-provided tools, models, extensions, resources, hooks, and auth providers.
-- Define conservative recovery policy for unfinished agent turns, provider requests, tool calls, compaction, and tree navigation.
-- Prototype reducer-based recovery from session entries.
-- Decide whether interrupted operations append user-visible messages or only internal operation entries.
+- None for the conservative P0 recovery contract. Large payloads belong in an application artifact store rather than the runtime journal.
 
 Notes:
 
@@ -394,21 +396,20 @@ Remaining:
 - Test no deadlocks when async listeners call harness APIs and await them.
 - Test phase cleanup through success, provider error, hook error, abort, compaction, and tree navigation.
 
-### 7. Later coding-agent migration plan
+### 7. coding-agent migration
 
-Status: Planned
+Status: Done
 
 Done:
 
-- None.
+- SDK-created coding sessions with a selected model use `CodingAgentHarnessRuntime`, a compatibility facade over `AgentHarness`.
+- Existing `AgentSession` extensions, context transforms, tool hooks, model/thinking/tool refresh, stream/auth/retry/header behavior, and public `Agent` control APIs are bridged to Harness hooks and snapshots.
+- Harness owns canonical message persistence and recovery; `AgentSession` retains app-specific session/UI behavior without duplicating message writes.
+- Steering and follow-up remain distinct durable queues, including host prequeueing and selective clearing.
 
 Remaining:
 
-- Map coding-agent resources to sourced loaders.
-- Keep app-level resource dedupe/provenance outside the harness.
-- Adapt extension loading to the future hook/session facade.
-- Preserve UI/session behavior outside core.
-- Move coding-agent stream/auth/retry/header behavior onto harness stream configuration and provider hooks.
+- A fuller public session facade and direct interactive use of durable background process sessions remain later product work; neither is required for the default Harness runtime migration.
 
 ---
 

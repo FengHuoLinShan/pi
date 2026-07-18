@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
@@ -158,6 +158,38 @@ describe("JsonlSessionStorage", () => {
 		};
 		writeFileSync(filePath, `${JSON.stringify(header)}\nnot json\n${JSON.stringify(entry)}\n`);
 		await expect(JsonlSessionStorage.open(env, filePath)).rejects.toMatchObject({ code: "invalid_entry" });
+	});
+
+	it("repairs a malformed unterminated final append", async () => {
+		const dir = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: dir });
+		const filePath = join(dir, "session.jsonl");
+		const storage = await JsonlSessionStorage.create(env, filePath, { cwd: dir, sessionId: "session-1" });
+		await storage.appendEntry({
+			type: "message",
+			id: "entry-1",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:00.000Z",
+			message: createUserMessage("one"),
+		});
+		appendFileSync(filePath, '{"type":"message","id":"interrupted"');
+
+		const recovered = await JsonlSessionStorage.open(env, filePath);
+		expect(recovered.wasPartialTailRecovered()).toBe(true);
+		expect((await recovered.getEntries()).map((entry) => entry.id)).toEqual(["entry-1"]);
+		expect(readFileSync(filePath, "utf8")).toMatch(/\n$/);
+		expect(readFileSync(filePath, "utf8")).not.toContain("interrupted");
+	});
+
+	it("can keep strict handling for malformed unterminated tails", async () => {
+		const dir = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: dir });
+		const filePath = join(dir, "session.jsonl");
+		await JsonlSessionStorage.create(env, filePath, { cwd: dir, sessionId: "session-1" });
+		appendFileSync(filePath, "not json");
+		await expect(JsonlSessionStorage.open(env, filePath, { repairPartialTail: false })).rejects.toMatchObject({
+			code: "invalid_entry",
+		});
 	});
 
 	it("creates and reads session metadata from the header", async () => {

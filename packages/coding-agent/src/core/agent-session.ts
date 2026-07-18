@@ -46,6 +46,7 @@ import {
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
+import { getShellEnv } from "../utils/shell.ts";
 import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
@@ -61,6 +62,7 @@ import {
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
+import { type ExecutionBoundary, filterBoundaryEnvironment, resolveExecutionBoundary } from "./execution-boundary.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -176,6 +178,8 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 
 export interface AgentSessionConfig {
 	agent: Agent;
+	/** The runtime persists loop messages before emitting committed message_end events. */
+	agentOwnsSessionPersistence?: boolean;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	cwd: string;
@@ -185,6 +189,8 @@ export interface AgentSessionConfig {
 	resourceLoader: ResourceLoader;
 	/** SDK custom tools registered outside extensions */
 	customTools?: ToolDefinition[];
+	/** Optional attested boundary for built-in tools and session bash execution. */
+	executionBoundary?: ExecutionBoundary;
 	/** Canonical model/auth runtime used by coding-agent internals. */
 	modelRuntime: ModelRuntime;
 	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
@@ -331,6 +337,8 @@ export class AgentSession {
 	private _allowedToolNames?: Set<string>;
 	private _excludedToolNames?: Set<string>;
 	private _baseToolsOverride?: Record<string, AgentTool>;
+	private _executionBoundary?: ExecutionBoundary;
+	private _agentOwnsSessionPersistence: boolean;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
 	private _extensionMode: ExtensionMode = "print";
@@ -354,7 +362,16 @@ export class AgentSession {
 	private _systemPromptOverride?: string;
 
 	constructor(config: AgentSessionConfig) {
+		if (config.executionBoundary && config.baseToolsOverride) {
+			throw new Error("baseToolsOverride cannot be combined with executionBoundary");
+		}
+		if (config.executionBoundary && config.customTools && config.customTools.length > 0) {
+			throw new Error(
+				"customTools cannot be enabled with executionBoundary because they execute in the host process",
+			);
+		}
 		this.agent = config.agent;
+		this._agentOwnsSessionPersistence = config.agentOwnsSessionPersistence ?? false;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
@@ -367,6 +384,7 @@ export class AgentSession {
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
+		this._executionBoundary = config.executionBoundary;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 
 		// Always subscribe to agent events for internal handling
@@ -603,7 +621,7 @@ export class AgentSession {
 		// Handle session persistence
 		if (event.type === "message_end") {
 			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
+			if (!this._agentOwnsSessionPersistence && event.message.role === "custom") {
 				// Persist as CustomMessageEntry
 				this.sessionManager.appendCustomMessageEntry(
 					event.message.customType,
@@ -612,9 +630,8 @@ export class AgentSession {
 					event.message.details,
 				);
 			} else if (
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
+				!this._agentOwnsSessionPersistence &&
+				(event.message.role === "user" || event.message.role === "assistant" || event.message.role === "toolResult")
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
 				this.sessionManager.appendMessage(event.message);
@@ -2540,6 +2557,7 @@ export class AgentSession {
 					]),
 				)
 			: createAllToolDefinitions(this._cwd, {
+					boundary: this._executionBoundary,
 					read: { autoResizeImages },
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
@@ -2549,6 +2567,14 @@ export class AgentSession {
 		);
 
 		const extensionsResult = this._resourceLoader.getExtensions();
+		if (this._executionBoundary) {
+			const extensionTool = extensionsResult.extensions.flatMap((extension) => [...extension.tools.keys()])[0];
+			if (extensionTool) {
+				throw new Error(
+					`Extension tool ${extensionTool} cannot be enabled with executionBoundary because it executes in the host process`,
+				);
+			}
+		}
 		if (options.flagValues) {
 			for (const [name, value] of options.flagValues) {
 				extensionsResult.runtime.flagValues.set(name, value);
@@ -2715,20 +2741,31 @@ export class AgentSession {
 		options?: { excludeFromContext?: boolean; operations?: BashOperations },
 	): Promise<BashResult> {
 		this._bashAbortController = new AbortController();
+		if (this._executionBoundary && options?.operations) {
+			this._bashAbortController = undefined;
+			throw new Error("Cannot override bash operations when an execution boundary is configured");
+		}
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
 		const prefix = this.settingsManager.getShellCommandPrefix();
 		const shellPath = this.settingsManager.getShellPath();
 		const resolvedCommand = prefix ? `${prefix}\n${command}` : command;
+		const boundary = this._executionBoundary
+			? resolveExecutionBoundary(this._executionBoundary, ["bash"])
+			: undefined;
+		const bashOperations = boundary
+			? boundary.operations.bash!
+			: (options?.operations ?? createLocalBashOperations({ shellPath }));
 
 		try {
 			const result = await executeBashWithOperations(
 				resolvedCommand,
-				this.sessionManager.getCwd(),
-				options?.operations ?? createLocalBashOperations({ shellPath }),
+				boundary?.cwd ?? this.sessionManager.getCwd(),
+				bashOperations,
 				{
 					onChunk,
 					signal: this._bashAbortController.signal,
+					env: boundary ? filterBoundaryEnvironment(boundary.profile, getShellEnv()) : undefined,
 				},
 			);
 

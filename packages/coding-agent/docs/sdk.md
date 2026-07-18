@@ -49,6 +49,8 @@ The main factory function for a single `AgentSession`.
 
 `createAgentSession()` uses a `ResourceLoader` to supply extensions, skills, prompt templates, themes, and context files. If you do not provide one, it uses `DefaultResourceLoader` with standard discovery.
 
+When a model is selected, the factory uses `CodingAgentHarnessRuntime`, an `Agent`-compatible facade over the durable `AgentHarness`. The Harness owns canonical turn journaling, queue durability, ordered message persistence, and conservative restart recovery. Existing SDK code can continue using `session.agent`; extensions and UI/session behavior remain managed by `AgentSession`.
+
 ```typescript
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 
@@ -60,8 +62,13 @@ const { session } = await createAgentSession({
   model: myModel,
   tools: ["read", "bash"],
   sessionManager: SessionManager.inMemory(),
+  runBudget: { maxModelCalls: 8, maxToolCalls: 20, maxWallTimeMs: 120_000 },
+  loopDetection: { maxConsecutiveToolCalls: 3 },
+  toolPolicy: myToolPolicyAdapter,
 });
 ```
+
+`runBudget`, `loopDetection`, and `toolPolicy` are enforced by the Harness for every user-initiated run. Approval grants are bound to the exact canonical tool name, arguments, and resolved resources, so broader tool or session scopes do not authorize a changed action.
 
 ### AgentSession
 
@@ -237,6 +244,8 @@ Both `steer()` and `followUp()` expand file-based prompt templates but error on 
 
 The `Agent` class (from `@earendil-works/pi-agent-core`) handles the core LLM interaction. Access it via `session.agent`.
 
+For sessions with a selected model, this object is a `CodingAgentHarnessRuntime`. It preserves the `Agent` control surface while exposing the underlying Harness as `runtime.harness` for applications that need canonical runtime events or recovery diagnostics.
+
 ```typescript
 // Access current state
 const state = session.agent.state;
@@ -258,6 +267,8 @@ session.agent.state.tools = tools; // copies the top-level array
 // Wait for agent to finish processing
 await session.agent.waitForIdle();
 ```
+
+Durable artifact/process primitives and the transport-independent daemon/app protocol are separate public SDK layers. See [Artifacts and Durable Process Sessions](artifacts-and-processes.md) and [Harness App Protocol](app-protocol.md).
 
 ### Events
 
@@ -540,6 +551,84 @@ const { session } = await createAgentSession({
 ```
 
 > See [examples/sdk/05-tools.ts](../examples/sdk/05-tools.ts)
+
+#### External Execution Boundary
+
+`executionBoundary` routes built-in tools and `AgentSession.executeBash()` through a trusted external enforcement backend. It is intended for applications that already manage a container, VM, micro-VM, or remote sandbox. Omitting it preserves pi's normal local execution behavior.
+
+```typescript
+import {
+  type BoundaryProfile,
+  type ExecutionBoundary,
+  createAgentSession,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
+
+const profile: BoundaryProfile = {
+  scope: "built-in-tools",
+  workspace: {
+    workingDirectory: "/workspace",
+    mounts: [
+      {
+        source: process.cwd(),
+        target: "/workspace",
+        access: "read-write",
+      },
+    ],
+  },
+  process: { mode: "isolated" },
+  network: {
+    mode: "allowlist",
+    allowedHosts: ["registry.npmjs.org", "github.com"],
+  },
+  environment: {
+    allow: ["PATH", "DEEPSEEK_API_KEY"],
+  },
+};
+
+// Application-provided adapter for an initialized external runtime.
+// It supplies all built-in tool operations and attests the policy that the
+// runtime reports as actively enforced.
+const backend = await createMyContainerBackend(profile);
+const executionBoundary: ExecutionBoundary = { profile, backend };
+
+const { session } = await createAgentSession({
+  cwd: process.cwd(),
+  executionBoundary,
+  sessionManager: SessionManager.inMemory(process.cwd()),
+});
+```
+
+An `ExecutionBoundaryBackend` has three responsibilities:
+
+```typescript
+interface ExecutionBoundaryBackend {
+  id: string;
+  operations: BoundaryToolOperations;
+  attest(profile: BoundaryProfile): BoundaryAttestation;
+}
+```
+
+`attest()` must inspect the initialized backend and return the exact enforced profile digest plus its real capabilities. Pi checks that the digest matches and that the backend supports every requested workspace access mode, process mode, network mode, and environment allowlist. Missing or mismatched evidence fails before tools are created. This attestation is a trusted backend assertion; it is not independent proof that a third-party runtime is configured correctly.
+
+For a selected built-in tool, use the generic factory. Only that tool's operation adapter is required:
+
+```typescript
+import { createTool } from "@earendil-works/pi-coding-agent";
+
+const bash = createTool("bash", process.cwd(), {
+  boundary: executionBoundary,
+});
+```
+
+Bounded sessions require adapters for all seven built-in tools so later activation cannot fall back to local execution. Pi also:
+
+- derives file-tool roots from declared mount targets and prevents callers from replacing those roots or operations
+- filters the environment passed to tool processes to `profile.environment.allow`
+- rejects SDK `customTools`, extension-registered tools, and non-built-in names in `tools`
+- rejects custom bash operations passed to `AgentSession.executeBash()`
+
+The scope is only built-in tool execution. Model-provider traffic, resource loading, and extension module hooks still run in the host process. Use whole-process containerization when those also need isolation. See [Security](security.md) and [Containerization](containerization.md).
 
 ### Custom Tools
 
@@ -1163,10 +1252,13 @@ SessionManager
 SettingsManager
 
 // Tool factories
+createAllTools
 createCodingTools
 createReadOnlyTools
 createReadTool, createBashTool, createEditTool, createWriteTool
 createGrepTool, createFindTool, createLsTool
+createTool, createToolDefinition
+atomicWriteFile, computeFileRevision
 
 // Types
 type CreateAgentSessionOptions
@@ -1178,6 +1270,10 @@ type ToolDefinition
 type Skill
 type PromptTemplate
 type Tool
+type BoundaryProfile, ExecutionBoundary, ExecutionBoundaryBackend
+type BoundaryAttestation, BoundaryEnforcementCapabilities, BoundaryToolOperations
+type FileRevision, FileRevisionState, FilePathPolicy, FilePathOperations
+type ReadToolDetails, EditToolDetails, WriteToolDetails
 ```
 
 For extension types, see [extensions.md](extensions.md) for the full API.

@@ -19,6 +19,14 @@ export {
 } from "./edit.ts";
 export { withFileMutationQueue } from "./file-mutation-queue.ts";
 export {
+	atomicWriteFile,
+	computeFileRevision,
+	type FilePathOperations,
+	type FilePathPolicy,
+	type FileRevision,
+	type FileRevisionState,
+} from "./file-transaction.ts";
+export {
 	createFindTool,
 	createFindToolDefinition,
 	type FindOperations,
@@ -64,11 +72,13 @@ export {
 	createWriteTool,
 	createWriteToolDefinition,
 	type WriteOperations,
+	type WriteToolDetails,
 	type WriteToolInput,
 	type WriteToolOptions,
 } from "./write.ts";
 
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { type ExecutionBoundary, filterBoundaryEnvironment, resolveExecutionBoundary } from "../execution-boundary.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import { type BashToolOptions, createBashTool, createBashToolDefinition } from "./bash.ts";
 import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.ts";
@@ -84,6 +94,8 @@ export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "l
 export const allToolNames: Set<ToolName> = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 
 export interface ToolsOptions {
+	/** Route built-in tool operations through an attested external execution boundary. */
+	boundary?: ExecutionBoundary;
 	read?: ReadToolOptions;
 	bash?: BashToolOptions;
 	write?: WriteToolOptions;
@@ -93,7 +105,81 @@ export interface ToolsOptions {
 	ls?: LsToolOptions;
 }
 
+function assertBoundaryOptionsAreNotOverridden(options: ToolsOptions, toolNames: readonly ToolName[]): void {
+	for (const toolName of toolNames) {
+		const toolOptions = options[toolName];
+		if (toolOptions?.operations) {
+			throw new Error(`Cannot override ${toolName}.operations when an execution boundary is configured`);
+		}
+	}
+	for (const toolName of ["read", "edit", "write"] as const) {
+		if (toolNames.includes(toolName) && options[toolName]?.allowedRoots !== undefined) {
+			throw new Error(`Cannot override ${toolName}.allowedRoots when an execution boundary is configured`);
+		}
+	}
+	if (toolNames.includes("bash") && options.bash?.spawnHook) {
+		throw new Error("Cannot override bash.spawnHook when an execution boundary is configured");
+	}
+}
+
+function resolveToolsContext(
+	cwd: string,
+	options: ToolsOptions | undefined,
+	toolNames: readonly ToolName[],
+): { cwd: string; options: ToolsOptions | undefined } {
+	if (!options?.boundary) return { cwd, options };
+	assertBoundaryOptionsAreNotOverridden(options, toolNames);
+	const boundary = resolveExecutionBoundary(options.boundary, toolNames);
+	const resolved: ToolsOptions = { ...options, boundary: undefined };
+
+	if (toolNames.includes("read")) {
+		resolved.read = {
+			...options.read,
+			operations: boundary.operations.read,
+			allowedRoots: [...boundary.readableRoots],
+		};
+	}
+	if (toolNames.includes("bash")) {
+		resolved.bash = {
+			...options.bash,
+			operations: boundary.operations.bash,
+			spawnHook: (context) => ({
+				...context,
+				env: filterBoundaryEnvironment(boundary.profile, context.env),
+			}),
+		};
+	}
+	if (toolNames.includes("edit")) {
+		resolved.edit = {
+			...options.edit,
+			operations: boundary.operations.edit,
+			allowedRoots: [...boundary.writableRoots],
+		};
+	}
+	if (toolNames.includes("write")) {
+		resolved.write = {
+			...options.write,
+			operations: boundary.operations.write,
+			allowedRoots: [...boundary.writableRoots],
+		};
+	}
+	if (toolNames.includes("grep")) {
+		resolved.grep = { ...options.grep, operations: boundary.operations.grep };
+	}
+	if (toolNames.includes("find")) {
+		resolved.find = { ...options.find, operations: boundary.operations.find };
+	}
+	if (toolNames.includes("ls")) {
+		resolved.ls = { ...options.ls, operations: boundary.operations.ls };
+	}
+
+	return { cwd: boundary.cwd, options: resolved };
+}
+
 export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {
+	const resolved = resolveToolsContext(cwd, options, [toolName]);
+	cwd = resolved.cwd;
+	options = resolved.options;
 	switch (toolName) {
 		case "read":
 			return createReadToolDefinition(cwd, options?.read);
@@ -115,6 +201,9 @@ export function createToolDefinition(toolName: ToolName, cwd: string, options?: 
 }
 
 export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptions): Tool {
+	const resolved = resolveToolsContext(cwd, options, [toolName]);
+	cwd = resolved.cwd;
+	options = resolved.options;
 	switch (toolName) {
 		case "read":
 			return createReadTool(cwd, options?.read);
@@ -136,6 +225,9 @@ export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptio
 }
 
 export function createCodingToolDefinitions(cwd: string, options?: ToolsOptions): ToolDef[] {
+	const resolved = resolveToolsContext(cwd, options, ["read", "bash", "edit", "write"]);
+	cwd = resolved.cwd;
+	options = resolved.options;
 	return [
 		createReadToolDefinition(cwd, options?.read),
 		createBashToolDefinition(cwd, options?.bash),
@@ -145,6 +237,9 @@ export function createCodingToolDefinitions(cwd: string, options?: ToolsOptions)
 }
 
 export function createReadOnlyToolDefinitions(cwd: string, options?: ToolsOptions): ToolDef[] {
+	const resolved = resolveToolsContext(cwd, options, ["read", "grep", "find", "ls"]);
+	cwd = resolved.cwd;
+	options = resolved.options;
 	return [
 		createReadToolDefinition(cwd, options?.read),
 		createGrepToolDefinition(cwd, options?.grep),
@@ -154,6 +249,9 @@ export function createReadOnlyToolDefinitions(cwd: string, options?: ToolsOption
 }
 
 export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {
+	const resolved = resolveToolsContext(cwd, options, [...allToolNames]);
+	cwd = resolved.cwd;
+	options = resolved.options;
 	return {
 		read: createReadToolDefinition(cwd, options?.read),
 		bash: createBashToolDefinition(cwd, options?.bash),
@@ -166,6 +264,9 @@ export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): R
 }
 
 export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {
+	const resolved = resolveToolsContext(cwd, options, ["read", "bash", "edit", "write"]);
+	cwd = resolved.cwd;
+	options = resolved.options;
 	return [
 		createReadTool(cwd, options?.read),
 		createBashTool(cwd, options?.bash),
@@ -175,6 +276,9 @@ export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {
 }
 
 export function createReadOnlyTools(cwd: string, options?: ToolsOptions): Tool[] {
+	const resolved = resolveToolsContext(cwd, options, ["read", "grep", "find", "ls"]);
+	cwd = resolved.cwd;
+	options = resolved.options;
 	return [
 		createReadTool(cwd, options?.read),
 		createGrepTool(cwd, options?.grep),
@@ -184,6 +288,9 @@ export function createReadOnlyTools(cwd: string, options?: ToolsOptions): Tool[]
 }
 
 export function createAllTools(cwd: string, options?: ToolsOptions): Record<ToolName, Tool> {
+	const resolved = resolveToolsContext(cwd, options, [...allToolNames]);
+	cwd = resolved.cwd;
+	options = resolved.options;
 	return {
 		read: createReadTool(cwd, options?.read),
 		bash: createBashTool(cwd, options?.bash),

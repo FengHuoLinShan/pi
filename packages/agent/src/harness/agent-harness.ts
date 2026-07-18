@@ -1,10 +1,20 @@
-import type { AssistantMessage, ImageContent, Model, Models, UserMessage } from "@earendil-works/pi-ai";
-import { runAgentLoop } from "../agent-loop.ts";
+import type {
+	AssistantMessage,
+	ImageContent,
+	Model,
+	Models,
+	ModelsSimpleStreamOptions,
+	UserMessage,
+} from "@earendil-works/pi-ai";
+import { runAgentLoop, runAgentLoopContinue } from "../agent-loop.ts";
+import type { ToolPolicyAdapter } from "../tool-policy.ts";
 import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
+	AgentLoopDetection,
 	AgentMessage,
+	AgentRunBudget,
 	AgentTool,
 	QueueMode,
 	StreamFn,
@@ -12,13 +22,16 @@ import type {
 } from "../types.ts";
 import { collectEntriesForBranchSummary, generateBranchSummary } from "./compaction/branch-summarization.ts";
 import { compact, DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "./compaction/compaction.ts";
+import { type AgentHarnessHooks, DefaultAgentHarnessHooks, type HookHandler, type ResultOf } from "./hooks.ts";
 import { convertToLlm } from "./messages.ts";
 import { formatPromptTemplateInvocation } from "./prompt-templates.ts";
+import { type RuntimeQueueName, type RuntimeRecoveryResult, SessionRuntimeEventStore } from "./runtime-events/index.ts";
+import { uuidv7 } from "./session/uuid.ts";
 import { formatSkillInvocation } from "./skills.ts";
 import type {
 	AbortResult,
 	AgentHarnessEvent,
-	AgentHarnessEventResultMap,
+	AgentHarnessHookContext,
 	AgentHarnessOptions,
 	AgentHarnessOwnEvent,
 	AgentHarnessPhase,
@@ -30,6 +43,7 @@ import type {
 	PendingSessionWrite,
 	PromptTemplate,
 	Session,
+	SessionTreeEntry,
 	Skill,
 } from "./types.ts";
 import { AgentHarnessError, BranchSummaryError, CompactionError, SessionError, toError } from "./types.ts";
@@ -66,6 +80,8 @@ function cloneStreamOptions(streamOptions?: AgentHarnessStreamOptions): AgentHar
 		...streamOptions,
 		headers: streamOptions?.headers ? { ...streamOptions.headers } : undefined,
 		metadata: streamOptions?.metadata ? { ...streamOptions.metadata } : undefined,
+		env: streamOptions?.env ? { ...streamOptions.env } : undefined,
+		thinkingBudgets: streamOptions?.thinkingBudgets ? { ...streamOptions.thinkingBudgets } : undefined,
 	};
 }
 
@@ -86,11 +102,21 @@ function applyStreamOptionsPatch(
 	const result = cloneStreamOptions(base);
 	if (!patch) return result;
 
+	if (Object.hasOwn(patch, "temperature")) result.temperature = patch.temperature;
+	if (Object.hasOwn(patch, "maxTokens")) result.maxTokens = patch.maxTokens;
 	if (Object.hasOwn(patch, "transport")) result.transport = patch.transport;
 	if (Object.hasOwn(patch, "timeoutMs")) result.timeoutMs = patch.timeoutMs;
 	if (Object.hasOwn(patch, "maxRetries")) result.maxRetries = patch.maxRetries;
+	if (Object.hasOwn(patch, "websocketConnectTimeoutMs")) {
+		result.websocketConnectTimeoutMs = patch.websocketConnectTimeoutMs;
+	}
 	if (Object.hasOwn(patch, "maxRetryDelayMs")) result.maxRetryDelayMs = patch.maxRetryDelayMs;
 	if (Object.hasOwn(patch, "cacheRetention")) result.cacheRetention = patch.cacheRetention;
+	if (Object.hasOwn(patch, "env")) result.env = patch.env ? { ...patch.env } : undefined;
+	if (Object.hasOwn(patch, "thinkingBudgets")) {
+		result.thinkingBudgets = patch.thinkingBudgets ? { ...patch.thinkingBudgets } : undefined;
+	}
+	if (Object.hasOwn(patch, "transformHeaders")) result.transformHeaders = patch.transformHeaders;
 
 	if (Object.hasOwn(patch, "headers")) {
 		if (patch.headers === undefined) {
@@ -121,10 +147,6 @@ function applyStreamOptionsPatch(
 	return result;
 }
 
-const SUBSCRIBER_EVENT_TYPE = "*";
-
-type AgentHarnessHandler = (event: any, signal?: AbortSignal) => Promise<any> | any;
-
 function normalizeHarnessError(error: unknown, fallbackCode: AgentHarnessError["code"]): AgentHarnessError {
 	if (error instanceof AgentHarnessError) return error;
 	const cause = toError(error);
@@ -152,6 +174,61 @@ interface AgentHarnessTurnState<
 	thinkingLevel: ThinkingLevel;
 	tools: TTool[];
 	activeTools: TTool[];
+	runBudget?: AgentRunBudget;
+	loopDetection?: AgentLoopDetection;
+}
+
+interface DurableQueuedMessage<TMessage extends AgentMessage = AgentMessage> {
+	message: TMessage;
+	queueItemId?: string;
+}
+
+interface DurablePendingWrite {
+	write: PendingSessionWrite;
+	pendingWriteId?: string;
+	targetEntryId?: string;
+}
+
+function isRestorableQueueMessage(value: unknown): value is AgentMessage {
+	if (typeof value !== "object" || value === null || !("role" in value)) return false;
+	const role = (value as { role?: unknown }).role;
+	return (role === "user" || role === "custom") && "content" in value;
+}
+
+function isPendingSessionWrite(value: unknown): value is PendingSessionWrite {
+	if (typeof value !== "object" || value === null || !("type" in value)) return false;
+	return [
+		"message",
+		"model_change",
+		"thinking_level_change",
+		"active_tools_change",
+		"custom",
+		"custom_message",
+		"label",
+		"session_info",
+		"leaf",
+	].includes(String((value as { type?: unknown }).type));
+}
+
+function isThinkingLevel(value: string): value is ThinkingLevel {
+	return (
+		value === "off" ||
+		value === "minimal" ||
+		value === "low" ||
+		value === "medium" ||
+		value === "high" ||
+		value === "xhigh" ||
+		value === "max"
+	);
+}
+
+export interface RestoredAgentHarness<
+	TSkill extends Skill = Skill,
+	TPromptTemplate extends PromptTemplate = PromptTemplate,
+	TTool extends AgentTool = AgentTool,
+> {
+	harness: AgentHarness<TSkill, TPromptTemplate, TTool>;
+	recovery: RuntimeRecoveryResult;
 }
 
 export class AgentHarness<
@@ -162,31 +239,62 @@ export class AgentHarness<
 	readonly env: ExecutionEnv;
 	private session: Session;
 	readonly models: Models;
+	readonly runtimeEvents?: SessionRuntimeEventStore;
+	readonly toolPolicy?: ToolPolicyAdapter;
 	private phase: AgentHarnessPhase = "idle";
+	private acceptsTurnInput = false;
 	private runAbortController?: AbortController;
 	private runPromise?: Promise<void>;
-	private pendingSessionWrites: PendingSessionWrite[] = [];
+	private pendingSessionWrites: DurablePendingWrite[] = [];
 	private model: Model<any>;
 	private thinkingLevel: ThinkingLevel;
 	private systemPrompt: AgentHarnessOptions<TSkill, TPromptTemplate, TTool>["systemPrompt"];
+	private convertMessages: NonNullable<AgentHarnessOptions<TSkill, TPromptTemplate, TTool>["convertToLlm"]>;
 	private streamOptions: AgentHarnessStreamOptions;
+	private streamFn?: StreamFn;
+	private runBudget?: AgentRunBudget;
+	private loopDetection?: AgentLoopDetection;
 	private resources: AgentHarnessResources<TSkill, TPromptTemplate>;
 	private tools = new Map<string, TTool>();
 	private activeToolNames: string[];
-	private steerQueue: UserMessage[] = [];
+	private steerQueue: DurableQueuedMessage[] = [];
 	private steeringQueueMode: QueueMode;
-	private followUpQueue: UserMessage[] = [];
+	private followUpQueue: DurableQueuedMessage[] = [];
 	private followUpQueueMode: QueueMode;
-	private nextTurnQueue: AgentMessage[] = [];
-	private handlers = new Map<string, Set<AgentHarnessHandler>>();
+	private nextTurnQueue: DurableQueuedMessage[] = [];
+	private consumedQueueItemIds: string[] = [];
+	private activeOperationId?: string;
+	private activeTurnId?: string;
+	private activeProviderRequestId?: string;
+	readonly hooks: AgentHarnessHooks<AgentHarnessEvent<TSkill, TPromptTemplate>, AgentHarnessHookContext>;
 
 	constructor(options: AgentHarnessOptions<TSkill, TPromptTemplate, TTool>) {
 		this.env = options.env;
 		this.session = options.session;
 		this.models = options.models;
+		this.runtimeEvents = options.runtimeEvents;
+		this.toolPolicy = options.toolPolicy;
+		const hookContext: AgentHarnessHookContext = {
+			env: this.env,
+			getSession: () => this.session,
+			getPhase: () => this.getPhase(),
+			isIdle: () => this.isIdle(),
+			appendMessage: async (message) => await this.appendMessage(message),
+			getPendingWrites: () => this.getPendingWrites(),
+		};
+		this.hooks =
+			options.hooks ??
+			new DefaultAgentHarnessHooks<AgentHarnessEvent<TSkill, TPromptTemplate>, AgentHarnessHookContext>({
+				context: hookContext,
+			});
+		if (options.hooks) this.hooks.setContext(hookContext);
 		this.resources = options.resources ?? {};
 		this.streamOptions = cloneStreamOptions(options.streamOptions);
+		this.streamFn = options.streamFn;
 		this.systemPrompt = options.systemPrompt;
+		this.convertMessages = options.convertToLlm ?? convertToLlm;
+		this.runBudget = options.runBudget ? { ...options.runBudget } : undefined;
+		this.loopDetection = options.loopDetection ? { ...options.loopDetection } : undefined;
 		this.validateUniqueNames(
 			(options.tools ?? []).map((tool) => tool.name),
 			"Duplicate tool name(s)",
@@ -203,49 +311,63 @@ export class AgentHarness<
 		this.validateToolNames(this.activeToolNames);
 		this.steeringQueueMode = options.steeringMode ?? "one-at-a-time";
 		this.followUpQueueMode = options.followUpMode ?? "one-at-a-time";
+		this.restoreRuntimeQueues();
+		this.restoreRuntimePendingWrites();
 	}
 
-	private getHandlers(type: string): Set<AgentHarnessHandler> | undefined {
-		return this.handlers.get(type);
+	private restoreRuntimePendingWrites(): void {
+		if (!this.runtimeEvents) return;
+		const pendingWrites = Object.values(this.runtimeEvents.getState().pendingWrites)
+			.filter((write) => write.status === "pending")
+			.sort((left, right) => left.enqueuedSequence - right.enqueuedSequence);
+		for (const pending of pendingWrites) {
+			if (!isPendingSessionWrite(pending.write)) continue;
+			this.pendingSessionWrites.push({
+				write: pending.write,
+				pendingWriteId: pending.pendingWriteId,
+				targetEntryId: pending.targetEntryId,
+			});
+		}
+	}
+
+	private restoreRuntimeQueues(): void {
+		if (!this.runtimeEvents) return;
+		const items = Object.values(this.runtimeEvents.getState().queueItems)
+			.filter((item) => item.status === "queued")
+			.sort((left, right) => left.enqueuedSequence - right.enqueuedSequence);
+		for (const item of items) {
+			if (!isRestorableQueueMessage(item.message)) continue;
+			if (item.queue === "steer") {
+				this.steerQueue.push({ message: item.message, queueItemId: item.queueItemId });
+			} else if (item.queue === "follow_up") {
+				this.followUpQueue.push({ message: item.message, queueItemId: item.queueItemId });
+			} else if (item.queue === "next_turn") {
+				this.nextTurnQueue.push({ message: item.message, queueItemId: item.queueItemId });
+			}
+		}
 	}
 
 	private async emitOwn(event: AgentHarnessOwnEvent<TSkill, TPromptTemplate>, signal?: AbortSignal): Promise<void> {
-		for (const listener of this.getHandlers(SUBSCRIBER_EVENT_TYPE) ?? []) {
-			try {
-				await listener(event, signal);
-			} catch (error) {
-				throw normalizeHookError(error);
-			}
-		}
+		await this.emitHook(event, signal);
 	}
 
 	private async emitAny(event: AgentHarnessEvent<TSkill, TPromptTemplate>, signal?: AbortSignal): Promise<void> {
-		for (const listener of this.getHandlers(SUBSCRIBER_EVENT_TYPE) ?? []) {
-			try {
-				await listener(event, signal);
-			} catch (error) {
-				throw normalizeHookError(error);
-			}
+		try {
+			await this.hooks.emit(event, signal);
+		} catch (error) {
+			throw normalizeHookError(error);
 		}
 	}
 
-	private async emitHook<TType extends keyof AgentHarnessEventResultMap>(
-		event: Extract<AgentHarnessOwnEvent, { type: TType }>,
-	): Promise<AgentHarnessEventResultMap[TType] | undefined> {
-		const handlers = this.getHandlers(event.type as TType);
-		if (!handlers || handlers.size === 0) return undefined;
-		let lastResult: AgentHarnessEventResultMap[TType] | undefined;
-		for (const handler of handlers) {
-			try {
-				const result = await handler(event);
-				if (result !== undefined) {
-					lastResult = result;
-				}
-			} catch (error) {
-				throw normalizeHookError(error);
-			}
+	private async emitHook<TType extends AgentHarnessOwnEvent<TSkill, TPromptTemplate>["type"]>(
+		event: Extract<AgentHarnessOwnEvent<TSkill, TPromptTemplate>, { type: TType }>,
+		signal?: AbortSignal,
+	): Promise<ResultOf<Extract<AgentHarnessOwnEvent<TSkill, TPromptTemplate>, { type: TType }>> | undefined> {
+		try {
+			return await this.hooks.emit(event, signal);
+		} catch (error) {
+			throw normalizeHookError(error);
 		}
-		return lastResult;
 	}
 
 	private async emitBeforeProviderRequest(
@@ -253,51 +375,110 @@ export class AgentHarness<
 		sessionId: string,
 		streamOptions: AgentHarnessStreamOptions,
 	): Promise<AgentHarnessStreamOptions> {
-		const handlers = this.getHandlers("before_provider_request");
-		let current = cloneStreamOptions(streamOptions);
-		if (!handlers || handlers.size === 0) return current;
-		for (const handler of handlers) {
-			try {
-				const result = await handler({
-					type: "before_provider_request",
-					model,
-					sessionId,
-					streamOptions: cloneStreamOptions(current),
-				});
-				if (result?.streamOptions) {
-					current = applyStreamOptionsPatch(current, result.streamOptions);
-				}
-			} catch (error) {
-				throw normalizeHookError(error);
-			}
-		}
-		return current;
+		const result = await this.emitHook({
+			type: "before_provider_request",
+			model,
+			sessionId,
+			streamOptions: cloneStreamOptions(streamOptions),
+		});
+		return applyStreamOptionsPatch(streamOptions, result?.streamOptions);
 	}
 
 	private async emitBeforeProviderPayload(model: Model<any>, payload: unknown): Promise<unknown> {
-		const handlers = this.getHandlers("before_provider_payload");
-		let current = payload;
-		if (!handlers || handlers.size === 0) return current;
-		for (const handler of handlers) {
-			try {
-				const result = await handler({ type: "before_provider_payload", model, payload: current });
-				if (result !== undefined) {
-					current = result.payload;
-				}
-			} catch (error) {
-				throw normalizeHookError(error);
-			}
-		}
-		return current;
+		const result = await this.emitHook({ type: "before_provider_payload", model, payload });
+		return result?.payload ?? payload;
 	}
 
 	private async emitQueueUpdate(): Promise<void> {
 		await this.emitOwn({
 			type: "queue_update",
-			steer: [...this.steerQueue],
-			followUp: [...this.followUpQueue],
-			nextTurn: [...this.nextTurnQueue],
+			steer: this.steerQueue.map((item) => item.message),
+			followUp: this.followUpQueue.map((item) => item.message),
+			nextTurn: this.nextTurnQueue.map((item) => item.message),
 		});
+	}
+
+	private async enqueueMessage(
+		queue: RuntimeQueueName,
+		messages: Array<DurableQueuedMessage>,
+		message: AgentMessage,
+	): Promise<void> {
+		const queuedMessage: DurableQueuedMessage = this.runtimeEvents ? { message, queueItemId: uuidv7() } : { message };
+		messages.push(queuedMessage);
+		try {
+			if (this.runtimeEvents && queuedMessage.queueItemId) {
+				await this.runtimeEvents.append({
+					type: "queue_enqueued",
+					queueItemId: queuedMessage.queueItemId,
+					queue,
+					message,
+				});
+			}
+		} catch (error) {
+			const index = messages.indexOf(queuedMessage);
+			if (index >= 0) messages.splice(index, 1);
+			throw error;
+		}
+		await this.emitQueueUpdate();
+	}
+
+	private async startRuntimeOperation(kind: "turn" | "compaction" | "branch_summary" | "retry"): Promise<void> {
+		if (!this.runtimeEvents) return;
+		const operationId = uuidv7();
+		await this.runtimeEvents.append({ type: "operation_started", operationId, kind });
+		this.activeOperationId = operationId;
+	}
+
+	private async finishRuntimeOperation(): Promise<void> {
+		if (!this.runtimeEvents || !this.activeOperationId) return;
+		const operationId = this.activeOperationId;
+		await this.runtimeEvents.append({ type: "operation_finished", operationId });
+		this.activeOperationId = undefined;
+	}
+
+	private async interruptRuntimeOperation(reason: string): Promise<void> {
+		if (!this.runtimeEvents || !this.activeOperationId) return;
+		const operationId = this.activeOperationId;
+		if (this.activeProviderRequestId) {
+			await this.runtimeEvents.append({
+				type: "provider_request_interrupted",
+				requestId: this.activeProviderRequestId,
+				reason,
+			});
+			this.activeProviderRequestId = undefined;
+		}
+		if (this.activeTurnId) {
+			const state = this.runtimeEvents.getState();
+			for (const toolCall of Object.values(state.toolCalls)) {
+				if (toolCall.turnId === this.activeTurnId && toolCall.status === "active") {
+					await this.runtimeEvents.append({
+						type: "tool_call_interrupted",
+						toolCallId: toolCall.toolCallId,
+						reason,
+					});
+				}
+			}
+			await this.runtimeEvents.append({ type: "turn_interrupted", turnId: this.activeTurnId, reason });
+			this.activeTurnId = undefined;
+		}
+		await this.runtimeEvents.append({ type: "operation_interrupted", operationId, reason });
+		this.activeOperationId = undefined;
+	}
+
+	private async normalizeOperationFailure(
+		error: unknown,
+		fallbackCode: AgentHarnessError["code"],
+	): Promise<AgentHarnessError> {
+		try {
+			await this.interruptRuntimeOperation(toError(error).message);
+			return normalizeHarnessError(error, fallbackCode);
+		} catch (runtimeError) {
+			const cause = new AggregateError(
+				[toError(error), toError(runtimeError)],
+				"Operation failed and runtime interruption could not be persisted",
+			);
+			return new AgentHarnessError(fallbackCode, cause.message, cause);
+		}
 	}
 
 	private startRunPromise(): () => void {
@@ -342,6 +523,8 @@ export class AgentHarness<
 			thinkingLevel: this.thinkingLevel,
 			tools,
 			activeTools,
+			runBudget: this.runBudget ? { ...this.runBudget } : undefined,
+			loopDetection: this.loopDetection ? { ...this.loopDetection } : undefined,
 		};
 	}
 
@@ -359,11 +542,24 @@ export class AgentHarness<
 	private createStreamFn(getTurnState: () => AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>): StreamFn {
 		return async (model, context, streamOptions) => {
 			const turnState = getTurnState();
+			if (this.runtimeEvents && this.activeTurnId) {
+				const requestId = uuidv7();
+				await this.runtimeEvents.append({
+					type: "provider_request_started",
+					requestId,
+					turnId: this.activeTurnId,
+					provider: model.provider,
+					modelId: model.id,
+				});
+				this.activeProviderRequestId = requestId;
+			}
 			const snapshotOptions: AgentHarnessStreamOptions = { ...turnState.streamOptions };
 			const requestOptions = await this.emitBeforeProviderRequest(model, turnState.sessionId, snapshotOptions);
-			return this.models.streamSimple(model, context, {
+			const options: ModelsSimpleStreamOptions = {
 				cacheRetention: requestOptions.cacheRetention,
+				env: requestOptions.env,
 				headers: requestOptions.headers,
+				maxTokens: requestOptions.maxTokens,
 				maxRetries: requestOptions.maxRetries,
 				maxRetryDelayMs: requestOptions.maxRetryDelayMs,
 				metadata: requestOptions.metadata,
@@ -378,20 +574,33 @@ export class AgentHarness<
 				reasoning: streamOptions?.reasoning,
 				signal: streamOptions?.signal,
 				sessionId: turnState.sessionId,
+				temperature: requestOptions.temperature,
+				thinkingBudgets: requestOptions.thinkingBudgets,
 				timeoutMs: requestOptions.timeoutMs,
 				transport: requestOptions.transport,
-			});
+				transformHeaders: requestOptions.transformHeaders,
+				websocketConnectTimeoutMs: requestOptions.websocketConnectTimeoutMs,
+			};
+			if (this.streamFn) {
+				const { transformHeaders: _transformHeaders, ...streamOptionsWithoutTransforms } = options;
+				return this.streamFn(model, context, streamOptionsWithoutTransforms);
+			}
+			return this.models.streamSimple(model, context, options);
 		};
 	}
 
-	private async drainQueuedMessages(queue: AgentMessage[], mode: QueueMode): Promise<AgentMessage[]> {
-		const messages = mode === "all" ? queue.splice(0) : queue.splice(0, 1);
-		if (messages.length === 0) return messages;
+	private async drainQueuedMessages<TMessage extends AgentMessage>(
+		queue: Array<DurableQueuedMessage<TMessage>>,
+		mode: QueueMode,
+	): Promise<TMessage[]> {
+		const queued = mode === "all" ? queue.splice(0) : queue.splice(0, 1);
+		if (queued.length === 0) return [];
 		try {
 			await this.emitQueueUpdate();
-			return messages;
+			this.consumedQueueItemIds.push(...queued.flatMap((item) => (item.queueItemId ? [item.queueItemId] : [])));
+			return queued.map((item) => item.message);
 		} catch (error) {
-			queue.unshift(...messages);
+			queue.unshift(...queued);
 			throw normalizeHookError(error);
 		}
 	}
@@ -404,19 +613,31 @@ export class AgentHarness<
 		return {
 			model: turnState.model,
 			reasoning: turnState.thinkingLevel === "off" ? undefined : turnState.thinkingLevel,
-			convertToLlm,
+			convertToLlm: this.convertMessages,
+			runBudget: turnState.runBudget,
+			loopDetection: turnState.loopDetection,
 			transformContext: async (messages) => {
 				const result = await this.emitHook({ type: "context", messages: [...messages] });
 				return result?.messages ?? messages;
 			},
-			beforeToolCall: async ({ toolCall, args }) => {
-				const result = await this.emitHook({
-					type: "tool_call",
-					toolCallId: toolCall.id,
-					toolName: toolCall.name,
-					input: args as Record<string, unknown>,
+			beforeToolCall: async (context, signal) => {
+				const { toolCall, args } = context;
+				const result = await this.emitHook(
+					{
+						type: "tool_call",
+						toolCallId: toolCall.id,
+						toolName: toolCall.name,
+						input: args as Record<string, unknown>,
+					},
+					signal,
+				);
+				if (result?.block) return { block: true, reason: result.reason };
+				if (!this.toolPolicy) return undefined;
+				const authorization = await this.toolPolicy.authorize(context, signal, {
+					sessionId: getTurnState().sessionId,
 				});
-				return result ? { block: result.block, reason: result.reason } : undefined;
+				if (authorization.allowed) return undefined;
+				return { block: true, reason: authorization.reason ?? authorization.decision.reason };
 			},
 			afterToolCall: async ({ toolCall, args, result, isError }) => {
 				const patch = await this.emitHook({
@@ -461,34 +682,188 @@ export class AgentHarness<
 
 	private async flushPendingSessionWrites(): Promise<void> {
 		while (this.pendingSessionWrites.length > 0) {
-			const write = this.pendingSessionWrites[0]!;
-			if (write.type === "message") {
-				await this.session.appendMessage(write.message);
-			} else if (write.type === "model_change") {
-				await this.session.appendModelChange(write.provider, write.modelId);
-			} else if (write.type === "thinking_level_change") {
-				await this.session.appendThinkingLevelChange(write.thinkingLevel);
-			} else if (write.type === "active_tools_change") {
-				await this.session.appendActiveToolsChange(write.activeToolNames);
-			} else if (write.type === "custom") {
-				await this.session.appendCustomEntry(write.customType, write.data);
-			} else if (write.type === "custom_message") {
-				await this.session.appendCustomMessageEntry(write.customType, write.content, write.display, write.details);
-			} else if (write.type === "label") {
-				await this.session.appendLabel(write.targetId, write.label);
-			} else if (write.type === "session_info") {
-				await this.session.appendSessionName(write.name ?? "");
-			} else if (write.type === "leaf") {
-				await this.session.getStorage().setLeafId(write.targetId);
-			}
+			const pending = this.pendingSessionWrites[0]!;
+			await this.applyPendingSessionWrite(pending);
 			this.pendingSessionWrites.shift();
 		}
 	}
 
+	/**
+	 * Apply durable writes left by a previous process and restore session-selected runtime state.
+	 * Prefer {@link restoreAgentHarness}; this method is public for hosts that own event-store opening.
+	 */
+	async reconcileRecoveredState(): Promise<void> {
+		if (this.phase !== "idle") {
+			throw new AgentHarnessError("busy", "reconcileRecoveredState() requires idle harness");
+		}
+		await this.flushPendingSessionWrites();
+		const branch = await this.session.getBranch();
+		const context = await this.session.buildContext();
+		const previousModel = this.model;
+		const previousThinkingLevel = this.thinkingLevel;
+		const previousActiveToolNames = [...this.activeToolNames];
+
+		if (context.model) {
+			const restoredModel =
+				this.models.getModel(context.model.provider, context.model.modelId) ??
+				(this.model.provider === context.model.provider && this.model.id === context.model.modelId
+					? this.model
+					: undefined);
+			if (!restoredModel) {
+				throw new AgentHarnessError(
+					"invalid_state",
+					`Session model is unavailable: ${context.model.provider}/${context.model.modelId}`,
+				);
+			}
+			this.model = restoredModel;
+		}
+
+		if (branch.some((entry) => entry.type === "thinking_level_change")) {
+			if (!isThinkingLevel(context.thinkingLevel)) {
+				throw new AgentHarnessError(
+					"invalid_state",
+					`Session thinking level is unsupported: ${context.thinkingLevel}`,
+				);
+			}
+			this.thinkingLevel = context.thinkingLevel;
+		}
+
+		if (context.activeToolNames) {
+			this.validateToolNames(context.activeToolNames);
+			this.activeToolNames = [...context.activeToolNames];
+		}
+
+		if (this.model !== previousModel) {
+			await this.emitOwn({ type: "model_update", model: this.model, previousModel, source: "restore" });
+		}
+		if (this.thinkingLevel !== previousThinkingLevel) {
+			await this.emitOwn({
+				type: "thinking_level_update",
+				level: this.thinkingLevel,
+				previousLevel: previousThinkingLevel,
+			});
+		}
+		if (
+			this.activeToolNames.length !== previousActiveToolNames.length ||
+			this.activeToolNames.some((name, index) => name !== previousActiveToolNames[index])
+		) {
+			await this.emitOwn({
+				type: "tools_update",
+				toolNames: [...this.tools.keys()],
+				previousToolNames: [...this.tools.keys()],
+				activeToolNames: [...this.activeToolNames],
+				previousActiveToolNames,
+				source: "restore",
+			});
+		}
+		await this.emitQueueUpdate();
+	}
+
+	private async queuePendingSessionWrite(write: PendingSessionWrite): Promise<void> {
+		if (!this.runtimeEvents) {
+			this.pendingSessionWrites.push({ write });
+			return;
+		}
+		const pendingWriteId = uuidv7();
+		const targetEntryId = await this.session.getStorage().createEntryId();
+		await this.runtimeEvents.append({
+			type: "pending_write_enqueued",
+			pendingWriteId,
+			targetEntryId,
+			write,
+		});
+		this.pendingSessionWrites.push({ write, pendingWriteId, targetEntryId });
+	}
+
+	private async applyPendingSessionWrite(pending: DurablePendingWrite): Promise<void> {
+		const storage = this.session.getStorage();
+		if (pending.targetEntryId) {
+			const existing = await storage.getEntry(pending.targetEntryId);
+			if (!existing) {
+				await storage.appendEntry({
+					...pending.write,
+					id: pending.targetEntryId,
+					parentId: await storage.getLeafId(),
+					timestamp: new Date().toISOString(),
+				} as SessionTreeEntry);
+			}
+			if (this.runtimeEvents && pending.pendingWriteId) {
+				await this.runtimeEvents.append({
+					type: "pending_write_applied",
+					pendingWriteId: pending.pendingWriteId,
+					targetEntryId: pending.targetEntryId,
+				});
+			}
+			return;
+		}
+
+		const write = pending.write;
+		if (write.type === "message") await this.session.appendMessage(write.message);
+		else if (write.type === "model_change") await this.session.appendModelChange(write.provider, write.modelId);
+		else if (write.type === "thinking_level_change") {
+			await this.session.appendThinkingLevelChange(write.thinkingLevel);
+		} else if (write.type === "active_tools_change") {
+			await this.session.appendActiveToolsChange(write.activeToolNames);
+		} else if (write.type === "custom") await this.session.appendCustomEntry(write.customType, write.data);
+		else if (write.type === "custom_message") {
+			await this.session.appendCustomMessageEntry(write.customType, write.content, write.display, write.details);
+		} else if (write.type === "label") await this.session.appendLabel(write.targetId, write.label);
+		else if (write.type === "session_info") await this.session.appendSessionName(write.name ?? "");
+		else if (write.type === "leaf") await storage.setLeafId(write.targetId);
+	}
+
 	private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise<void> {
+		if (event.type === "turn_start" && this.runtimeEvents && this.activeOperationId) {
+			const turnId = uuidv7();
+			await this.runtimeEvents.append({
+				type: "turn_started",
+				turnId,
+				operationId: this.activeOperationId,
+				consumedQueueItemIds: this.consumedQueueItemIds.splice(0),
+			});
+			this.activeTurnId = turnId;
+		}
+		if (event.type === "tool_execution_start" && this.runtimeEvents && this.activeTurnId) {
+			await this.runtimeEvents.append({
+				type: "tool_call_started",
+				toolCallId: event.toolCallId,
+				turnId: this.activeTurnId,
+				toolName: event.toolName,
+				retrySafe: this.toolPolicy?.getSpec(event.toolName)?.retrySafe ?? false,
+			});
+		}
+		if (event.type === "tool_execution_end" && this.runtimeEvents) {
+			const toolCall = this.runtimeEvents.getState().toolCalls[event.toolCallId];
+			if (toolCall?.status === "active") {
+				await this.runtimeEvents.append({ type: "tool_call_finished", toolCallId: event.toolCallId });
+			}
+		}
 		if (event.type === "message_end") {
-			await this.session.appendMessage(event.message);
-			await this.emitAny(event, signal);
+			if (event.message.role === "assistant" && this.runtimeEvents && this.activeProviderRequestId) {
+				if (event.message.stopReason === "error") {
+					await this.runtimeEvents.append({
+						type: "provider_request_failed",
+						requestId: this.activeProviderRequestId,
+						reason: event.message.errorMessage ?? "Provider request failed",
+					});
+				} else if (event.message.stopReason === "aborted") {
+					await this.runtimeEvents.append({
+						type: "provider_request_interrupted",
+						requestId: this.activeProviderRequestId,
+						reason: event.message.errorMessage ?? "Provider request aborted",
+					});
+				} else {
+					await this.runtimeEvents.append({
+						type: "provider_request_finished",
+						requestId: this.activeProviderRequestId,
+					});
+				}
+				this.activeProviderRequestId = undefined;
+			}
+			const persistResult = await this.emitHook({ type: "before_message_persist", message: event.message }, signal);
+			const message = persistResult?.message ?? event.message;
+			await this.session.appendMessage(message);
+			await this.emitAny({ ...event, message }, signal);
 			return;
 		}
 		if (event.type === "turn_end") {
@@ -500,15 +875,51 @@ export class AgentHarness<
 			}
 			const hadPendingMutations = this.pendingSessionWrites.length > 0;
 			await this.flushPendingSessionWrites();
+			if (event.message.role === "assistant" && event.message.stopReason === "aborted") {
+				await this.interruptRuntimeOperation(event.message.errorMessage ?? "Provider request aborted");
+			} else if (event.message.role === "assistant" && event.message.stopReason === "error") {
+				await this.interruptRuntimeOperation(event.message.errorMessage ?? "Provider request failed");
+			} else if (this.runtimeEvents && this.activeTurnId) {
+				await this.runtimeEvents.append({ type: "turn_finished", turnId: this.activeTurnId });
+				this.activeTurnId = undefined;
+			}
 			if (eventError) throw eventError;
 			await this.emitOwn({ type: "save_point", hadPendingMutations });
 			return;
 		}
 		if (event.type === "agent_end") {
-			await this.flushPendingSessionWrites();
-			this.phase = "idle";
-			await this.emitAny(event, signal);
-			await this.emitOwn({ type: "settled", nextTurnCount: this.nextTurnQueue.length }, signal);
+			this.acceptsTurnInput = false;
+			this.runAbortController = undefined;
+			const errors: Error[] = [];
+			try {
+				await this.flushPendingSessionWrites();
+			} catch (error) {
+				errors.push(toError(error));
+			}
+			try {
+				await this.finishRuntimeOperation();
+			} catch (error) {
+				errors.push(toError(error));
+			}
+			try {
+				await this.emitAny(event, signal);
+			} catch (error) {
+				errors.push(toError(error));
+			}
+			try {
+				await this.emitOwn({ type: "settled", nextTurnCount: this.nextTurnQueue.length }, signal);
+			} catch (error) {
+				errors.push(toError(error));
+			}
+			try {
+				await this.flushPendingSessionWrites();
+			} catch (error) {
+				errors.push(toError(error));
+			}
+			if (errors.length > 0) {
+				const cause = errors.length === 1 ? errors[0]! : new AggregateError(errors, "Agent run settlement failed");
+				throw normalizeHarnessError(cause, "hook");
+			}
 			return;
 		}
 		await this.emitAny(event, signal);
@@ -528,49 +939,59 @@ export class AgentHarness<
 		return [failureMessage];
 	}
 
-	private async executeTurn(
+	private async drainNextTurnMessages(): Promise<AgentMessage[]> {
+		const queuedMessages = this.nextTurnQueue.splice(0);
+		if (queuedMessages.length === 0) return [];
+		try {
+			await this.emitQueueUpdate();
+		} catch (error) {
+			this.nextTurnQueue.unshift(...queuedMessages);
+			throw normalizeHookError(error);
+		}
+		this.consumedQueueItemIds.push(...queuedMessages.flatMap((item) => (item.queueItemId ? [item.queueItemId] : [])));
+		return queuedMessages.map((item) => item.message);
+	}
+
+	private async executeRun(
 		turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
-		text: string,
-		options?: { images?: ImageContent[] },
+		messages: AgentMessage[],
+		options: { continuation?: boolean; contextMessages?: AgentMessage[]; systemPrompt?: string } = {},
 	): Promise<AssistantMessage> {
 		let activeTurnState = turnState;
-		let messages: AgentMessage[] = [createUserMessage(text, options?.images)];
-		if (this.nextTurnQueue.length > 0) {
-			const queuedMessages = this.nextTurnQueue.splice(0);
-			try {
-				await this.emitQueueUpdate();
-			} catch (error) {
-				this.nextTurnQueue.unshift(...queuedMessages);
-				throw normalizeHookError(error);
-			}
-			messages = [...queuedMessages, messages[0]!];
-		}
-		const beforeResult = await this.emitHook({
-			type: "before_agent_start",
-			prompt: text,
-			images: options?.images,
-			systemPrompt: turnState.systemPrompt,
-			resources: turnState.resources,
-		});
-		if (beforeResult?.messages) messages = [...messages, ...beforeResult.messages];
-
+		let terminalSettlementStarted = false;
 		const abortController = new AbortController();
 		const getTurnState = () => activeTurnState;
 		const setTurnState = (nextTurnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>) => {
 			activeTurnState = nextTurnState;
 		};
 		this.runAbortController = abortController;
+		this.acceptsTurnInput = true;
 		const runResultPromise = (async () => {
 			try {
-				return await runAgentLoop(
-					messages,
-					this.createContext(turnState, beforeResult?.systemPrompt),
-					this.createLoopConfig(getTurnState, setTurnState),
-					(event) => this.handleAgentEvent(event, abortController.signal),
-					abortController.signal,
-					this.createStreamFn(getTurnState),
-				);
+				const context = this.createContext(turnState, options.systemPrompt);
+				if (options.contextMessages) context.messages = [...options.contextMessages];
+				const emit = (event: AgentEvent) => {
+					if (event.type === "agent_end") terminalSettlementStarted = true;
+					return this.handleAgentEvent(event, abortController.signal);
+				};
+				return options.continuation
+					? await runAgentLoopContinue(
+							context,
+							this.createLoopConfig(getTurnState, setTurnState),
+							emit,
+							abortController.signal,
+							this.createStreamFn(getTurnState),
+						)
+					: await runAgentLoop(
+							messages,
+							context,
+							this.createLoopConfig(getTurnState, setTurnState),
+							emit,
+							abortController.signal,
+							this.createStreamFn(getTurnState),
+						);
 			} catch (error) {
+				if (terminalSettlementStarted) throw error;
 				try {
 					return await this.emitRunFailure(
 						activeTurnState.model,
@@ -600,9 +1021,30 @@ export class AgentHarness<
 			try {
 				await this.flushPendingSessionWrites();
 			} finally {
+				this.acceptsTurnInput = false;
 				this.runAbortController = undefined;
 			}
 		}
+	}
+
+	private async executeTurn(
+		turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
+		text: string,
+		options?: { images?: ImageContent[] },
+	): Promise<AssistantMessage> {
+		let messages: AgentMessage[] = [
+			...(await this.drainNextTurnMessages()),
+			createUserMessage(text, options?.images),
+		];
+		const beforeResult = await this.emitHook({
+			type: "before_agent_start",
+			prompt: text,
+			images: options?.images,
+			systemPrompt: turnState.systemPrompt,
+			resources: turnState.resources,
+		});
+		if (beforeResult?.messages) messages = [...messages, ...beforeResult.messages];
+		return this.executeRun(turnState, messages, { systemPrompt: beforeResult?.systemPrompt });
 	}
 
 	async prompt(text: string, options?: { images?: ImageContent[] }): Promise<AssistantMessage> {
@@ -610,12 +1052,51 @@ export class AgentHarness<
 		this.phase = "turn";
 		const finishRunPromise = this.startRunPromise();
 		try {
+			await this.startRuntimeOperation("turn");
 			const turnState = await this.createTurnState();
 			return await this.executeTurn(turnState, text, options);
 		} catch (error) {
-			this.phase = "idle";
-			throw normalizeHarnessError(error, "unknown");
+			throw await this.normalizeOperationFailure(error, "unknown");
 		} finally {
+			this.phase = "idle";
+			finishRunPromise();
+		}
+	}
+
+	/** Run an application-prepared message batch without re-running text expansion hooks. */
+	async promptMessages(messages: AgentMessage[]): Promise<AssistantMessage> {
+		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
+		if (messages.length === 0) throw new AgentHarnessError("invalid_argument", "promptMessages() requires messages");
+		this.phase = "turn";
+		const finishRunPromise = this.startRunPromise();
+		try {
+			await this.startRuntimeOperation("turn");
+			const turnState = await this.createTurnState();
+			return await this.executeRun(turnState, [...(await this.drainNextTurnMessages()), ...messages]);
+		} catch (error) {
+			throw await this.normalizeOperationFailure(error, "unknown");
+		} finally {
+			this.phase = "idle";
+			finishRunPromise();
+		}
+	}
+
+	/** Continue from caller-projected context, typically after retry or compaction. */
+	async continue(contextMessages?: AgentMessage[]): Promise<AssistantMessage> {
+		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
+		this.phase = "retry";
+		const finishRunPromise = this.startRunPromise();
+		try {
+			await this.startRuntimeOperation("retry");
+			const turnState = await this.createTurnState();
+			const queuedMessages = await this.drainNextTurnMessages();
+			return queuedMessages.length > 0
+				? await this.executeRun(turnState, queuedMessages, { contextMessages })
+				: await this.executeRun(turnState, [], { continuation: true, contextMessages });
+		} catch (error) {
+			throw await this.normalizeOperationFailure(error, "unknown");
+		} finally {
+			this.phase = "idle";
 			finishRunPromise();
 		}
 	}
@@ -625,14 +1106,15 @@ export class AgentHarness<
 		this.phase = "turn";
 		const finishRunPromise = this.startRunPromise();
 		try {
+			await this.startRuntimeOperation("turn");
 			const turnState = await this.createTurnState();
 			const skill = (turnState.resources.skills ?? []).find((candidate) => candidate.name === name);
 			if (!skill) throw new AgentHarnessError("invalid_argument", `Unknown skill: ${name}`);
 			return await this.executeTurn(turnState, formatSkillInvocation(skill, additionalInstructions));
 		} catch (error) {
-			this.phase = "idle";
-			throw normalizeHarnessError(error, "unknown");
+			throw await this.normalizeOperationFailure(error, "unknown");
 		} finally {
+			this.phase = "idle";
 			finishRunPromise();
 		}
 	}
@@ -642,33 +1124,57 @@ export class AgentHarness<
 		this.phase = "turn";
 		const finishRunPromise = this.startRunPromise();
 		try {
+			await this.startRuntimeOperation("turn");
 			const turnState = await this.createTurnState();
 			const template = (turnState.resources.promptTemplates ?? []).find((candidate) => candidate.name === name);
 			if (!template) throw new AgentHarnessError("invalid_argument", `Unknown prompt template: ${name}`);
 			return await this.executeTurn(turnState, formatPromptTemplateInvocation(template, args));
 		} catch (error) {
-			this.phase = "idle";
-			throw normalizeHarnessError(error, "unknown");
+			throw await this.normalizeOperationFailure(error, "unknown");
 		} finally {
+			this.phase = "idle";
 			finishRunPromise();
 		}
 	}
 
 	async steer(text: string, options?: { images?: ImageContent[] }): Promise<void> {
-		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot steer while idle");
-		this.steerQueue.push(createUserMessage(text, options?.images));
-		await this.emitQueueUpdate();
+		await this.steerMessage(createUserMessage(text, options?.images));
+	}
+
+	async steerMessage(message: AgentMessage): Promise<void> {
+		if (!this.canAcceptTurnInput()) {
+			throw new AgentHarnessError("invalid_state", "Cannot steer outside an active agent turn");
+		}
+		await this.queueSteeringMessage(message);
+	}
+
+	/** Queue steering input even when the host has not started a turn yet. */
+	async queueSteeringMessage(message: AgentMessage): Promise<void> {
+		await this.enqueueMessage("steer", this.steerQueue, message);
 	}
 
 	async followUp(text: string, options?: { images?: ImageContent[] }): Promise<void> {
-		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot follow up while idle");
-		this.followUpQueue.push(createUserMessage(text, options?.images));
-		await this.emitQueueUpdate();
+		await this.followUpMessage(createUserMessage(text, options?.images));
+	}
+
+	async followUpMessage(message: AgentMessage): Promise<void> {
+		if (!this.canAcceptTurnInput()) {
+			throw new AgentHarnessError("invalid_state", "Cannot follow up outside an active agent turn");
+		}
+		await this.queueFollowUpMessage(message);
+	}
+
+	/** Queue follow-up input even when the host has not started a turn yet. */
+	async queueFollowUpMessage(message: AgentMessage): Promise<void> {
+		await this.enqueueMessage("follow_up", this.followUpQueue, message);
 	}
 
 	async nextTurn(text: string, options?: { images?: ImageContent[] }): Promise<void> {
-		this.nextTurnQueue.push(createUserMessage(text, options?.images));
-		await this.emitQueueUpdate();
+		await this.nextTurnMessage(createUserMessage(text, options?.images));
+	}
+
+	async nextTurnMessage(message: AgentMessage): Promise<void> {
+		await this.enqueueMessage("next_turn", this.nextTurnQueue, message);
 	}
 
 	async appendMessage(message: AgentMessage): Promise<void> {
@@ -676,7 +1182,7 @@ export class AgentHarness<
 			if (this.phase === "idle") {
 				await this.session.appendMessage(message);
 			} else {
-				this.pendingSessionWrites.push({ type: "message", message });
+				await this.queuePendingSessionWrite({ type: "message", message });
 			}
 		} catch (error) {
 			throw normalizeHarnessError(error, "session");
@@ -689,6 +1195,7 @@ export class AgentHarness<
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "compact() requires idle harness");
 		this.phase = "compaction";
 		try {
+			await this.startRuntimeOperation("compaction");
 			const model = this.model;
 			if (!model) throw new AgentHarnessError("invalid_state", "No model set for compaction");
 			const branchEntries = await this.session.getBranch();
@@ -721,9 +1228,10 @@ export class AgentHarness<
 			if (entry?.type === "compaction") {
 				await this.emitOwn({ type: "session_compact", compactionEntry: entry, fromHook: provided !== undefined });
 			}
+			await this.finishRuntimeOperation();
 			return result;
 		} catch (error) {
-			throw normalizeHarnessError(error, "compaction");
+			throw await this.normalizeOperationFailure(error, "compaction");
 		} finally {
 			this.phase = "idle";
 		}
@@ -736,8 +1244,12 @@ export class AgentHarness<
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "navigateTree() requires idle harness");
 		this.phase = "branch_summary";
 		try {
+			await this.startRuntimeOperation("branch_summary");
 			const oldLeafId = await this.session.getLeafId();
-			if (oldLeafId === targetId) return { cancelled: false };
+			if (oldLeafId === targetId) {
+				await this.finishRuntimeOperation();
+				return { cancelled: false };
+			}
 			const targetEntry = await this.session.getEntry(targetId);
 			if (!targetEntry) throw new AgentHarnessError("invalid_argument", `Entry ${targetId} not found`);
 			const { entries, commonAncestorId } = await collectEntriesForBranchSummary(this.session, oldLeafId, targetId);
@@ -753,7 +1265,10 @@ export class AgentHarness<
 			};
 			const signal = new AbortController().signal;
 			const hookResult = await this.emitHook({ type: "session_before_tree", preparation, signal });
-			if (hookResult?.cancel) return { cancelled: true };
+			if (hookResult?.cancel) {
+				await this.finishRuntimeOperation();
+				return { cancelled: true };
+			}
 			let summaryEntry: NavigateTreeResult["summaryEntry"];
 			let summaryText: string | undefined = hookResult?.summary?.summary;
 			let summaryDetails: unknown = hookResult?.summary?.details;
@@ -768,7 +1283,10 @@ export class AgentHarness<
 					replaceInstructions: hookResult?.replaceInstructions ?? options?.replaceInstructions,
 				});
 				if (!branchSummary.ok) {
-					if (branchSummary.error.code === "aborted") return { cancelled: true };
+					if (branchSummary.error.code === "aborted") {
+						await this.finishRuntimeOperation();
+						return { cancelled: true };
+					}
 					throw new AgentHarnessError("branch_summary", branchSummary.error.message, branchSummary.error);
 				}
 				summaryText = branchSummary.value.summary;
@@ -818,9 +1336,10 @@ export class AgentHarness<
 				summaryEntry,
 				fromHook: hookResult?.summary !== undefined,
 			});
+			await this.finishRuntimeOperation();
 			return { cancelled: false, editorText, summaryEntry };
 		} catch (error) {
-			throw normalizeHarnessError(error, "branch_summary");
+			throw await this.normalizeOperationFailure(error, "branch_summary");
 		} finally {
 			this.phase = "idle";
 		}
@@ -830,13 +1349,57 @@ export class AgentHarness<
 		return this.model;
 	}
 
+	getPhase(): AgentHarnessPhase {
+		return this.phase;
+	}
+
+	isIdle(): boolean {
+		return this.phase === "idle";
+	}
+
+	canAcceptTurnInput(): boolean {
+		return (this.phase === "turn" || this.phase === "retry") && this.acceptsTurnInput;
+	}
+
+	get signal(): AbortSignal | undefined {
+		return this.runAbortController?.signal;
+	}
+
+	getPendingWrites(): readonly PendingSessionWrite[] {
+		return this.pendingSessionWrites.map((pending) => pending.write);
+	}
+
+	/** Update host-owned runtime projections without creating duplicate session entries. */
+	synchronizeRuntimeState(state: {
+		model: Model<any>;
+		thinkingLevel: ThinkingLevel;
+		tools: TTool[];
+		activeToolNames?: string[];
+	}): void {
+		this.validateUniqueNames(
+			state.tools.map((tool) => tool.name),
+			"Duplicate tool name(s)",
+		);
+		const tools = new Map(state.tools.map((tool) => [tool.name, tool]));
+		const activeToolNames = state.activeToolNames ? [...state.activeToolNames] : state.tools.map((tool) => tool.name);
+		this.validateToolNames(activeToolNames, tools);
+		this.model = state.model;
+		this.thinkingLevel = state.thinkingLevel;
+		this.tools = tools;
+		this.activeToolNames = activeToolNames;
+	}
+
 	async setModel(model: Model<any>): Promise<void> {
 		try {
 			const previousModel = this.model;
 			if (this.phase === "idle") {
 				await this.session.appendModelChange(model.provider, model.id);
 			} else {
-				this.pendingSessionWrites.push({ type: "model_change", provider: model.provider, modelId: model.id });
+				await this.queuePendingSessionWrite({
+					type: "model_change",
+					provider: model.provider,
+					modelId: model.id,
+				});
 			}
 			this.model = model;
 			await this.emitOwn({ type: "model_update", model, previousModel, source: "set" });
@@ -855,7 +1418,7 @@ export class AgentHarness<
 			if (this.phase === "idle") {
 				await this.session.appendThinkingLevelChange(level);
 			} else {
-				this.pendingSessionWrites.push({ type: "thinking_level_change", thinkingLevel: level });
+				await this.queuePendingSessionWrite({ type: "thinking_level_change", thinkingLevel: level });
 			}
 			this.thinkingLevel = level;
 			await this.emitOwn({ type: "thinking_level_update", level, previousLevel });
@@ -882,7 +1445,10 @@ export class AgentHarness<
 			if (this.phase === "idle") {
 				await this.session.appendActiveToolsChange(nextActiveToolNames);
 			} else {
-				this.pendingSessionWrites.push({ type: "active_tools_change", activeToolNames: [...nextActiveToolNames] });
+				await this.queuePendingSessionWrite({
+					type: "active_tools_change",
+					activeToolNames: [...nextActiveToolNames],
+				});
 			}
 			this.tools = nextTools;
 			this.activeToolNames = [...nextActiveToolNames];
@@ -911,7 +1477,10 @@ export class AgentHarness<
 			if (this.phase === "idle") {
 				await this.session.appendActiveToolsChange(toolNames);
 			} else {
-				this.pendingSessionWrites.push({ type: "active_tools_change", activeToolNames: [...toolNames] });
+				await this.queuePendingSessionWrite({
+					type: "active_tools_change",
+					activeToolNames: [...toolNames],
+				});
 			}
 			this.activeToolNames = [...toolNames];
 			await this.emitOwn({
@@ -967,22 +1536,105 @@ export class AgentHarness<
 		this.streamOptions = cloneStreamOptions(streamOptions);
 	}
 
-	async abort(): Promise<AbortResult> {
-		const clearedSteer = [...this.steerQueue];
-		const clearedFollowUp = [...this.followUpQueue];
-		this.steerQueue = [];
-		this.followUpQueue = [];
-		this.runAbortController?.abort();
+	getQueueSnapshot(): { steer: AgentMessage[]; followUp: AgentMessage[]; nextTurn: AgentMessage[] } {
+		return {
+			steer: this.steerQueue.map((item) => item.message),
+			followUp: this.followUpQueue.map((item) => item.message),
+			nextTurn: this.nextTurnQueue.map((item) => item.message),
+		};
+	}
+
+	hasQueuedMessages(): boolean {
+		return this.steerQueue.length > 0 || this.followUpQueue.length > 0 || this.nextTurnQueue.length > 0;
+	}
+
+	private async discardQueuedMessages<TMessage extends AgentMessage>(
+		queue: Array<DurableQueuedMessage<TMessage>>,
+		reason: string,
+		errors: Error[],
+	): Promise<TMessage[]> {
+		const cleared: TMessage[] = [];
+		const retained: Array<DurableQueuedMessage<TMessage>> = [];
+		for (const item of queue) {
+			try {
+				if (this.runtimeEvents && item.queueItemId) {
+					await this.runtimeEvents.append({
+						type: "queue_discarded",
+						queueItemId: item.queueItemId,
+						reason,
+					});
+				}
+				cleared.push(item.message);
+			} catch (error) {
+				errors.push(toError(error));
+				retained.push(item);
+			}
+		}
+		queue.splice(0, queue.length, ...retained);
+		return cleared;
+	}
+
+	private async clearQueue(queue: Array<DurableQueuedMessage>, reason: string): Promise<AgentMessage[]> {
 		const errors: Error[] = [];
+		const cleared = await this.discardQueuedMessages(queue, reason, errors);
 		try {
 			await this.emitQueueUpdate();
 		} catch (error) {
 			errors.push(toError(error));
 		}
+		if (errors.length > 0) {
+			const cause = errors.length === 1 ? errors[0]! : new AggregateError(errors, "Queue clearing failed");
+			throw normalizeHarnessError(cause, "hook");
+		}
+		return cleared;
+	}
+
+	async clearSteeringQueue(reason = "host_clear"): Promise<AgentMessage[]> {
+		return await this.clearQueue(this.steerQueue, reason);
+	}
+
+	async clearFollowUpQueue(reason = "host_clear"): Promise<AgentMessage[]> {
+		return await this.clearQueue(this.followUpQueue, reason);
+	}
+
+	async clearQueues(reason = "host_clear"): Promise<{
+		steer: AgentMessage[];
+		followUp: AgentMessage[];
+		nextTurn: AgentMessage[];
+	}> {
+		const errors: Error[] = [];
+		const steer = await this.discardQueuedMessages(this.steerQueue, reason, errors);
+		const followUp = await this.discardQueuedMessages(this.followUpQueue, reason, errors);
+		const nextTurn = await this.discardQueuedMessages(this.nextTurnQueue, reason, errors);
 		try {
-			await this.waitForIdle();
+			await this.emitQueueUpdate();
 		} catch (error) {
 			errors.push(toError(error));
+		}
+		if (errors.length > 0) {
+			const cause = errors.length === 1 ? errors[0]! : new AggregateError(errors, "Queue clearing failed");
+			throw normalizeHarnessError(cause, "hook");
+		}
+		return { steer, followUp, nextTurn };
+	}
+
+	async abort(): Promise<AbortResult> {
+		const activeRun = this.runAbortController;
+		activeRun?.abort();
+		const errors: Error[] = [];
+		const clearedSteer = await this.discardQueuedMessages(this.steerQueue, "abort", errors);
+		const clearedFollowUp = await this.discardQueuedMessages(this.followUpQueue, "abort", errors);
+		try {
+			await this.emitQueueUpdate();
+		} catch (error) {
+			errors.push(toError(error));
+		}
+		if (activeRun) {
+			try {
+				await this.waitForIdle();
+			} catch (error) {
+				errors.push(toError(error));
+			}
 		}
 		try {
 			await this.emitOwn({ type: "abort", clearedSteer, clearedFollowUp });
@@ -1003,27 +1655,32 @@ export class AgentHarness<
 	subscribe(
 		listener: (event: AgentHarnessEvent<TSkill, TPromptTemplate>, signal?: AbortSignal) => Promise<void> | void,
 	): () => void {
-		let handlers = this.handlers.get(SUBSCRIBER_EVENT_TYPE);
-		if (!handlers) {
-			handlers = new Set();
-			this.handlers.set(SUBSCRIBER_EVENT_TYPE, handlers);
-		}
-		handlers.add(listener as AgentHarnessHandler);
-		return () => handlers!.delete(listener as AgentHarnessHandler);
+		return this.hooks.observe(async (event, _context, signal) => await listener(event, signal));
 	}
 
-	on<TType extends keyof AgentHarnessEventResultMap>(
+	on<TType extends AgentHarnessOwnEvent<TSkill, TPromptTemplate>["type"]>(
 		type: TType,
-		handler: (
-			event: Extract<AgentHarnessOwnEvent, { type: TType }>,
-		) => Promise<AgentHarnessEventResultMap[TType]> | AgentHarnessEventResultMap[TType],
+		handler: HookHandler<
+			Extract<AgentHarnessOwnEvent<TSkill, TPromptTemplate>, { type: TType }>,
+			AgentHarnessHookContext
+		>,
 	): () => void {
-		let handlers = this.handlers.get(type);
-		if (!handlers) {
-			handlers = new Set();
-			this.handlers.set(type, handlers);
-		}
-		handlers.add(handler as AgentHarnessHandler);
-		return () => handlers!.delete(handler as AgentHarnessHandler);
+		return this.hooks.on(type, handler);
 	}
+}
+
+/** Open the canonical journal, conservatively recover interrupted work, and rebuild a usable harness. */
+export async function restoreAgentHarness<
+	TSkill extends Skill = Skill,
+	TPromptTemplate extends PromptTemplate = PromptTemplate,
+	TTool extends AgentTool = AgentTool,
+>(
+	options: AgentHarnessOptions<TSkill, TPromptTemplate, TTool>,
+	recoveryOptions: { reason?: string; recoveryId?: string } = {},
+): Promise<RestoredAgentHarness<TSkill, TPromptTemplate, TTool>> {
+	const runtimeEvents = options.runtimeEvents ?? (await SessionRuntimeEventStore.open(options.session));
+	const recovery = await runtimeEvents.recover(recoveryOptions);
+	const harness = new AgentHarness({ ...options, runtimeEvents });
+	await harness.reconcileRecoveredState();
+	return { harness, recovery };
 }

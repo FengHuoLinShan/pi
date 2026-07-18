@@ -2,6 +2,8 @@
 export * from "./agent.ts";
 // Loop functions
 export * from "./agent-loop.ts";
+// Context compilation and evidence
+export * from "./context/index.ts";
 export * from "./harness/agent-harness.ts";
 export {
 	type BranchPreparation,
@@ -25,8 +27,11 @@ export {
 	serializeConversation,
 	shouldCompact,
 } from "./harness/compaction/compaction.ts";
+export * from "./harness/hooks.ts";
 export * from "./harness/messages.ts";
+export * from "./harness/observability/index.ts";
 export * from "./harness/prompt-templates.ts";
+export * from "./harness/runtime-events/index.ts";
 export * from "./harness/session/jsonl-repo.ts";
 export * from "./harness/session/jsonl-storage.ts";
 export * from "./harness/session/memory-repo.ts";
@@ -42,5 +47,7 @@ export * from "./harness/utils/shell-output.ts";
 export * from "./harness/utils/truncate.ts";
 // Proxy utilities
 export * from "./proxy.ts";
+// Tool policy and approvals
+export * from "./tool-policy.ts";
 // Types
 export * from "./types.ts";

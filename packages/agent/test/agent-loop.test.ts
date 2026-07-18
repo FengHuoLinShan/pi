@@ -2,6 +2,10 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	EventStream,
+	type FauxProviderHandle,
+	fauxAssistantMessage,
+	fauxProvider,
+	fauxToolCall,
 	type Message,
 	type Model,
 	type UserMessage,
@@ -9,7 +13,7 @@ import {
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
+import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool, StreamFn } from "../src/types.ts";
 
 // Mock stream for testing - mimics MockAssistantStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -78,6 +82,28 @@ function createUserMessage(text: string): UserMessage {
 // Simple identity converter for tests - just passes through standard messages
 function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter((m) => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
+}
+
+function streamFromFaux(faux: FauxProviderHandle): StreamFn {
+	return (model, context, options) => faux.provider.streamSimple(model, context, options);
+}
+
+const echoToolSchema = Type.Object({ value: Type.String() });
+
+function createEchoTool(executed: string[]): AgentTool<typeof echoToolSchema, { value: string }> {
+	return {
+		name: "echo",
+		label: "Echo",
+		description: "Echo tool",
+		parameters: echoToolSchema,
+		async execute(_toolCallId, params) {
+			executed.push(params.value);
+			return {
+				content: [{ type: "text", text: `echoed: ${params.value}` }],
+				details: { value: params.value },
+			};
+		},
+	};
 }
 
 describe("agentLoop with AgentMessage", () => {
@@ -1300,6 +1326,458 @@ describe("agentLoop with AgentMessage", () => {
 		}
 
 		expect(llmCalls).toBe(1);
+	});
+});
+
+describe("agentLoop run limits", () => {
+	it("keeps budgets and loop detection disabled by default", async () => {
+		const executed: string[] = [];
+		const faux = fauxProvider();
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("echo", { value: "same" }, { id: "call-1" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage(fauxToolCall("echo", { value: "same" }, { id: "call-2" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("done"),
+		]);
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: "", messages: [], tools: [createEchoTool(executed)] },
+			{ model: faux.getModel(), convertToLlm: identityConverter },
+			undefined,
+			streamFromFaux(faux),
+		);
+		for await (const event of stream) events.push(event);
+
+		expect(executed).toEqual(["same", "same"]);
+		expect(faux.state.callCount).toBe(3);
+		expect(events.some((event) => event.type === "agent_termination")).toBe(false);
+	});
+
+	it.each([
+		["maxSteps", "max_steps"],
+		["maxModelCalls", "max_model_calls"],
+	] as const)("enforces %s before another provider request", async (budgetKey, expectedReason) => {
+		const executed: string[] = [];
+		const faux = fauxProvider();
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("echo", { value: "once" }, { id: "call-1" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("must remain queued"),
+		]);
+		let steeringPolls = 0;
+		let followUpPolls = 0;
+		const config: AgentLoopConfig = {
+			model: faux.getModel(),
+			convertToLlm: identityConverter,
+			runBudget: budgetKey === "maxSteps" ? { maxSteps: 1 } : { maxModelCalls: 1 },
+			getSteeringMessages: async () => {
+				steeringPolls++;
+				return [];
+			},
+			getFollowUpMessages: async () => {
+				followUpPolls++;
+				return [];
+			},
+		};
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: "", messages: [], tools: [createEchoTool(executed)] },
+			config,
+			undefined,
+			streamFromFaux(faux),
+		);
+		for await (const event of stream) events.push(event);
+
+		const termination = events.find((event) => event.type === "agent_termination");
+		expect(termination).toMatchObject({
+			type: "agent_termination",
+			termination: { status: "budget_exhausted", reason: expectedReason, limit: 1, observed: 1 },
+			usage: { steps: 1, modelCalls: 1, toolCalls: 1 },
+		});
+		expect(executed).toEqual(["once"]);
+		expect(faux.state.callCount).toBe(1);
+		expect(faux.getPendingResponseCount()).toBe(1);
+		expect(steeringPolls).toBe(1);
+		expect(followUpPolls).toBe(0);
+	});
+
+	it("enforces a tool-call budget across a parallel batch without leaving unresolved calls", async () => {
+		const executed: string[] = [];
+		const faux = fauxProvider();
+		faux.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("echo", { value: "first" }, { id: "call-1" }),
+					fauxToolCall("echo", { value: "second" }, { id: "call-2" }),
+				],
+				{ stopReason: "toolUse" },
+			),
+		]);
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: "", messages: [], tools: [createEchoTool(executed)] },
+			{
+				model: faux.getModel(),
+				convertToLlm: identityConverter,
+				toolExecution: "parallel",
+				runBudget: { maxToolCalls: 1 },
+			},
+			undefined,
+			streamFromFaux(faux),
+		);
+		for await (const event of stream) events.push(event);
+
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(executed).toEqual(["first"]);
+		expect(toolEnds.map((event) => [event.toolCallId, event.isError])).toEqual([
+			["call-1", false],
+			["call-2", true],
+		]);
+		expect(events.find((event) => event.type === "agent_termination")).toMatchObject({
+			termination: { status: "budget_exhausted", reason: "max_tool_calls", limit: 1, observed: 1 },
+			usage: { toolCalls: 1 },
+		});
+		const turnEnd = events.find((event) => event.type === "turn_end");
+		expect(turnEnd?.type === "turn_end" ? turnEnd.toolResults.map((result) => result.toolCallId) : []).toEqual([
+			"call-1",
+			"call-2",
+		]);
+		expect(events[events.length - 1]?.type).toBe("agent_end");
+	});
+
+	it("stops before tools when cumulative model tokens exceed the budget", async () => {
+		const executed: string[] = [];
+		const faux = fauxProvider({ tokenSize: { min: 1, max: 1 } });
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("echo", { value: "blocked" }, { id: "call-1" }), {
+				stopReason: "toolUse",
+			}),
+		]);
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("a prompt that consumes tokens")],
+			{ systemPrompt: "", messages: [], tools: [createEchoTool(executed)] },
+			{
+				model: faux.getModel(),
+				convertToLlm: identityConverter,
+				runBudget: { maxModelTokens: 1 },
+			},
+			undefined,
+			streamFromFaux(faux),
+		);
+		for await (const event of stream) events.push(event);
+
+		expect(executed).toEqual([]);
+		const termination = events.find((event) => event.type === "agent_termination");
+		expect(termination).toMatchObject({
+			termination: { status: "budget_exhausted", reason: "max_model_tokens", limit: 1 },
+		});
+		if (termination?.type !== "agent_termination") throw new Error("Expected termination event");
+		expect(termination.usage.modelTokens).toBeGreaterThan(1);
+	});
+
+	it("stops before tools when cumulative provider cost exceeds the budget", async () => {
+		const executed: string[] = [];
+		const message = createAssistantMessage(
+			[{ type: "toolCall", id: "call-1", name: "echo", arguments: { value: "blocked" } }],
+			"toolUse",
+		);
+		message.usage.cost = { input: 0.6, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.6 };
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: "", messages: [], tools: [createEchoTool(executed)] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				runBudget: { maxCost: 0.5 },
+			},
+			undefined,
+			() => {
+				const mockStream = new MockAssistantStream();
+				queueMicrotask(() => mockStream.push({ type: "done", reason: "toolUse", message }));
+				return mockStream;
+			},
+		);
+		for await (const event of stream) events.push(event);
+
+		expect(executed).toEqual([]);
+		expect(events.find((event) => event.type === "agent_termination")).toMatchObject({
+			termination: { status: "budget_exhausted", reason: "max_cost", limit: 0.5, observed: 0.6 },
+			usage: { cost: 0.6 },
+		});
+	});
+
+	it.each([
+		[{ deadline: 0 }, "deadline_exceeded", "deadline"],
+		[{ maxWallTimeMs: 0 }, "budget_exhausted", "max_wall_time"],
+	] as const)(
+		"terminates an already-expired time budget without calling the provider",
+		async (runBudget, status, reason) => {
+			const faux = fauxProvider();
+			faux.setResponses([fauxAssistantMessage("must remain queued")]);
+			const events: AgentEvent[] = [];
+			const stream = agentLoop(
+				[createUserMessage("start")],
+				{ systemPrompt: "", messages: [], tools: [] },
+				{ model: faux.getModel(), convertToLlm: identityConverter, runBudget },
+				undefined,
+				streamFromFaux(faux),
+			);
+			for await (const event of stream) events.push(event);
+
+			expect(faux.state.callCount).toBe(0);
+			expect(events.find((event) => event.type === "agent_termination")).toMatchObject({
+				termination: { status, reason, partialResult: false },
+				usage: { steps: 0, modelCalls: 0, toolCalls: 0 },
+			});
+		},
+	);
+
+	it("aborts an in-flight faux provider response when wall time expires", async () => {
+		const faux = fauxProvider({ tokensPerSecond: 100, tokenSize: { min: 1, max: 1 } });
+		faux.setResponses([fauxAssistantMessage("delayed response")]);
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: "", messages: [], tools: [] },
+			{
+				model: faux.getModel(),
+				convertToLlm: identityConverter,
+				runBudget: { maxWallTimeMs: 1 },
+			},
+			undefined,
+			streamFromFaux(faux),
+		);
+		for await (const event of stream) events.push(event);
+
+		expect(events.find((event) => event.type === "agent_termination")).toMatchObject({
+			termination: { status: "budget_exhausted", reason: "max_wall_time", partialResult: true },
+			usage: { steps: 1, modelCalls: 1 },
+		});
+		const turnEnd = events.find((event) => event.type === "turn_end");
+		expect(
+			turnEnd?.type === "turn_end" && turnEnd.message.role === "assistant" ? turnEnd.message.stopReason : "",
+		).toBe("aborted");
+	});
+
+	it("keeps caller cancellation distinct from deadline termination", async () => {
+		const faux = fauxProvider({ tokensPerSecond: 100, tokenSize: { min: 1, max: 1 } });
+		faux.setResponses([fauxAssistantMessage("delayed response")]);
+		const abortController = new AbortController();
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: "", messages: [], tools: [] },
+			{
+				model: faux.getModel(),
+				convertToLlm: identityConverter,
+				runBudget: { maxWallTimeMs: 1_000, deadline: Date.now() + 1_000 },
+			},
+			abortController.signal,
+			streamFromFaux(faux),
+		);
+		setTimeout(() => abortController.abort(), 1);
+		for await (const event of stream) events.push(event);
+
+		expect(events.some((event) => event.type === "agent_termination")).toBe(false);
+		const turnEnd = events.find((event) => event.type === "turn_end");
+		expect(
+			turnEnd?.type === "turn_end" && turnEnd.message.role === "assistant" ? turnEnd.message.stopReason : "",
+		).toBe("aborted");
+	});
+
+	it("detects equivalent repeated tool calls using canonical argument order and stable results", async () => {
+		const executed: string[] = [];
+		const schema = Type.Object({
+			value: Type.String(),
+			options: Type.Object({ first: Type.Number(), second: Type.Number() }),
+		});
+		const tool: AgentTool<typeof schema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: schema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+		const faux = fauxProvider();
+		faux.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("echo", { value: "same", options: { first: 1, second: 2 } }, { id: "call-1" }),
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage(
+				fauxToolCall("echo", { options: { second: 2, first: 1 }, value: "same" }, { id: "call-2" }),
+				{ stopReason: "toolUse" },
+			),
+		]);
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: "", messages: [], tools: [tool] },
+			{
+				model: faux.getModel(),
+				convertToLlm: identityConverter,
+				loopDetection: { maxConsecutiveToolCalls: 2 },
+			},
+			undefined,
+			streamFromFaux(faux),
+		);
+		for await (const event of stream) events.push(event);
+
+		expect(executed).toEqual(["same", "same"]);
+		expect(events.find((event) => event.type === "agent_termination")).toMatchObject({
+			termination: {
+				status: "loop_detected",
+				reason: "repeated_tool_call",
+				toolName: "echo",
+				repetitions: 2,
+				threshold: 2,
+			},
+			usage: { modelCalls: 2, toolCalls: 2 },
+		});
+	});
+
+	it("can stop an args-only loop before a repeated call in the same parallel batch", async () => {
+		const executed: string[] = [];
+		const faux = fauxProvider();
+		faux.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("echo", { value: "same" }, { id: "call-1" }),
+					fauxToolCall("echo", { value: "same" }, { id: "call-2" }),
+				],
+				{ stopReason: "toolUse" },
+			),
+		]);
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: "", messages: [], tools: [createEchoTool(executed)] },
+			{
+				model: faux.getModel(),
+				convertToLlm: identityConverter,
+				toolExecution: "parallel",
+				loopDetection: { maxConsecutiveToolCalls: 2, includeToolResult: false },
+			},
+			undefined,
+			streamFromFaux(faux),
+		);
+		for await (const event of stream) events.push(event);
+
+		expect(executed).toEqual(["same"]);
+		expect(events.find((event) => event.type === "agent_termination")).toMatchObject({
+			termination: { status: "loop_detected", repetitions: 2, threshold: 2 },
+			usage: { toolCalls: 1 },
+		});
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnds.map((event) => [event.toolCallId, event.isError])).toEqual([
+			["call-1", false],
+			["call-2", true],
+		]);
+	});
+
+	it("does not flag repeated read-like calls while their finalized results keep changing", async () => {
+		let execution = 0;
+		const tool: AgentTool<typeof echoToolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Returns changing evidence",
+			parameters: echoToolSchema,
+			async execute() {
+				execution++;
+				return {
+					content: [{ type: "text", text: `result-${execution}` }],
+					details: { value: `result-${execution}` },
+				};
+			},
+		};
+		const faux = fauxProvider();
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("echo", { value: "same" }, { id: "call-1" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage(fauxToolCall("echo", { value: "same" }, { id: "call-2" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage(fauxToolCall("echo", { value: "same" }, { id: "call-3" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("done"),
+		]);
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: "", messages: [], tools: [tool] },
+			{
+				model: faux.getModel(),
+				convertToLlm: identityConverter,
+				loopDetection: { maxConsecutiveToolCalls: 3 },
+			},
+			undefined,
+			streamFromFaux(faux),
+		);
+		for await (const event of stream) events.push(event);
+
+		expect(execution).toBe(3);
+		expect(faux.state.callCount).toBe(4);
+		expect(events.some((event) => event.type === "agent_termination")).toBe(false);
+	});
+
+	it("resets repeated-tool history when steering injects new user evidence", async () => {
+		const executed: string[] = [];
+		const faux = fauxProvider();
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("echo", { value: "same" }, { id: "call-1" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage(fauxToolCall("echo", { value: "same" }, { id: "call-2" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("done"),
+		]);
+		let steeringDelivered = false;
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: "", messages: [], tools: [createEchoTool(executed)] },
+			{
+				model: faux.getModel(),
+				convertToLlm: identityConverter,
+				loopDetection: { maxConsecutiveToolCalls: 2 },
+				getSteeringMessages: async () => {
+					if (executed.length === 1 && !steeringDelivered) {
+						steeringDelivered = true;
+						return [createUserMessage("try again with new evidence")];
+					}
+					return [];
+				},
+			},
+			undefined,
+			streamFromFaux(faux),
+		);
+		for await (const event of stream) events.push(event);
+
+		expect(executed).toEqual(["same", "same"]);
+		expect(faux.state.callCount).toBe(3);
+		expect(events.some((event) => event.type === "agent_termination")).toBe(false);
 	});
 });
 

@@ -15,6 +15,7 @@ import type {
 	ResponseToolSearchOutputItemParam,
 } from "openai/resources/responses/responses.js";
 import { calculateCost } from "../models.ts";
+import { compileToolSchemas } from "../tool-schema.ts";
 import type {
 	Api,
 	AssistantMessage,
@@ -305,12 +306,12 @@ export function convertResponsesMessages<TApi extends Api>(
 
 export function convertResponsesTools(tools: readonly Tool[], options?: ConvertResponsesToolsOptions): OpenAITool[] {
 	const strict = options?.strict === undefined ? false : options.strict;
-	return tools.map(
+	return compileToolSchemas(tools).tools.map(
 		(tool): OpenAIFunctionTool => ({
 			type: "function",
 			name: tool.name,
 			description: tool.description,
-			parameters: tool.parameters as Record<string, unknown>, // TypeBox already generates JSON Schema
+			parameters: tool.provider.schema,
 			strict,
 			...(options?.deferLoading ? { defer_loading: true } : {}),
 		}),

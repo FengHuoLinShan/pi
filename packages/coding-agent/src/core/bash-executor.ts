@@ -24,6 +24,8 @@ export interface BashExecutorOptions {
 	onChunk?: (chunk: string) => void;
 	/** AbortSignal for cancellation */
 	signal?: AbortSignal;
+	/** Explicit environment for delegated execution. */
+	env?: NodeJS.ProcessEnv;
 }
 
 export interface BashResult {
@@ -108,6 +110,7 @@ export async function executeBashWithOperations(
 		const result = await operations.exec(command, cwd, {
 			onData,
 			signal: options?.signal,
+			env: options?.env,
 		});
 
 		const fullOutput = outputChunks.join("");

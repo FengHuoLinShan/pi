@@ -1,5 +1,26 @@
-import type { ImageContent, Model, Models, SimpleStreamOptions, TextContent, Transport } from "@earendil-works/pi-ai";
-import type { AgentEvent, AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../index.ts";
+import type {
+	ImageContent,
+	Message,
+	Model,
+	Models,
+	ModelsSimpleStreamOptions,
+	SimpleStreamOptions,
+	TextContent,
+	Transport,
+} from "@earendil-works/pi-ai";
+import type {
+	AgentEvent,
+	AgentLoopDetection,
+	AgentMessage,
+	AgentRunBudget,
+	AgentTool,
+	QueueMode,
+	StreamFn,
+	ThinkingLevel,
+} from "../index.ts";
+import type { ToolPolicyAdapter } from "../tool-policy.ts";
+import type { AgentHarnessHooks, HookEvent } from "./hooks.ts";
+import type { SessionRuntimeEventStore } from "./runtime-events/event-store.ts";
 import type { Session } from "./session/session.ts";
 
 /** Result of a fallible operation. Expected failures are returned as `ok: false` instead of thrown. */
@@ -79,20 +100,32 @@ export interface AgentHarnessResources<
 
 /** Curated provider request options owned by the harness and snapshotted per turn. */
 export interface AgentHarnessStreamOptions {
+	/** Sampling temperature forwarded to the provider. */
+	temperature?: SimpleStreamOptions["temperature"];
+	/** Provider output token limit. */
+	maxTokens?: SimpleStreamOptions["maxTokens"];
 	/** Preferred transport forwarded to the stream function. */
 	transport?: Transport;
 	/** Provider request timeout in milliseconds. */
 	timeoutMs?: number;
 	/** Maximum provider retry attempts. */
 	maxRetries?: number;
+	/** WebSocket connection timeout in milliseconds. */
+	websocketConnectTimeoutMs?: SimpleStreamOptions["websocketConnectTimeoutMs"];
 	/** Optional cap for provider-requested retry delays. */
 	maxRetryDelayMs?: number;
 	/** Additional request headers merged with auth and lifecycle headers. */
 	headers?: Record<string, string>;
 	/** Provider metadata forwarded with requests. */
 	metadata?: SimpleStreamOptions["metadata"];
+	/** Provider-scoped environment forwarded with the request. */
+	env?: SimpleStreamOptions["env"];
 	/** Provider cache retention hint. */
 	cacheRetention?: SimpleStreamOptions["cacheRetention"];
+	/** Provider-specific reasoning token budgets. */
+	thinkingBudgets?: SimpleStreamOptions["thinkingBudgets"];
+	/** Final transform over fully assembled authentication and request headers. */
+	transformHeaders?: ModelsSimpleStreamOptions["transformHeaders"];
 }
 
 /** Per-request stream option patch returned by provider hooks. */
@@ -499,25 +532,25 @@ export type PendingSessionWrite = SessionTreeEntry extends infer TEntry
 		: never
 	: never;
 
-export interface QueueUpdateEvent {
+export interface QueueUpdateEvent extends HookEvent<"queue_update"> {
 	type: "queue_update";
 	steer: AgentMessage[];
 	followUp: AgentMessage[];
 	nextTurn: AgentMessage[];
 }
 
-export interface SavePointEvent {
+export interface SavePointEvent extends HookEvent<"save_point"> {
 	type: "save_point";
 	hadPendingMutations: boolean;
 }
 
-export interface AbortEvent {
+export interface AbortEvent extends HookEvent<"abort"> {
 	type: "abort";
 	clearedSteer: AgentMessage[];
 	clearedFollowUp: AgentMessage[];
 }
 
-export interface SettledEvent {
+export interface SettledEvent extends HookEvent<"settled"> {
 	type: "settled";
 	nextTurnCount: number;
 }
@@ -525,7 +558,7 @@ export interface SettledEvent {
 export interface BeforeAgentStartEvent<
 	TSkill extends Skill = Skill,
 	TPromptTemplate extends PromptTemplate = PromptTemplate,
-> {
+> extends HookEvent<"before_agent_start", BeforeAgentStartResult> {
 	type: "before_agent_start";
 	prompt: string;
 	images?: ImageContent[];
@@ -533,38 +566,44 @@ export interface BeforeAgentStartEvent<
 	resources: AgentHarnessResources<TSkill, TPromptTemplate>;
 }
 
-export interface ContextEvent {
+export interface ContextEvent extends HookEvent<"context", ContextResult> {
 	type: "context";
 	messages: AgentMessage[];
 }
 
-export interface BeforeProviderRequestEvent {
+/** Final interception point before a loop-produced message enters canonical session storage. */
+export interface BeforeMessagePersistEvent extends HookEvent<"before_message_persist", BeforeMessagePersistResult> {
+	type: "before_message_persist";
+	message: AgentMessage;
+}
+
+export interface BeforeProviderRequestEvent extends HookEvent<"before_provider_request", BeforeProviderRequestResult> {
 	type: "before_provider_request";
 	model: Model<any>;
 	sessionId: string;
 	streamOptions: AgentHarnessStreamOptions;
 }
 
-export interface BeforeProviderPayloadEvent {
+export interface BeforeProviderPayloadEvent extends HookEvent<"before_provider_payload", BeforeProviderPayloadResult> {
 	type: "before_provider_payload";
 	model: Model<any>;
 	payload: unknown;
 }
 
-export interface AfterProviderResponseEvent {
+export interface AfterProviderResponseEvent extends HookEvent<"after_provider_response"> {
 	type: "after_provider_response";
 	status: number;
 	headers: Record<string, string>;
 }
 
-export interface ToolCallEvent {
+export interface ToolCallEvent extends HookEvent<"tool_call", ToolCallResult> {
 	type: "tool_call";
 	toolCallId: string;
 	toolName: string;
 	input: Record<string, unknown>;
 }
 
-export interface ToolResultEvent {
+export interface ToolResultEvent extends HookEvent<"tool_result", ToolResultPatch> {
 	type: "tool_result";
 	toolCallId: string;
 	toolName: string;
@@ -574,7 +613,7 @@ export interface ToolResultEvent {
 	isError: boolean;
 }
 
-export interface SessionBeforeCompactEvent {
+export interface SessionBeforeCompactEvent extends HookEvent<"session_before_compact", SessionBeforeCompactResult> {
 	type: "session_before_compact";
 	preparation: CompactionPreparation;
 	branchEntries: SessionTreeEntry[];
@@ -582,19 +621,19 @@ export interface SessionBeforeCompactEvent {
 	signal: AbortSignal;
 }
 
-export interface SessionCompactEvent {
+export interface SessionCompactEvent extends HookEvent<"session_compact"> {
 	type: "session_compact";
 	compactionEntry: CompactionEntry;
 	fromHook: boolean;
 }
 
-export interface SessionBeforeTreeEvent {
+export interface SessionBeforeTreeEvent extends HookEvent<"session_before_tree", SessionBeforeTreeResult> {
 	type: "session_before_tree";
 	preparation: TreePreparation;
 	signal: AbortSignal;
 }
 
-export interface SessionTreeEvent {
+export interface SessionTreeEvent extends HookEvent<"session_tree"> {
 	type: "session_tree";
 	newLeafId: string | null;
 	oldLeafId: string | null;
@@ -602,20 +641,20 @@ export interface SessionTreeEvent {
 	fromHook?: boolean;
 }
 
-export interface ModelUpdateEvent {
+export interface ModelUpdateEvent extends HookEvent<"model_update"> {
 	type: "model_update";
 	model: Model<any>;
 	previousModel: Model<any> | undefined;
 	source: "set" | "restore";
 }
 
-export interface ThinkingLevelUpdateEvent {
+export interface ThinkingLevelUpdateEvent extends HookEvent<"thinking_level_update"> {
 	type: "thinking_level_update";
 	level: ThinkingLevel;
 	previousLevel: ThinkingLevel;
 }
 
-export interface ToolsUpdateEvent {
+export interface ToolsUpdateEvent extends HookEvent<"tools_update"> {
 	type: "tools_update";
 	toolNames: string[];
 	previousToolNames: string[];
@@ -627,7 +666,7 @@ export interface ToolsUpdateEvent {
 export interface ResourcesUpdateEvent<
 	TSkill extends Skill = Skill,
 	TPromptTemplate extends PromptTemplate = PromptTemplate,
-> {
+> extends HookEvent<"resources_update"> {
 	type: "resources_update";
 	resources: AgentHarnessResources<TSkill, TPromptTemplate>;
 	previousResources: AgentHarnessResources<TSkill, TPromptTemplate>;
@@ -643,6 +682,7 @@ export type AgentHarnessOwnEvent<
 	| SettledEvent
 	| BeforeAgentStartEvent<TSkill, TPromptTemplate>
 	| ContextEvent
+	| BeforeMessagePersistEvent
 	| BeforeProviderRequestEvent
 	| BeforeProviderPayloadEvent
 	| AfterProviderResponseEvent
@@ -668,6 +708,10 @@ export interface BeforeAgentStartResult {
 
 export interface ContextResult {
 	messages: AgentMessage[];
+}
+
+export interface BeforeMessagePersistResult {
+	message: AgentMessage;
 }
 
 export interface BeforeProviderRequestResult {
@@ -702,28 +746,6 @@ export interface SessionBeforeTreeResult {
 	replaceInstructions?: boolean;
 	label?: string;
 }
-
-export type AgentHarnessEventResultMap = {
-	before_agent_start: BeforeAgentStartResult | undefined;
-	context: ContextResult | undefined;
-	before_provider_request: BeforeProviderRequestResult | undefined;
-	before_provider_payload: BeforeProviderPayloadResult | undefined;
-	after_provider_response: undefined;
-	tool_call: ToolCallResult | undefined;
-	tool_result: ToolResultPatch | undefined;
-	session_before_compact: SessionBeforeCompactResult | undefined;
-	session_compact: undefined;
-	session_before_tree: SessionBeforeTreeResult | undefined;
-	session_tree: undefined;
-	model_update: undefined;
-	thinking_level_update: undefined;
-	resources_update: undefined;
-	tools_update: undefined;
-	queue_update: undefined;
-	save_point: undefined;
-	abort: undefined;
-	settled: undefined;
-};
 
 export interface AgentHarnessPromptOptions {
 	images?: ImageContent[];
@@ -804,6 +826,15 @@ export interface AgentHarnessOptions<
 > {
 	env: ExecutionEnv;
 	session: Session;
+	/** Optional canonical runtime journal. Use `restoreAgentHarness()` to open and recover one automatically. */
+	runtimeEvents?: SessionRuntimeEventStore;
+	/** Optional hook host. Defaults to an ordered, fail-fast implementation. */
+	hooks?: AgentHarnessHooks<AgentHarnessEvent<TSkill, TPromptTemplate>, AgentHarnessHookContext>;
+	/**
+	 * Optional fail-closed tool authorization adapter. Tool-call hooks may further
+	 * restrict or transform calls, but cannot override a policy denial.
+	 */
+	toolPolicy?: ToolPolicyAdapter;
 	/**
 	 * Provider collection used for all model requests (turn streaming,
 	 * compaction, branch summarization). Auth resolves through the providers'
@@ -828,11 +859,32 @@ export interface AgentHarnessOptions<
 		  }) => string | Promise<string>);
 	/** Curated stream/provider request options. Snapshotted at turn start. */
 	streamOptions?: AgentHarnessStreamOptions;
+	/**
+	 * Optional turn-stream override for proxy hosts and compatibility facades.
+	 * Model lookup, recovery, compaction, and branch summaries still use `models`.
+	 */
+	streamFn?: StreamFn;
+	/** Application message projection. Defaults to the harness generic converter. */
+	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+	/** Optional hard limits for each user-initiated harness run. */
+	runBudget?: AgentRunBudget;
+	/** Optional repeated-tool-call detection for each user-initiated harness run. */
+	loopDetection?: AgentLoopDetection;
 	model: Model<any>;
 	thinkingLevel?: ThinkingLevel;
 	activeToolNames?: string[];
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
+}
+
+/** Stable facade passed to harness hook handlers. Dynamic state is exposed through methods. */
+export interface AgentHarnessHookContext {
+	readonly env: ExecutionEnv;
+	getSession(): Session;
+	getPhase(): AgentHarnessPhase;
+	isIdle(): boolean;
+	appendMessage(message: AgentMessage): Promise<void>;
+	getPendingWrites(): readonly PendingSessionWrite[];
 }
 
 export type { AgentHarness } from "./agent-harness.ts";

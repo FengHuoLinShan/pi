@@ -1,5 +1,8 @@
 // Core session management
 
+// Stable app/daemon protocol
+export * from "./app-protocol/index.ts";
+
 export { type Args, parseArgs } from "./cli/args.ts";
 
 // Config paths
@@ -23,7 +26,9 @@ export {
 	parseSkillBlock,
 	type SessionStats,
 } from "./core/agent-session.ts";
+export * from "./core/artifact-store.ts";
 export { readStoredCredential } from "./core/auth-storage.ts";
+export { CodingAgentHarnessRuntime } from "./core/coding-agent-harness-runtime.ts";
 // Compaction
 export {
 	type BranchPreparation,
@@ -48,6 +53,24 @@ export {
 	shouldCompact,
 } from "./core/compaction/index.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
+export {
+	type BoundaryAttestation,
+	type BoundaryEnforcementCapabilities,
+	type BoundaryIsolationKind,
+	type BoundaryNetworkMode,
+	type BoundaryProcessMode,
+	type BoundaryProfile,
+	type BoundaryToolOperations,
+	type BoundaryWorkspaceAccess,
+	type BoundaryWorkspaceMount,
+	createBoundaryProfileDigest,
+	type ExecutionBoundary,
+	type ExecutionBoundaryBackend,
+	ExecutionBoundaryError,
+	filterBoundaryEnvironment,
+	type ResolvedExecutionBoundary,
+	resolveExecutionBoundary,
+} from "./core/execution-boundary.ts";
 // Extension system
 export type {
 	AgentEndEvent,
@@ -182,6 +205,7 @@ export type {
 	ResolvedResource,
 } from "./core/package-manager.ts";
 export { DefaultPackageManager } from "./core/package-manager.ts";
+export * from "./core/process-session.ts";
 export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.ts";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
 // SDK for programmatic usage
@@ -200,6 +224,7 @@ export {
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
+	createAllTools,
 	createBashTool,
 	// Tool factories (for custom cwd)
 	createCodingTools,
@@ -209,6 +234,8 @@ export {
 	createLsTool,
 	createReadOnlyTools,
 	createReadTool,
+	createTool,
+	createToolDefinition,
 	createWriteTool,
 	type PromptTemplate,
 } from "./core/sdk.ts";
@@ -261,12 +288,14 @@ export { createSyntheticSourceInfo } from "./core/source-info.ts";
 export { type EditDiffResult, generateDiffString, generateUnifiedPatch } from "./core/tools/edit-diff.ts";
 // Tools
 export {
+	atomicWriteFile,
 	type BashOperations,
 	type BashSpawnContext,
 	type BashSpawnHook,
 	type BashToolDetails,
 	type BashToolInput,
 	type BashToolOptions,
+	computeFileRevision,
 	createBashToolDefinition,
 	createEditToolDefinition,
 	createFindToolDefinition,
@@ -281,6 +310,10 @@ export {
 	type EditToolDetails,
 	type EditToolInput,
 	type EditToolOptions,
+	type FilePathOperations,
+	type FilePathPolicy,
+	type FileRevision,
+	type FileRevisionState,
 	type FindOperations,
 	type FindToolDetails,
 	type FindToolInput,
@@ -305,6 +338,7 @@ export {
 	truncateLine,
 	truncateTail,
 	type WriteOperations,
+	type WriteToolDetails,
 	type WriteToolInput,
 	type WriteToolOptions,
 	withFileMutationQueue,

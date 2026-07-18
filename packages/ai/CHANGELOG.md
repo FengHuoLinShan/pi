@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added provider/model capability profiles and canonical tool-schema compilation with stable hashes, provider views, loss diagnostics, and observable deferred-tool placement.
+
 ### Fixed
 
 - Fixed GitHub Copilot long-context pricing tiers in generated model metadata ([#6668](https://github.com/earendil-works/pi/issues/6668)).

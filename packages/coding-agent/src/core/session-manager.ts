@@ -66,6 +66,17 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	modelId: string;
 }
 
+export interface ActiveToolsChangeEntry extends SessionEntryBase {
+	type: "active_tools_change";
+	activeToolNames: string[];
+}
+
+/** Durable leaf cursor update. The entry is an audit record, not the new branch parent. */
+export interface LeafEntry extends SessionEntryBase {
+	type: "leaf";
+	targetId: string | null;
+}
+
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	type: "compaction";
 	summary: string;
@@ -141,12 +152,14 @@ export type SessionEntry =
 	| SessionMessageEntry
 	| ThinkingLevelChangeEntry
 	| ModelChangeEntry
+	| ActiveToolsChangeEntry
 	| CompactionEntry
 	| BranchSummaryEntry
 	| CustomEntry
 	| CustomMessageEntry
 	| LabelEntry
-	| SessionInfoEntry;
+	| SessionInfoEntry
+	| LeafEntry;
 
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
@@ -894,7 +907,7 @@ export class SessionManager {
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
-			this.leafId = entry.id;
+			this.leafId = entry.type === "leaf" ? entry.targetId : entry.id;
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.labelsById.set(entry.targetId, entry.label);
@@ -975,8 +988,30 @@ export class SessionManager {
 	private _appendEntry(entry: SessionEntry): void {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
-		this.leafId = entry.id;
+		this.leafId = entry.type === "leaf" ? entry.targetId : entry.id;
+		if (entry.type === "label") {
+			if (entry.label) {
+				this.labelsById.set(entry.targetId, entry.label);
+				this.labelTimestampsById.set(entry.targetId, entry.timestamp);
+			} else {
+				this.labelsById.delete(entry.targetId);
+				this.labelTimestampsById.delete(entry.targetId);
+			}
+		}
 		this._persist(entry);
+	}
+
+	/** Append a fully formed entry while preserving its id and parent. Used by durable runtime adapters. */
+	appendEntry(entry: SessionEntry): void {
+		if (this.byId.has(entry.id)) throw new Error(`Entry ${entry.id} already exists`);
+		if (entry.type === "leaf") {
+			if (entry.targetId !== null && !this.byId.has(entry.targetId)) {
+				throw new Error(`Entry ${entry.targetId} not found`);
+			}
+		} else if (entry.parentId !== null && !this.byId.has(entry.parentId)) {
+			throw new Error(`Parent entry ${entry.parentId} not found`);
+		}
+		this._appendEntry(entry);
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1019,6 +1054,33 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			provider,
 			modelId,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append a branch-scoped active tool selection. */
+	appendActiveToolsChange(activeToolNames: string[]): string {
+		const entry: ActiveToolsChangeEntry = {
+			type: "active_tools_change",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			activeToolNames: [...activeToolNames],
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Persist a leaf cursor change without making the audit entry the branch parent. */
+	appendLeafChange(targetId: string | null): string {
+		if (targetId !== null && !this.byId.has(targetId)) throw new Error(`Entry ${targetId} not found`);
+		const entry: LeafEntry = {
+			type: "leaf",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			targetId,
 		};
 		this._appendEntry(entry);
 		return entry.id;

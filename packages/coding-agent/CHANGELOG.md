@@ -6,9 +6,15 @@
 
 - Added built-in llama.cpp router support with `/login` connection setup and `/llama` Hugging Face model search and downloads, explicit loading, unloading, and live progress. See [llama.cpp](docs/llama-cpp.md).
 - Added extension registration for complete pi-ai providers, including native authentication, model refresh, filtering, and streaming behavior.
+- Added SHA-256 revision preconditions and mutation evidence, opt-in canonical allowed-root enforcement, and atomic local commits for the built-in `read`, `edit`, and `write` tools.
+- Added an attested SDK execution-boundary contract for routing built-in tools and session bash through external OS, container, VM, or remote-sandbox backends, with fail-closed workspace, process, network, and environment policy validation.
+- Added local content-addressed artifact storage and recoverable process-session lifecycle primitives with artifact-backed output and execution-boundary binding.
+- Added a transport-independent, negotiated app protocol with strict JSON-RPC validation, typed Thread/Turn/Item events, reverse approval/input requests, and bounded cursor replay.
+- Changed SDK-created coding sessions with a selected model to run through the durable AgentHarness runtime while preserving the public `Agent` facade and extension lifecycle, with direct run-budget, loop-detection, and tool-policy configuration.
 
 ### Fixed
 
+- Fixed source-checkout extension loading to resolve workspace package source entrypoints when build artifacts are absent.
 - Fixed prompt-template defaults for all arguments (`${@:-default}` and `${ARGUMENTS:-default}`) ([#6695](https://github.com/earendil-works/pi/issues/6695)).
 - Fixed obsolete custom UI, custom tool, and custom editor examples in the extension documentation ([#6735](https://github.com/earendil-works/pi/issues/6735)).
 - Fixed Kimi Coding sessions to show API-equivalent implied costs with the subscription indicator.

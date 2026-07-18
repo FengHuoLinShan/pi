@@ -57,19 +57,20 @@ Harness can validate stable IDs/versions/hashes when available, but it cannot se
 
 Constructor options remain explicit runtime configuration and do not read session state. Hidden async restore in a constructor would make failure handling ambiguous.
 
-A future async builder/factory should own durable restore:
+The async `restoreAgentHarness()` factory owns durable restore:
 
 ```ts
-const harness = await AgentHarness.builder()
-  .env(env)
-  .session(session)
-  .model(defaultModel)
-  .tools(runtimeTools)
-  .defaultActiveTools(["read", "edit"])
-  .restore({ missingActiveTools: "fail" });
+const { harness, recovery } = await restoreAgentHarness({
+  env,
+  session,
+  models,
+  model: defaultModel,
+  tools: runtimeTools,
+  activeToolNames: ["read", "edit"],
+});
 ```
 
-`restore()` should read the active branch, reduce durable harness configuration, apply defaults for missing entries, validate against app-supplied runtime dependencies, construct the harness, and optionally emit `source: "restore"` update events after construction.
+The factory opens or accepts the runtime journal, conservatively marks interrupted work, constructs the harness, applies unapplied writes, restores branch-selected configuration and queues, validates app-supplied runtime dependencies, and emits `source: "restore"` updates where state changes.
 
 For active tools:
 
@@ -151,6 +152,32 @@ recovery: "mark_interrupted" | "retry_unfinished"
 
 `retry_unfinished` must be guarded around non-idempotent tool calls.
 
+## Implemented runtime-event foundation
+
+`SessionRuntimeEventStore` persists versioned `RuntimeEventEnvelope` values as `pi.runtime_event` custom entries in the active session branch. It does not create a sidecar log. The session remains the single durable source of truth.
+
+The implemented event bodies cover:
+
+- queued messages, consumed atomically by `turn_started`
+- pending-write enqueue/apply state with deterministic target entry ids
+- operation and turn start/finish/interruption
+- provider-request and tool-call start/finish/interruption
+- recovery markers and checkpoints
+
+`reduceRuntimeEvent()` is a pure reducer. It requires contiguous branch-local sequences and valid causal transitions. `replayRuntimeEvents()` validates the envelope stream and resumes from the latest checkpoint. `SessionRuntimeEventStore.open()` reduces the current session branch explicitly; constructors do not perform hidden asynchronous restore.
+
+Runtime envelopes are session-scoped. A session fork retains source entries so the tree parent chain stays intact, but the fork ignores inherited source-session runtime envelopes and begins its own sequence at 1.
+
+`SessionRuntimeEventStore.recover()` implements the conservative policy:
+
+- active provider requests, tool calls, turns, and operations are marked interrupted in dependency order
+- queued messages and unapplied pending writes are returned to the host unchanged
+- retry-safe tool calls are reported as eligible for an explicit host decision, but are never retried automatically
+
+JSONL session open also repairs a malformed final line only when the line is unterminated, which identifies an interrupted append. Malformed complete lines and malformed middle lines remain hard errors. Callers can opt back into strict final-line handling with `repairPartialTail: false`.
+
+`AgentHarness` writes these lifecycle events for operations, turns, provider requests, tool calls, queues, and pending session writes. The store and reducer intentionally do not serialize tool implementations, provider clients, hooks, or other host-owned runtime dependencies.
+
 ## Critical scenarios
 
 ### Queues
@@ -191,16 +218,14 @@ recovery: "mark_interrupted" | "retry_unfinished"
 - Crash after summary entry before leaf entry: append missing leaf entry.
 - Crash after leaf entry: operation is complete; append finish marker if missing.
 
-## Minimum viable spike
+## Implemented minimum recovery contract
 
-1. Add durable queue entries.
-2. Add durable pending write entries with deterministic target IDs.
-3. Add operation start/finish/interrupted entries.
-4. Add turn start with consumed queue IDs.
-5. Recover by reducing the session log.
-6. Mark unfinished agent turns interrupted by default.
-7. Rerun unfinished compaction/tree operations only when no final entry exists.
-8. Do not retry unfinished tool calls unless tool metadata says retry-safe.
+1. Queue acceptance is durable and queue consumption is tied atomically to a turn-start event.
+2. Pending writes use deterministic target IDs and are reconciled idempotently.
+3. Operations, turns, provider requests, and tool calls have explicit terminal or interrupted state.
+4. Restore reduces the session journal and marks unfinished work interrupted by default.
+5. Unfinished tool calls are never retried automatically; retry-safe metadata only makes them eligible for an explicit host decision.
+6. Provider streams resume only from durable boundaries.
 
 ## Open questions
 
@@ -209,4 +234,3 @@ recovery: "mark_interrupted" | "retry_unfinished"
 - Do we require strict dependency ID/version matching on resume?
 - How much provider request data should be journaled?
 - Should recovery append user-visible assistant interruption messages or only internal operation entries?
-- Should storage support truncating a final partial JSONL line during recovery?

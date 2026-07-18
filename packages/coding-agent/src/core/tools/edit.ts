@@ -1,7 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { constants } from "fs";
-import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
+import { access as fsAccess, readFile as fsReadFile, realpath as fsRealpath } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { renderDiff } from "../../modes/interactive/components/diff.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
@@ -20,6 +20,16 @@ import {
 	stripBom,
 } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
+import {
+	assertExpectedRevision,
+	atomicWriteFile,
+	captureFilePathSnapshot,
+	computeFileRevision,
+	type FilePathOperations,
+	type FilePathPolicy,
+	type FileRevision,
+	revalidateFilePathSnapshot,
+} from "./file-transaction.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { renderToolPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -48,6 +58,12 @@ const editSchema = Type.Object(
 			description:
 				"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
 		}),
+		expectedRevision: Type.Optional(
+			Type.String({
+				description:
+					'SHA-256 revision returned by read/edit/write. Use "missing" only when the target must not exist.',
+			}),
+		),
 	},
 	{},
 );
@@ -63,6 +79,10 @@ export interface EditToolDetails {
 	diff: string;
 	/** Standard unified patch of the changes made */
 	patch: string;
+	/** Revision that was read and edited. */
+	beforeRevision: FileRevision;
+	/** Revision verified after the atomic commit. */
+	afterRevision: FileRevision;
 	/** Line number of the first change in the new file (for editor navigation) */
 	firstChangedLine?: number;
 }
@@ -71,7 +91,7 @@ export interface EditToolDetails {
  * Pluggable operations for the edit tool.
  * Override these to delegate file editing to remote systems (for example SSH).
  */
-export interface EditOperations {
+export interface EditOperations extends FilePathOperations {
 	/** Read file contents as a Buffer */
 	readFile: (absolutePath: string) => Promise<Buffer>;
 	/** Write content to a file */
@@ -82,11 +102,12 @@ export interface EditOperations {
 
 const defaultEditOperations: EditOperations = {
 	readFile: (path) => fsReadFile(path),
-	writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
+	writeFile: atomicWriteFile,
 	access: (path) => fsAccess(path, constants.R_OK | constants.W_OK),
+	realpath: (path) => fsRealpath(path),
 };
 
-export interface EditToolOptions {
+export interface EditToolOptions extends FilePathPolicy {
 	/** Custom operations for file editing. Default: local filesystem */
 	operations?: EditOperations;
 }
@@ -117,11 +138,11 @@ function prepareEditArguments(input: unknown): EditToolInput {
 	return { ...rest, edits } as EditToolInput;
 }
 
-function validateEditInput(input: EditToolInput): { path: string; edits: Edit[] } {
+function validateEditInput(input: EditToolInput): { path: string; edits: Edit[]; expectedRevision?: string } {
 	if (!Array.isArray(input.edits) || input.edits.length === 0) {
 		throw new Error("Edit tool input is invalid. edits must contain at least one replacement.");
 	}
-	return { path: input.path, edits: input.edits };
+	return { path: input.path, edits: input.edits, expectedRevision: input.expectedRevision };
 }
 
 type RenderableEditArgs = {
@@ -289,6 +310,7 @@ export function createEditToolDefinition(
 	options?: EditToolOptions,
 ): ToolDefinition<typeof editSchema, EditToolDetails | undefined, EditRenderState> {
 	const ops = options?.operations ?? defaultEditOperations;
+	const allowedRoots = options?.allowedRoots?.map((root) => resolveToCwd(root, cwd));
 	return {
 		name: "edit",
 		label: "edit",
@@ -301,12 +323,13 @@ export function createEditToolDefinition(
 			"When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
 			"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
 			"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+			"When edit follows read, pass the revision from read as expectedRevision so external changes are detected.",
 		],
 		parameters: editSchema,
 		renderShell: "self",
 		prepareArguments: prepareEditArguments,
 		async execute(_toolCallId, input: EditToolInput, signal?: AbortSignal, _onUpdate?, _ctx?) {
-			const { path, edits } = validateEditInput(input);
+			const { path, edits, expectedRevision } = validateEditInput(input);
 			const absolutePath = resolveToCwd(path, cwd);
 
 			return withFileMutationQueue(absolutePath, async () => {
@@ -319,10 +342,12 @@ export function createEditToolDefinition(
 				};
 
 				throwIfAborted();
+				const pathSnapshot = await captureFilePathSnapshot(absolutePath, path, allowedRoots, ops.realpath, true);
+				throwIfAborted();
 
 				// Check if file exists.
 				try {
-					await ops.access(absolutePath);
+					await ops.access(pathSnapshot.targetPath);
 				} catch (error: unknown) {
 					throwIfAborted();
 					const errorMessage =
@@ -332,31 +357,51 @@ export function createEditToolDefinition(
 				throwIfAborted();
 
 				// Read the file.
-				const buffer = await ops.readFile(absolutePath);
+				const buffer = await ops.readFile(pathSnapshot.targetPath);
 				const rawContent = buffer.toString("utf-8");
+				const beforeRevision = computeFileRevision(buffer);
+				assertExpectedRevision(path, expectedRevision, beforeRevision);
 				throwIfAborted();
 
 				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
 				const { bom, text: content } = stripBom(rawContent);
 				const originalEnding = detectLineEnding(content);
 				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				const { newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
 				throwIfAborted();
 
 				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
-				await ops.writeFile(absolutePath, finalContent);
+				await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath);
+				const currentBuffer = await ops.readFile(pathSnapshot.targetPath);
+				assertExpectedRevision(path, beforeRevision, computeFileRevision(currentBuffer));
 				throwIfAborted();
+				await ops.writeFile(pathSnapshot.targetPath, finalContent);
+				throwIfAborted();
+				const verifiedBuffer = await ops.readFile(pathSnapshot.targetPath);
+				const afterRevision = computeFileRevision(verifiedBuffer);
+				const intendedRevision = computeFileRevision(finalContent);
+				if (afterRevision !== intendedRevision) {
+					throw new Error(
+						`Could not verify edit of ${path}: expected revision ${intendedRevision}, found ${afterRevision}.`,
+					);
+				}
 
-				const diffResult = generateDiffString(baseContent, newContent);
-				const patch = generateUnifiedPatch(path, baseContent, newContent);
+				const diffResult = generateDiffString(rawContent, finalContent);
+				const patch = generateUnifiedPatch(path, rawContent, finalContent);
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
+							text: `Successfully replaced ${edits.length} block(s) in ${path}. Revision: ${beforeRevision} -> ${afterRevision}.`,
 						},
 					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+					details: {
+						diff: diffResult.diff,
+						patch,
+						beforeRevision,
+						afterRevision,
+						firstChangedLine: diffResult.firstChangedLine,
+					},
 				};
 			});
 		},
@@ -377,7 +422,10 @@ export function createEditToolDefinition(
 			if (context.argsComplete && previewInput && !component.preview && !component.previewPending) {
 				component.previewPending = true;
 				const requestKey = argsKey;
-				void computeEditsDiff(previewInput.path, previewInput.edits, context.cwd).then((preview) => {
+				void computeEditsDiff(previewInput.path, previewInput.edits, context.cwd, {
+					operations: ops,
+					allowedRoots,
+				}).then((preview) => {
 					if (component.previewArgsKey === requestKey) {
 						setEditPreview(component, preview, requestKey);
 						context.invalidate();

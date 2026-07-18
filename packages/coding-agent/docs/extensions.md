@@ -2070,6 +2070,14 @@ pi.registerTool({
 
 **Operations interfaces:** `ReadOperations`, `WriteOperations`, `EditOperations`, `BashOperations`, `LsOperations`, `GrepOperations`, `FindOperations`
 
+The built-in `read`, `edit`, and `write` tools expose SHA-256 file revisions. `read` includes the revision in both its model-visible text and `details.revision`; `edit` and `write` accept an optional `expectedRevision` and return `beforeRevision`, `afterRevision`, diff, and unified patch evidence. Pass the revision from the latest read when an edit or rewrite must not overwrite external changes. For create-only writes, use `expectedRevision: "missing"`.
+
+Local `edit` and `write` commits use a same-directory staging file followed by atomic rename. A custom `writeFile` operation is the backend's commit boundary, so remote implementations should provide equivalent atomic behavior when they need the same guarantee. `WriteOperations.readFile` is optional for compatibility; providing it enables pre/post revision verification and complete patch evidence.
+
+All three file tools also accept `allowedRoots`. This policy is opt-in so the default local-agent behavior remains unchanged; an explicit empty array denies every path. When roots are configured, custom operations must implement `realpath()` in the backend path namespace. Pi canonicalizes roots and targets at execution time, rejects symlink escapes, and revalidates mutation targets before writing. This is a path guard, not an OS sandbox; use the isolation patterns in [Containerization](containerization.md) for a security boundary.
+
+For local custom tools, `atomicWriteFile()` and `computeFileRevision()` are exported alongside the tool factories.
+
 For `user_bash`, extensions can reuse pi's local shell backend via `createLocalBashOperations()` instead of reimplementing local process spawning, shell resolution, and process-tree termination.
 
 The bash tool also supports a spawn hook to adjust the command, cwd, or env before execution:

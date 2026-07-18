@@ -8,6 +8,7 @@ import type {
 	RefusalStopDetails,
 } from "@anthropic-ai/sdk/resources/messages.js";
 import { calculateCost } from "../models.ts";
+import { compileToolSchemas } from "../tool-schema.ts";
 import type {
 	AnthropicMessagesCompat,
 	Api,
@@ -1266,18 +1267,12 @@ function convertTools(
 ): Anthropic.Messages.Tool[] {
 	if (!tools) return [];
 
-	return tools.map((tool, index) => {
-		const schema = tool.parameters as { properties?: unknown; required?: string[] };
-
+	return compileToolSchemas(tools, { target: "anthropic-input-schema" }).tools.map((tool, index) => {
 		return {
 			name: isOAuthToken ? toClaudeCodeName(tool.name) : tool.name,
 			description: tool.description,
 			...(supportsEagerToolInputStreaming ? { eager_input_streaming: true } : {}),
-			input_schema: {
-				type: "object",
-				properties: schema.properties ?? {},
-				required: schema.required ?? [],
-			},
+			input_schema: tool.provider.schema as unknown as Anthropic.Messages.Tool.InputSchema,
 			...(deferLoading ? { defer_loading: true } : {}),
 			...(cacheControl && index === tools.length - 1 ? { cache_control: cacheControl } : {}),
 		};

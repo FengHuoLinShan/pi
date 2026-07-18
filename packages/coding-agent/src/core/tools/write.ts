@@ -1,12 +1,25 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Container, Text } from "@earendil-works/pi-tui";
-import { mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
+import { mkdir as fsMkdir, readFile as fsReadFile, realpath as fsRealpath } from "fs/promises";
 import { dirname } from "path";
 import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import { getLanguageFromPath, highlightCode, type Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import { generateDiffString, generateUnifiedPatch } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
+import {
+	assertExpectedRevision,
+	atomicWriteFile,
+	captureFilePathSnapshot,
+	computeFileRevision,
+	type FilePathOperations,
+	type FilePathPolicy,
+	type FileRevision,
+	type FileRevisionState,
+	readRevisionState,
+	revalidateFilePathSnapshot,
+} from "./file-transaction.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { normalizeDisplayText, renderToolPath, replaceTabs, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -14,27 +27,49 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 const writeSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to write (relative or absolute)" }),
 	content: Type.String({ description: "Content to write to the file" }),
+	expectedRevision: Type.Optional(
+		Type.String({
+			description: 'SHA-256 revision returned by read/edit/write. Use "missing" to require creation of a new file.',
+		}),
+	),
 });
 
 export type WriteToolInput = Static<typeof writeSchema>;
+
+export interface WriteToolDetails {
+	/** Revision before the write, or missing/unknown when the backend cannot provide one. */
+	beforeRevision: FileRevisionState;
+	/** Revision verified after the write. */
+	afterRevision: FileRevision;
+	/** Display-oriented diff when the previous content was available. */
+	diff?: string;
+	/** Standard unified patch when the previous content was available. */
+	patch?: string;
+	/** Line number of the first change in the new file. */
+	firstChangedLine?: number;
+}
 
 /**
  * Pluggable operations for the write tool.
  * Override these to delegate file writing to remote systems (for example SSH).
  */
-export interface WriteOperations {
+export interface WriteOperations extends FilePathOperations {
 	/** Write content to a file */
 	writeFile: (absolutePath: string, content: string) => Promise<void>;
 	/** Create directory recursively */
 	mkdir: (dir: string) => Promise<void>;
+	/** Read existing content for revision checks and mutation evidence. */
+	readFile?: (absolutePath: string) => Promise<Buffer>;
 }
 
 const defaultWriteOperations: WriteOperations = {
-	writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
+	writeFile: atomicWriteFile,
 	mkdir: (dir) => fsMkdir(dir, { recursive: true }).then(() => {}),
+	readFile: (path) => fsReadFile(path),
+	realpath: (path) => fsRealpath(path),
 };
 
-export interface WriteToolOptions {
+export interface WriteToolOptions extends FilePathPolicy {
 	/** Custom operations for file writing. Default: local filesystem */
 	operations?: WriteOperations;
 }
@@ -181,25 +216,28 @@ function formatWriteResult(
 export function createWriteToolDefinition(
 	cwd: string,
 	options?: WriteToolOptions,
-): ToolDefinition<typeof writeSchema, undefined> {
+): ToolDefinition<typeof writeSchema, WriteToolDetails> {
 	const ops = options?.operations ?? defaultWriteOperations;
+	const allowedRoots = options?.allowedRoots?.map((root) => resolveToCwd(root, cwd));
 	return {
 		name: "write",
 		label: "write",
 		description:
 			"Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
 		promptSnippet: "Create or overwrite files",
-		promptGuidelines: ["Use write only for new files or complete rewrites."],
+		promptGuidelines: [
+			"Use write only for new files or complete rewrites.",
+			"When write follows read, pass the revision from read as expectedRevision; use expectedRevision=missing when creating a file that must not already exist.",
+		],
 		parameters: writeSchema,
 		async execute(
 			_toolCallId,
-			{ path, content }: { path: string; content: string },
+			{ path, content, expectedRevision }: { path: string; content: string; expectedRevision?: string },
 			signal?: AbortSignal,
 			_onUpdate?,
 			_ctx?,
 		) {
 			const absolutePath = resolveToCwd(path, cwd);
-			const dir = dirname(absolutePath);
 			return withFileMutationQueue(absolutePath, async () => {
 				// Do not reject from an abort event listener here: that would release the
 				// mutation queue while an in-flight filesystem operation may still finish.
@@ -210,17 +248,53 @@ export function createWriteToolDefinition(
 				};
 
 				throwIfAborted();
+				const pathSnapshot = await captureFilePathSnapshot(absolutePath, path, allowedRoots, ops.realpath, true);
+				throwIfAborted();
 				// Create parent directories if needed.
-				await ops.mkdir(dir);
+				await ops.mkdir(dirname(pathSnapshot.targetPath));
+				await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath);
+				throwIfAborted();
+				const before = await readRevisionState(pathSnapshot.targetPath, ops.readFile);
+				assertExpectedRevision(path, expectedRevision, before.revision);
 				throwIfAborted();
 
 				// Write the file contents.
-				await ops.writeFile(absolutePath, content);
+				await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath);
+				const current = await readRevisionState(pathSnapshot.targetPath, ops.readFile);
+				if (before.revision !== "unknown") {
+					assertExpectedRevision(path, before.revision, current.revision);
+				}
+				throwIfAborted();
+				await ops.writeFile(pathSnapshot.targetPath, content);
 				throwIfAborted();
 
+				const intendedRevision = computeFileRevision(content);
+				const verified = await readRevisionState(pathSnapshot.targetPath, ops.readFile);
+				const afterRevision = verified.revision === "unknown" ? intendedRevision : verified.revision;
+				if (afterRevision !== intendedRevision) {
+					throw new Error(
+						`Could not verify write to ${path}: expected revision ${intendedRevision}, found ${afterRevision}.`,
+					);
+				}
+
+				const previousContent = before.revision === "missing" ? "" : before.content?.toString("utf8");
+				const diffResult = previousContent === undefined ? undefined : generateDiffString(previousContent, content);
+
 				return {
-					content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` }],
-					details: undefined,
+					content: [
+						{
+							type: "text",
+							text: `Successfully wrote ${Buffer.byteLength(content, "utf8")} bytes to ${path}. Revision: ${before.revision} -> ${afterRevision}.`,
+						},
+					],
+					details: {
+						beforeRevision: before.revision,
+						afterRevision,
+						diff: diffResult?.diff,
+						patch:
+							previousContent === undefined ? undefined : generateUnifiedPatch(path, previousContent, content),
+						firstChangedLine: diffResult?.firstChangedLine,
+					},
 				};
 			});
 		},

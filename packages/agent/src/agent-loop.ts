@@ -16,6 +16,9 @@ import type {
 	AgentEvent,
 	AgentLoopConfig,
 	AgentMessage,
+	AgentRunBudgetReason,
+	AgentRunTermination,
+	AgentRunUsage,
 	AgentTool,
 	AgentToolCall,
 	AgentToolResult,
@@ -149,6 +152,199 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
+type ToolLoopHistoryEntry = {
+	requestSignature: string;
+	resultSignature: string;
+};
+
+type RunControl = {
+	startedAt: number;
+	config: AgentLoopConfig;
+	usage: Omit<AgentRunUsage, "elapsedMs">;
+	toolLoopHistory: ToolLoopHistoryEntry[];
+	signal?: AbortSignal;
+	timingTermination?: AgentRunTermination;
+	dispose: () => void;
+};
+
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function createRunControl(config: AgentLoopConfig, signal: AbortSignal | undefined): RunControl {
+	const startedAt = Date.now();
+	const usage = { steps: 0, modelCalls: 0, toolCalls: 0, modelTokens: 0, cost: 0 };
+	const wallDeadline =
+		config.runBudget?.maxWallTimeMs === undefined ? undefined : startedAt + config.runBudget.maxWallTimeMs;
+	const absoluteDeadline = config.runBudget?.deadline;
+	const effectiveDeadline =
+		wallDeadline === undefined
+			? absoluteDeadline
+			: absoluteDeadline === undefined
+				? wallDeadline
+				: Math.min(wallDeadline, absoluteDeadline);
+	if (effectiveDeadline === undefined) {
+		return {
+			startedAt,
+			config,
+			usage,
+			toolLoopHistory: [],
+			signal,
+			dispose: () => {},
+		};
+	}
+
+	const controller = new AbortController();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let control: RunControl;
+	const abortFromCaller = () => controller.abort(signal?.reason);
+	if (signal?.aborted) {
+		abortFromCaller();
+	} else {
+		signal?.addEventListener("abort", abortFromCaller, { once: true });
+	}
+
+	const abortForTimeLimit = () => {
+		if (signal?.aborted || control.timingTermination) return;
+		const now = Date.now();
+		if (absoluteDeadline !== undefined && absoluteDeadline <= now && absoluteDeadline <= (wallDeadline ?? Infinity)) {
+			control.timingTermination = {
+				status: "deadline_exceeded",
+				reason: "deadline",
+				deadline: absoluteDeadline,
+				observedAt: now,
+				partialResult: usage.steps > 0 || usage.toolCalls > 0,
+			};
+		} else if (wallDeadline !== undefined && wallDeadline <= now) {
+			control.timingTermination = createBudgetTermination(
+				"max_wall_time",
+				config.runBudget?.maxWallTimeMs ?? 0,
+				now - startedAt,
+				usage,
+			);
+		} else {
+			return;
+		}
+		controller.abort(control.timingTermination);
+	};
+
+	const scheduleTimer = () => {
+		if (controller.signal.aborted) return;
+		const delay = effectiveDeadline - Date.now();
+		if (delay <= 0) {
+			abortForTimeLimit();
+			return;
+		}
+		timer = setTimeout(scheduleTimer, Math.min(delay, MAX_TIMER_DELAY_MS));
+	};
+
+	control = {
+		startedAt,
+		config,
+		usage,
+		toolLoopHistory: [],
+		signal: controller.signal,
+		dispose: () => {
+			if (timer !== undefined) clearTimeout(timer);
+			signal?.removeEventListener("abort", abortFromCaller);
+		},
+	};
+	scheduleTimer();
+	return control;
+}
+
+function createBudgetTermination(
+	reason: AgentRunBudgetReason,
+	limit: number,
+	observed: number,
+	usage: RunControl["usage"],
+): AgentRunTermination {
+	return {
+		status: "budget_exhausted",
+		reason,
+		limit,
+		observed,
+		partialResult: usage.steps > 0 || usage.toolCalls > 0,
+	};
+}
+
+function refreshTimingTermination(control: RunControl): AgentRunTermination | undefined {
+	if (control.timingTermination || control.signal?.aborted) return control.timingTermination;
+	const now = Date.now();
+	const budget = control.config.runBudget;
+	const wallDeadline = budget?.maxWallTimeMs === undefined ? undefined : control.startedAt + budget.maxWallTimeMs;
+	if (budget?.deadline !== undefined && now >= budget.deadline && budget.deadline <= (wallDeadline ?? Infinity)) {
+		control.timingTermination = {
+			status: "deadline_exceeded",
+			reason: "deadline",
+			deadline: budget.deadline,
+			observedAt: now,
+			partialResult: control.usage.steps > 0 || control.usage.toolCalls > 0,
+		};
+	} else if (budget?.maxWallTimeMs !== undefined && now - control.startedAt >= budget.maxWallTimeMs) {
+		control.timingTermination = createBudgetTermination(
+			"max_wall_time",
+			budget.maxWallTimeMs,
+			now - control.startedAt,
+			control.usage,
+		);
+	}
+	return control.timingTermination;
+}
+
+function getBeforeModelTermination(control: RunControl): AgentRunTermination | undefined {
+	const timingTermination = refreshTimingTermination(control);
+	if (timingTermination) return timingTermination;
+	const budget = control.config.runBudget;
+	if (!budget) return undefined;
+	if (budget.maxSteps !== undefined && control.usage.steps >= budget.maxSteps) {
+		return createBudgetTermination("max_steps", budget.maxSteps, control.usage.steps, control.usage);
+	}
+	if (budget.maxModelCalls !== undefined && control.usage.modelCalls >= budget.maxModelCalls) {
+		return createBudgetTermination("max_model_calls", budget.maxModelCalls, control.usage.modelCalls, control.usage);
+	}
+	if (budget.maxModelTokens !== undefined && control.usage.modelTokens >= budget.maxModelTokens) {
+		return createBudgetTermination(
+			"max_model_tokens",
+			budget.maxModelTokens,
+			control.usage.modelTokens,
+			control.usage,
+		);
+	}
+	if (budget.maxCost !== undefined && control.usage.cost >= budget.maxCost) {
+		return createBudgetTermination("max_cost", budget.maxCost, control.usage.cost, control.usage);
+	}
+	return undefined;
+}
+
+function getPostModelTermination(control: RunControl): AgentRunTermination | undefined {
+	const timingTermination = refreshTimingTermination(control);
+	if (timingTermination) return timingTermination;
+	const budget = control.config.runBudget;
+	if (budget?.maxModelTokens !== undefined && control.usage.modelTokens > budget.maxModelTokens) {
+		return createBudgetTermination(
+			"max_model_tokens",
+			budget.maxModelTokens,
+			control.usage.modelTokens,
+			control.usage,
+		);
+	}
+	if (budget?.maxCost !== undefined && control.usage.cost > budget.maxCost) {
+		return createBudgetTermination("max_cost", budget.maxCost, control.usage.cost, control.usage);
+	}
+	return undefined;
+}
+
+function getRunUsage(control: RunControl): AgentRunUsage {
+	return { ...control.usage, elapsedMs: Math.max(0, Date.now() - control.startedAt) };
+}
+
+async function emitTermination(
+	termination: AgentRunTermination,
+	control: RunControl,
+	emit: AgentEventSink,
+): Promise<void> {
+	await emit({ type: "agent_termination", termination, usage: getRunUsage(control) });
+}
+
 /**
  * Main loop logic shared by agentLoop and agentLoopContinue.
  */
@@ -160,118 +356,187 @@ async function runLoop(
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
 ): Promise<void> {
-	let currentContext = initialContext;
-	let config = initialConfig;
-	let firstTurn = true;
-	// Check for steering messages at start (user may have typed while waiting)
-	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+	const control = createRunControl(initialConfig, signal);
+	try {
+		let currentContext = initialContext;
+		let config = initialConfig;
+		let firstTurn = true;
+		const initialTermination = getBeforeModelTermination(control);
+		if (initialTermination) {
+			await emitTermination(initialTermination, control, emit);
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
 
-	// Outer loop: continues when queued follow-up messages arrive after agent would stop
-	while (true) {
-		let hasMoreToolCalls = true;
+		// Check for steering messages at start (user may have typed while waiting).
+		let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
-		// Inner loop: process tool calls and steering messages
-		while (hasMoreToolCalls || pendingMessages.length > 0) {
-			if (!firstTurn) {
-				await emit({ type: "turn_start" });
-			} else {
-				firstTurn = false;
-			}
+		// Outer loop: continues when queued follow-up messages arrive after agent would stop.
+		while (true) {
+			let hasMoreToolCalls = true;
 
-			// Process pending messages (inject before next assistant response)
-			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					await emit({ type: "message_start", message });
-					await emit({ type: "message_end", message });
-					currentContext.messages.push(message);
-					newMessages.push(message);
+			// Inner loop: process tool calls and steering messages.
+			while (hasMoreToolCalls || pendingMessages.length > 0) {
+				const beforeModelTermination = getBeforeModelTermination(control);
+				if (beforeModelTermination) {
+					await emitTermination(beforeModelTermination, control, emit);
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
 				}
-				pendingMessages = [];
-			}
 
-			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
-			newMessages.push(message);
-
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				await emit({ type: "turn_end", message, toolResults: [] });
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-
-			// Check for tool calls
-			const toolCalls = message.content.filter((c) => c.type === "toolCall");
-
-			const toolResults: ToolResultMessage[] = [];
-			hasMoreToolCalls = false;
-			if (toolCalls.length > 0) {
-				// A "length" stop means the output was cut off by the token limit, so
-				// every tool call in the message may carry truncated arguments. Fail
-				// them all instead of executing potentially borked calls.
-				const executedToolBatch =
-					message.stopReason === "length"
-						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
-						: await executeToolCalls(currentContext, message, config, signal, emit);
-				toolResults.push(...executedToolBatch.messages);
-				hasMoreToolCalls = !executedToolBatch.terminate;
-
-				for (const result of toolResults) {
-					currentContext.messages.push(result);
-					newMessages.push(result);
+				if (!firstTurn) {
+					await emit({ type: "turn_start" });
+				} else {
+					firstTurn = false;
 				}
-			}
 
-			await emit({ type: "turn_end", message, toolResults });
+				// New user input is new evidence, so repeated-tool history does not cross this boundary.
+				if (pendingMessages.length > 0) {
+					control.toolLoopHistory = [];
+					for (const message of pendingMessages) {
+						await emit({ type: "message_start", message });
+						await emit({ type: "message_end", message });
+						currentContext.messages.push(message);
+						newMessages.push(message);
+					}
+					pendingMessages = [];
+				}
 
-			const nextTurnContext = {
-				message,
-				toolResults,
-				context: currentContext,
-				newMessages,
-			};
-			const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
-			if (nextTurnSnapshot) {
-				currentContext = nextTurnSnapshot.context ?? currentContext;
-				config = {
-					...config,
-					model: nextTurnSnapshot.model ?? config.model,
-					reasoning:
-						nextTurnSnapshot.thinkingLevel === undefined
-							? config.reasoning
-							: nextTurnSnapshot.thinkingLevel === "off"
-								? undefined
-								: nextTurnSnapshot.thinkingLevel,
-				};
-			}
+				control.usage.steps++;
+				control.usage.modelCalls++;
+				const message = await streamAssistantResponse(currentContext, config, control.signal, emit, streamFn);
+				newMessages.push(message);
+				recordAssistantUsage(message, control);
 
-			if (
-				await config.shouldStopAfterTurn?.({
+				if (message.stopReason === "error" || message.stopReason === "aborted") {
+					await emit({ type: "turn_end", message, toolResults: [] });
+					const timingTermination = refreshTimingTermination(control);
+					if (timingTermination) await emitTermination(timingTermination, control, emit);
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+
+				const toolCalls = message.content.filter((content) => content.type === "toolCall");
+				const postModelTermination = getPostModelTermination(control);
+				if (postModelTermination) {
+					const toolResults = await failToolCallsWithoutExecution(
+						toolCalls,
+						`Run terminated before tool execution: ${postModelTermination.reason}`,
+						emit,
+					);
+					for (const result of toolResults) {
+						currentContext.messages.push(result);
+						newMessages.push(result);
+					}
+					await emit({ type: "turn_end", message, toolResults });
+					await emitTermination(postModelTermination, control, emit);
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+
+				const toolResults: ToolResultMessage[] = [];
+				let toolBatchTermination: AgentRunTermination | undefined;
+				hasMoreToolCalls = false;
+				if (toolCalls.length > 0) {
+					// A "length" stop means the output was cut off by the token limit, so
+					// every tool call in the message may carry truncated arguments. Fail
+					// them all instead of executing potentially borked calls.
+					const executedToolBatch =
+						message.stopReason === "length"
+							? await failToolCallsFromTruncatedMessage(toolCalls, control, emit)
+							: await executeToolCalls(currentContext, message, config, control, emit);
+					toolResults.push(...executedToolBatch.messages);
+					toolBatchTermination = executedToolBatch.termination;
+					hasMoreToolCalls = !executedToolBatch.terminate;
+
+					for (const result of toolResults) {
+						currentContext.messages.push(result);
+						newMessages.push(result);
+					}
+				}
+
+				await emit({ type: "turn_end", message, toolResults });
+				const timingTermination = refreshTimingTermination(control);
+				const immediateTermination = timingTermination ?? toolBatchTermination;
+				if (immediateTermination) {
+					await emitTermination(immediateTermination, control, emit);
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+
+				const nextTurnContext = {
 					message,
 					toolResults,
 					context: currentContext,
 					newMessages,
-				})
-			) {
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
+				};
+				const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
+				if (nextTurnSnapshot) {
+					currentContext = nextTurnSnapshot.context ?? currentContext;
+					config = {
+						...config,
+						model: nextTurnSnapshot.model ?? config.model,
+						reasoning:
+							nextTurnSnapshot.thinkingLevel === undefined
+								? config.reasoning
+								: nextTurnSnapshot.thinkingLevel === "off"
+									? undefined
+									: nextTurnSnapshot.thinkingLevel,
+					};
+					control.config = config;
+				}
+
+				if (
+					await config.shouldStopAfterTurn?.({
+						message,
+						toolResults,
+						context: currentContext,
+						newMessages,
+					})
+				) {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+
+				if (hasMoreToolCalls) {
+					const nextModelTermination = getBeforeModelTermination(control);
+					if (nextModelTermination) {
+						await emitTermination(nextModelTermination, control, emit);
+						await emit({ type: "agent_end", messages: newMessages });
+						return;
+					}
+				}
+
+				// Do not drain steering if no additional model request can start.
+				if (!hasMoreToolCalls && getBeforeModelTermination(control)) {
+					pendingMessages = [];
+				} else {
+					pendingMessages = (await config.getSteeringMessages?.()) || [];
+				}
 			}
 
-			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			// Do not drain follow-ups if the run has no remaining provider budget.
+			if (getBeforeModelTermination(control)) break;
+			const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+			if (followUpMessages.length > 0) {
+				pendingMessages = followUpMessages;
+				continue;
+			}
+			break;
 		}
 
-		// Agent would stop here. Check for follow-up messages.
-		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
-		if (followUpMessages.length > 0) {
-			// Set as pending so inner loop processes them
-			pendingMessages = followUpMessages;
-			continue;
-		}
-
-		// No more messages, exit
-		break;
+		await emit({ type: "agent_end", messages: newMessages });
+	} finally {
+		control.dispose();
 	}
+}
 
-	await emit({ type: "agent_end", messages: newMessages });
+function recordAssistantUsage(message: AssistantMessage, control: RunControl): void {
+	const usage = message.usage;
+	const tokenParts = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+	const costParts = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+	control.usage.modelTokens += Math.max(0, usage.totalTokens || tokenParts);
+	control.usage.cost += Math.max(0, usage.cost.total || costParts);
 }
 
 /**
@@ -373,6 +638,161 @@ async function streamAssistantResponse(
 	return finalMessage;
 }
 
+type ToolCallPlan = {
+	admitted: AgentToolCall[];
+	blocked: AgentToolCall[];
+	termination?: AgentRunTermination;
+};
+
+function planToolCalls(toolCalls: AgentToolCall[], control: RunControl): ToolCallPlan {
+	const admitted: AgentToolCall[] = [];
+	let termination: AgentRunTermination | undefined;
+
+	for (const toolCall of toolCalls) {
+		const maxToolCalls = control.config.runBudget?.maxToolCalls;
+		if (maxToolCalls !== undefined && control.usage.toolCalls + admitted.length >= maxToolCalls) {
+			termination = createBudgetTermination(
+				"max_tool_calls",
+				maxToolCalls,
+				control.usage.toolCalls + admitted.length,
+				control.usage,
+			);
+			break;
+		}
+
+		const loopTermination = detectRepeatedToolCall(toolCall, admitted, control);
+		if (loopTermination) {
+			termination = loopTermination;
+			break;
+		}
+		admitted.push(toolCall);
+	}
+
+	return {
+		admitted,
+		blocked: toolCalls.slice(admitted.length),
+		termination,
+	};
+}
+
+function detectRepeatedToolCall(
+	toolCall: AgentToolCall,
+	admittedInBatch: AgentToolCall[],
+	control: RunControl,
+): AgentRunTermination | undefined {
+	const detection = control.config.loopDetection;
+	if (!detection || !Number.isInteger(detection.maxConsecutiveToolCalls) || detection.maxConsecutiveToolCalls < 2) {
+		return undefined;
+	}
+	if (detection.includeToolResult !== false) return undefined;
+
+	const requestSignature = createToolRequestSignature(toolCall);
+	let repetitions = 1;
+	const requestSignatures = [
+		...control.toolLoopHistory.map((entry) => entry.requestSignature),
+		...admittedInBatch.map(createToolRequestSignature),
+	];
+	for (let index = requestSignatures.length - 1; index >= 0; index--) {
+		if (requestSignatures[index] !== requestSignature) break;
+		repetitions++;
+	}
+
+	if (repetitions < detection.maxConsecutiveToolCalls) return undefined;
+	return {
+		status: "loop_detected",
+		reason: "repeated_tool_call",
+		toolName: toolCall.name,
+		arguments: toolCall.arguments,
+		repetitions,
+		threshold: detection.maxConsecutiveToolCalls,
+		partialResult: control.usage.steps > 0 || control.usage.toolCalls > 0,
+	};
+}
+
+function createToolRequestSignature(toolCall: AgentToolCall): string {
+	return `${toolCall.name}\0${stableValueSignature(toolCall.arguments)}`;
+}
+
+function stableValueSignature(value: unknown): string {
+	const seen = new WeakSet<object>();
+	const normalize = (current: unknown): unknown => {
+		if (current === null || typeof current === "string" || typeof current === "boolean") return current;
+		if (typeof current === "number") return Number.isFinite(current) ? current : String(current);
+		if (typeof current === "bigint") return `${current}n`;
+		if (current === undefined) return "[undefined]";
+		if (typeof current === "function") return "[function]";
+		if (typeof current === "symbol") return String(current);
+		if (Array.isArray(current)) return current.map(normalize);
+		if (typeof current === "object") {
+			if (seen.has(current)) return "[circular]";
+			seen.add(current);
+			const normalized: Record<string, unknown> = {};
+			for (const key of Object.keys(current).sort()) {
+				normalized[key] = normalize((current as Record<string, unknown>)[key]);
+			}
+			seen.delete(current);
+			return normalized;
+		}
+		return String(current);
+	};
+
+	try {
+		return JSON.stringify(normalize(value));
+	} catch (error) {
+		return `[unserializable:${error instanceof Error ? error.message : String(error)}]`;
+	}
+}
+
+function recordToolLoopHistory(
+	finalizedCalls: FinalizedToolCallOutcome[],
+	control: RunControl,
+): AgentRunTermination | undefined {
+	const detection = control.config.loopDetection;
+	if (!detection) return undefined;
+	let termination: AgentRunTermination | undefined;
+	for (const finalized of finalizedCalls) {
+		const entry = {
+			requestSignature: createToolRequestSignature(finalized.toolCall),
+			resultSignature: stableValueSignature({ result: finalized.result, isError: finalized.isError }),
+		};
+		control.toolLoopHistory.push(entry);
+		if (
+			!termination &&
+			detection.includeToolResult !== false &&
+			Number.isInteger(detection.maxConsecutiveToolCalls) &&
+			detection.maxConsecutiveToolCalls >= 2
+		) {
+			let repetitions = 0;
+			for (let index = control.toolLoopHistory.length - 1; index >= 0; index--) {
+				const previous = control.toolLoopHistory[index];
+				if (
+					previous.requestSignature !== entry.requestSignature ||
+					previous.resultSignature !== entry.resultSignature
+				) {
+					break;
+				}
+				repetitions++;
+			}
+			if (repetitions >= detection.maxConsecutiveToolCalls) {
+				termination = {
+					status: "loop_detected",
+					reason: "repeated_tool_call",
+					toolName: finalized.toolCall.name,
+					arguments: finalized.toolCall.arguments,
+					repetitions,
+					threshold: detection.maxConsecutiveToolCalls,
+					partialResult: control.usage.steps > 0 || control.usage.toolCalls > 0,
+				};
+			}
+		}
+	}
+	const historyLimit = Math.max(1, detection.maxConsecutiveToolCalls);
+	if (control.toolLoopHistory.length > historyLimit) {
+		control.toolLoopHistory = control.toolLoopHistory.slice(-historyLimit);
+	}
+	return termination;
+}
+
 /**
  * Fail all tool calls from an assistant message that was truncated by the
  * output token limit. Streamed tool-call arguments are finalized with a
@@ -382,10 +802,14 @@ async function streamAssistantResponse(
  */
 async function failToolCallsFromTruncatedMessage(
 	toolCalls: AgentToolCall[],
+	control: RunControl,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
+	const plan = planToolCalls(toolCalls, control);
 	const messages: ToolResultMessage[] = [];
-	for (const toolCall of toolCalls) {
+	const finalizedCalls: FinalizedToolCallOutcome[] = [];
+	for (const toolCall of plan.admitted) {
+		control.usage.toolCalls++;
 		await emit({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
@@ -402,9 +826,47 @@ async function failToolCallsFromTruncatedMessage(
 		await emitToolExecutionEnd(finalized, emit);
 		const toolResultMessage = createToolResultMessage(finalized);
 		await emitToolResultMessage(toolResultMessage, emit);
+		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
 	}
-	return { messages, terminate: false };
+	const resultLoopTermination = recordToolLoopHistory(finalizedCalls, control);
+	if (plan.termination && !control.signal?.aborted) {
+		messages.push(
+			...(await failToolCallsWithoutExecution(
+				plan.blocked,
+				`Tool call was not executed: ${plan.termination.reason}`,
+				emit,
+			)),
+		);
+	}
+	const termination = plan.termination ?? resultLoopTermination;
+	return { messages, terminate: termination !== undefined, termination };
+}
+
+async function failToolCallsWithoutExecution(
+	toolCalls: AgentToolCall[],
+	reason: string,
+	emit: AgentEventSink,
+): Promise<ToolResultMessage[]> {
+	const messages: ToolResultMessage[] = [];
+	for (const toolCall of toolCalls) {
+		await emit({
+			type: "tool_execution_start",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			args: toolCall.arguments,
+		});
+		const finalized: FinalizedToolCallOutcome = {
+			toolCall,
+			result: createErrorToolResult(reason),
+			isError: true,
+		};
+		await emitToolExecutionEnd(finalized, emit);
+		const message = createToolResultMessage(finalized);
+		await emitToolResultMessage(message, emit);
+		messages.push(message);
+	}
+	return messages;
 }
 
 /**
@@ -414,22 +876,36 @@ async function executeToolCalls(
 	currentContext: AgentContext,
 	assistantMessage: AssistantMessage,
 	config: AgentLoopConfig,
-	signal: AbortSignal | undefined,
+	control: RunControl,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
-	const hasSequentialToolCall = toolCalls.some(
+	const plan = planToolCalls(toolCalls, control);
+	const hasSequentialToolCall = plan.admitted.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 	);
-	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
-		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	const executed =
+		config.toolExecution === "sequential" || hasSequentialToolCall
+			? await executeToolCallsSequential(currentContext, assistantMessage, plan.admitted, config, control, emit)
+			: await executeToolCallsParallel(currentContext, assistantMessage, plan.admitted, config, control, emit);
+	if (plan.termination && !control.signal?.aborted) {
+		executed.messages.push(
+			...(await failToolCallsWithoutExecution(
+				plan.blocked,
+				`Tool call was not executed: ${plan.termination.reason}`,
+				emit,
+			)),
+		);
+		executed.terminate = true;
+		executed.termination = plan.termination;
 	}
-	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	return executed;
 }
 
 type ExecutedToolCallBatch = {
 	messages: ToolResultMessage[];
 	terminate: boolean;
+	termination?: AgentRunTermination;
 };
 
 async function executeToolCallsSequential(
@@ -437,13 +913,15 @@ async function executeToolCallsSequential(
 	assistantMessage: AssistantMessage,
 	toolCalls: AgentToolCall[],
 	config: AgentLoopConfig,
-	signal: AbortSignal | undefined,
+	control: RunControl,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
 
-	for (const toolCall of toolCalls) {
+	for (let index = 0; index < toolCalls.length; index++) {
+		const toolCall = toolCalls[index];
+		control.usage.toolCalls++;
 		await emit({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
@@ -451,7 +929,7 @@ async function executeToolCallsSequential(
 			args: toolCall.arguments,
 		});
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, control.signal);
 		let finalized: FinalizedToolCallOutcome;
 		if (preparation.kind === "immediate") {
 			finalized = {
@@ -460,14 +938,14 @@ async function executeToolCallsSequential(
 				isError: preparation.isError,
 			};
 		} else {
-			const executed = await executePreparedToolCall(preparation, signal, emit);
+			const executed = await executePreparedToolCall(preparation, control.signal, emit);
 			finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
 				preparation,
 				executed,
 				config,
-				signal,
+				control.signal,
 			);
 		}
 
@@ -476,8 +954,19 @@ async function executeToolCallsSequential(
 		await emitToolResultMessage(toolResultMessage, emit);
 		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
+		const loopTermination = recordToolLoopHistory([finalized], control);
+		if (loopTermination) {
+			messages.push(
+				...(await failToolCallsWithoutExecution(
+					toolCalls.slice(index + 1),
+					`Tool call was not executed: ${loopTermination.reason}`,
+					emit,
+				)),
+			);
+			return { messages, terminate: true, termination: loopTermination };
+		}
 
-		if (signal?.aborted) {
+		if (control.signal?.aborted) {
 			break;
 		}
 	}
@@ -493,12 +982,13 @@ async function executeToolCallsParallel(
 	assistantMessage: AssistantMessage,
 	toolCalls: AgentToolCall[],
 	config: AgentLoopConfig,
-	signal: AbortSignal | undefined,
+	control: RunControl,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
 
 	for (const toolCall of toolCalls) {
+		control.usage.toolCalls++;
 		await emit({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
@@ -506,7 +996,7 @@ async function executeToolCallsParallel(
 			args: toolCall.arguments,
 		});
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, control.signal);
 		if (preparation.kind === "immediate") {
 			const finalized = {
 				toolCall,
@@ -515,26 +1005,26 @@ async function executeToolCallsParallel(
 			} satisfies FinalizedToolCallOutcome;
 			await emitToolExecutionEnd(finalized, emit);
 			finalizedCalls.push(finalized);
-			if (signal?.aborted) {
+			if (control.signal?.aborted) {
 				break;
 			}
 			continue;
 		}
 
 		finalizedCalls.push(async () => {
-			const executed = await executePreparedToolCall(preparation, signal, emit);
+			const executed = await executePreparedToolCall(preparation, control.signal, emit);
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
 				preparation,
 				executed,
 				config,
-				signal,
+				control.signal,
 			);
 			await emitToolExecutionEnd(finalized, emit);
 			return finalized;
 		});
-		if (signal?.aborted) {
+		if (control.signal?.aborted) {
 			break;
 		}
 	}
@@ -542,6 +1032,7 @@ async function executeToolCallsParallel(
 	const orderedFinalizedCalls = await Promise.all(
 		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
 	);
+	const loopTermination = recordToolLoopHistory(orderedFinalizedCalls, control);
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
 		const toolResultMessage = createToolResultMessage(finalized);
@@ -551,7 +1042,8 @@ async function executeToolCallsParallel(
 
 	return {
 		messages,
-		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		terminate: loopTermination !== undefined || shouldTerminateToolBatch(orderedFinalizedCalls),
+		termination: loopTermination,
 	};
 }
 

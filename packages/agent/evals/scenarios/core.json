@@ -1,0 +1,328 @@
+{
+  "version": 1,
+  "name": "agent-harness-core",
+  "scenarios": [
+    {
+      "version": 1,
+      "id": "tool-roundtrip",
+      "description": "Runs one deterministic tool call and returns the final answer.",
+      "prompt": "Look up alpha and report the value.",
+      "responses": [
+        {
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "lookup-1",
+              "name": "lookup",
+              "arguments": { "key": "alpha" }
+            }
+          ],
+          "stopReason": "toolUse"
+        },
+        {
+          "content": [{ "type": "text", "text": "alpha is 42" }],
+          "stopReason": "stop"
+        }
+      ],
+      "tools": [
+        {
+          "name": "lookup",
+          "responses": [
+            {
+              "content": [{ "type": "text", "text": "42" }],
+              "details": { "source": "fixture" }
+            }
+          ]
+        }
+      ],
+      "assertions": {
+        "eventOrder": [
+          "agent_start",
+          "turn_start",
+          "message_start:user",
+          "message_end:user",
+          "message_start:assistant",
+          "message_end:assistant",
+          "tool_execution_start:lookup",
+          "tool_execution_end:lookup",
+          "message_start:toolResult",
+          "message_end:toolResult",
+          "turn_end:toolUse",
+          "turn_start",
+          "message_start:assistant",
+          "message_end:assistant",
+          "turn_end:stop",
+          "agent_end",
+          "settled"
+        ],
+        "toolCalls": [{ "name": "lookup", "arguments": { "key": "alpha" } }],
+        "finalOutput": { "equals": "alpha is 42" },
+        "termination": { "status": "completed" },
+        "usage": { "steps": 2, "modelCalls": 2, "toolCalls": 1, "maxModelTokens": 1000, "maxCost": 0 },
+        "replayDeterministic": true
+      }
+    },
+    {
+      "version": 1,
+      "id": "model-call-budget",
+      "description": "Stops before a second provider call when the model-call budget is exhausted.",
+      "prompt": "Use the lookup tool.",
+      "responses": [
+        {
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "budget-lookup-1",
+              "name": "lookup",
+              "arguments": { "key": "budget" }
+            }
+          ],
+          "stopReason": "toolUse"
+        },
+        {
+          "content": [{ "type": "text", "text": "must not be requested" }],
+          "stopReason": "stop"
+        }
+      ],
+      "tools": [
+        {
+          "name": "lookup",
+          "responses": [{ "content": [{ "type": "text", "text": "budget result" }] }]
+        }
+      ],
+      "runBudget": { "maxModelCalls": 1 },
+      "assertions": {
+        "eventOrder": [
+          "agent_start",
+          "turn_start",
+          "tool_execution_start:lookup",
+          "tool_execution_end:lookup",
+          "turn_end:toolUse",
+          "agent_termination:budget_exhausted:max_model_calls",
+          "agent_end",
+          "settled"
+        ],
+        "toolCalls": [{ "name": "lookup", "arguments": { "key": "budget" } }],
+        "termination": { "status": "budget_exhausted", "reason": "max_model_calls" },
+        "usage": { "steps": 1, "modelCalls": 1, "toolCalls": 1, "maxCost": 0 },
+        "replayDeterministic": true
+      }
+    },
+    {
+      "version": 1,
+      "id": "tool-error-recovery",
+      "description": "Feeds a deterministic tool failure back to the model and verifies recovery on the next turn.",
+      "prompt": "Run the command and recover if it fails.",
+      "responses": [
+        {
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "command-1",
+              "name": "command",
+              "arguments": { "command": "false" }
+            }
+          ],
+          "stopReason": "toolUse"
+        },
+        {
+          "content": [{ "type": "text", "text": "command failed; recovery completed" }],
+          "stopReason": "stop"
+        }
+      ],
+      "tools": [
+        {
+          "name": "command",
+          "responses": [{ "error": "exit status 1" }]
+        }
+      ],
+      "assertions": {
+        "eventOrder": [
+          "tool_execution_start:command",
+          "tool_execution_end:command",
+          "turn_end:toolUse",
+          "turn_start",
+          "turn_end:stop",
+          "agent_end",
+          "settled"
+        ],
+        "toolCalls": [{ "name": "command", "arguments": { "command": "false" } }],
+        "finalOutput": { "contains": "recovery completed" },
+        "termination": { "status": "completed" },
+        "usage": { "steps": 2, "modelCalls": 2, "toolCalls": 1, "maxCost": 0 },
+        "replayDeterministic": true
+      }
+    },
+    {
+      "version": 1,
+      "id": "parallel-tool-batch",
+      "description": "Executes an independent two-tool batch and preserves deterministic result ordering.",
+      "prompt": "Look up alpha and beta together.",
+      "responses": [
+        {
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "parallel-alpha",
+              "name": "lookup-alpha",
+              "arguments": { "key": "alpha" }
+            },
+            {
+              "type": "toolCall",
+              "id": "parallel-beta",
+              "name": "lookup-beta",
+              "arguments": { "key": "beta" }
+            }
+          ],
+          "stopReason": "toolUse"
+        },
+        {
+          "content": [{ "type": "text", "text": "alpha=1 beta=2" }],
+          "stopReason": "stop"
+        }
+      ],
+      "tools": [
+        {
+          "name": "lookup-alpha",
+          "responses": [{ "content": [{ "type": "text", "text": "1" }] }]
+        },
+        {
+          "name": "lookup-beta",
+          "responses": [{ "content": [{ "type": "text", "text": "2" }] }]
+        }
+      ],
+      "assertions": {
+        "eventOrder": [
+          "tool_execution_start:lookup-alpha",
+          "tool_execution_start:lookup-beta",
+          "tool_execution_end:lookup-alpha",
+          "tool_execution_end:lookup-beta",
+          "turn_end:toolUse",
+          "turn_end:stop",
+          "settled"
+        ],
+        "toolCalls": [
+          { "name": "lookup-alpha", "arguments": { "key": "alpha" } },
+          { "name": "lookup-beta", "arguments": { "key": "beta" } }
+        ],
+        "finalOutput": { "equals": "alpha=1 beta=2" },
+        "termination": { "status": "completed" },
+        "usage": { "steps": 2, "modelCalls": 2, "toolCalls": 2, "maxCost": 0 },
+        "replayDeterministic": true
+      }
+    },
+    {
+      "version": 1,
+      "id": "tool-call-budget",
+      "description": "Finalizes an over-budget parallel tool call as an error without executing it.",
+      "prompt": "Run both lookups.",
+      "responses": [
+        {
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "budget-tool-1",
+              "name": "lookup",
+              "arguments": { "key": "first" }
+            },
+            {
+              "type": "toolCall",
+              "id": "budget-tool-2",
+              "name": "lookup",
+              "arguments": { "key": "second" }
+            }
+          ],
+          "stopReason": "toolUse"
+        }
+      ],
+      "tools": [
+        {
+          "name": "lookup",
+          "responses": [{ "content": [{ "type": "text", "text": "first result" }] }]
+        }
+      ],
+      "runBudget": { "maxToolCalls": 1 },
+      "assertions": {
+        "eventOrder": [
+          "tool_execution_start:lookup",
+          "tool_execution_end:lookup",
+          "tool_execution_start:lookup",
+          "tool_execution_end:lookup",
+          "turn_end:toolUse",
+          "agent_termination:budget_exhausted:max_tool_calls",
+          "agent_end",
+          "settled"
+        ],
+        "toolCalls": [
+          { "name": "lookup", "arguments": { "key": "first" } },
+          { "name": "lookup", "arguments": { "key": "second" } }
+        ],
+        "termination": { "status": "budget_exhausted", "reason": "max_tool_calls" },
+        "usage": { "steps": 1, "modelCalls": 1, "toolCalls": 1, "maxCost": 0 },
+        "replayDeterministic": true
+      }
+    },
+    {
+      "version": 1,
+      "id": "repeated-tool-loop",
+      "description": "Terminates a stable repeated tool-call loop at the configured threshold.",
+      "prompt": "Repeat the lookup.",
+      "responses": [
+        {
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "loop-lookup-1",
+              "name": "lookup",
+              "arguments": { "key": "same" }
+            }
+          ],
+          "stopReason": "toolUse"
+        },
+        {
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "loop-lookup-2",
+              "name": "lookup",
+              "arguments": { "key": "same" }
+            }
+          ],
+          "stopReason": "toolUse"
+        }
+      ],
+      "tools": [
+        {
+          "name": "lookup",
+          "responses": [
+            { "content": [{ "type": "text", "text": "stable" }] },
+            { "content": [{ "type": "text", "text": "stable" }] }
+          ]
+        }
+      ],
+      "loopDetection": { "maxConsecutiveToolCalls": 2 },
+      "assertions": {
+        "eventOrder": [
+          "agent_start",
+          "turn_start",
+          "tool_execution_start:lookup",
+          "turn_end:toolUse",
+          "turn_start",
+          "tool_execution_start:lookup",
+          "tool_execution_end:lookup",
+          "turn_end:toolUse",
+          "agent_termination:loop_detected:repeated_tool_call",
+          "agent_end",
+          "settled"
+        ],
+        "toolCalls": [
+          { "name": "lookup", "arguments": { "key": "same" } },
+          { "name": "lookup", "arguments": { "key": "same" } }
+        ],
+        "termination": { "status": "loop_detected", "reason": "repeated_tool_call" },
+        "usage": { "steps": 2, "modelCalls": 2, "toolCalls": 2, "maxCost": 0 },
+        "replayDeterministic": true
+      }
+    }
+  ]
+}

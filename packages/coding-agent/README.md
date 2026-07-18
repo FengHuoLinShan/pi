@@ -472,7 +472,7 @@ await session.prompt("What files are in the current directory?");
 
 For advanced multi-session runtime replacement, use `createAgentSessionRuntime()` and `AgentSessionRuntime`.
 
-See [docs/sdk.md](docs/sdk.md) and [examples/sdk/](examples/sdk/).
+See [docs/sdk.md](docs/sdk.md), [durable artifact/process SDK primitives](docs/artifacts-and-processes.md), the [app protocol contract](docs/app-protocol.md), and [examples/sdk/](examples/sdk/).
 
 ### RPC Mode
 

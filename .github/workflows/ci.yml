@@ -40,3 +40,6 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: AgentHarness eval gate
+        run: npm run eval:harness

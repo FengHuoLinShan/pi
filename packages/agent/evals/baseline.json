@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "suiteName": "agent-harness-core",
+  "createdAt": "2026-07-18T19:25:23.413Z",
+  "thresholds": {
+    "minimumPassRate": 1,
+    "maximumFailedScenarios": 0,
+    "maximumRegressions": 0,
+    "maximumUnbaselinedScenarios": 0,
+    "requireReplayDeterminism": true
+  },
+  "scenarios": {
+    "tool-roundtrip": {
+      "passed": true,
+      "signature": "9a1b91e3f04f78adfd7f7a8558fed4682298e0c140d593084b9d5c37bbcf4273"
+    },
+    "model-call-budget": {
+      "passed": true,
+      "signature": "ea5b19e0245b233b4bb222fab2406dca1249a146ad0c5ba7327ea900e19b6e23"
+    },
+    "tool-error-recovery": {
+      "passed": true,
+      "signature": "5f303e47bfad8e2dedf1d7553f569511c0e6d912c64cb6b45ee9ccbeb8f6a8c9"
+    },
+    "parallel-tool-batch": {
+      "passed": true,
+      "signature": "2e0a026b775dba41dfbf2fa26fd6e7cafcefa3122c071efc01d59b131ae982f3"
+    },
+    "tool-call-budget": {
+      "passed": true,
+      "signature": "99a88b0191e75975bfd1ad84969843a555b7bd166329e33bff7dc7d5dbeaf9b6"
+    },
+    "repeated-tool-loop": {
+      "passed": true,
+      "signature": "3592ec59ada0364c1c8e34fe92867ada04420398d9591a3544b062bff09aee73"
+    }
+  }
+}

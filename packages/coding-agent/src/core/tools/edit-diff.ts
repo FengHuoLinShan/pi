@@ -4,7 +4,8 @@
 
 import * as Diff from "diff";
 import { constants } from "fs";
-import { access, readFile } from "fs/promises";
+import { access, readFile, realpath } from "fs/promises";
+import { captureFilePathSnapshot, type FilePathOperations, revalidateFilePathSnapshot } from "./file-transaction.ts";
 import { resolveToCwd } from "./path-utils.ts";
 
 export function detectLineEnding(content: string): "\r\n" | "\n" {
@@ -511,6 +512,22 @@ export interface EditDiffError {
 	error: string;
 }
 
+export interface EditDiffOperations extends FilePathOperations {
+	readFile: (absolutePath: string) => Promise<Buffer>;
+	access: (absolutePath: string) => Promise<void>;
+}
+
+export interface ComputeEditsDiffOptions {
+	operations?: EditDiffOperations;
+	allowedRoots?: string[];
+}
+
+const defaultEditDiffOperations: EditDiffOperations = {
+	readFile,
+	access: (path) => access(path, constants.R_OK),
+	realpath,
+};
+
 /**
  * Compute the diff for one or more edit operations without applying them.
  * Used for preview rendering in the TUI before the tool executes.
@@ -519,20 +536,25 @@ export async function computeEditsDiff(
 	path: string,
 	edits: Edit[],
 	cwd: string,
+	options?: ComputeEditsDiffOptions,
 ): Promise<EditDiffResult | EditDiffError> {
 	const absolutePath = resolveToCwd(path, cwd);
+	const allowedRoots = options?.allowedRoots?.map((root) => resolveToCwd(root, cwd));
+	const ops = options?.operations ?? defaultEditDiffOperations;
 
 	try {
+		const pathSnapshot = await captureFilePathSnapshot(absolutePath, path, allowedRoots, ops.realpath, true);
 		// Check if file exists and is readable
 		try {
-			await access(absolutePath, constants.R_OK);
+			await ops.access(pathSnapshot.targetPath);
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
 			return { error: `Could not edit file: ${path}. ${errorMessage}.` };
 		}
+		await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath);
 
 		// Read the file
-		const rawContent = await readFile(absolutePath, "utf-8");
+		const rawContent = (await ops.readFile(pathSnapshot.targetPath)).toString("utf8");
 
 		// Strip BOM before matching (LLM won't include invisible BOM in oldText)
 		const { text: content } = stripBom(rawContent);

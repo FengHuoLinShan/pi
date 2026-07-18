@@ -155,26 +155,49 @@ export async function loadJsonlSessionMetadata(
 async function loadJsonlStorage(
 	fs: JsonlSessionStorageFileSystem,
 	filePath: string,
+	options: { repairPartialTail: boolean },
 ): Promise<{
 	header: SessionHeader;
 	entries: SessionTreeEntry[];
 	leafId: string | null;
+	tailRecovered: boolean;
 }> {
 	const content = getFileSystemResultOrThrow(await fs.readTextFile(filePath), `Failed to read session ${filePath}`);
-	const lines = content.split("\n").filter((line) => line.trim());
-	if (lines.length === 0) {
+	const lines = content.split("\n");
+	if (!lines[0]?.trim()) {
 		throw invalidSession(filePath, "missing session header");
 	}
 
 	const header = parseHeaderLine(lines[0]!, filePath);
 	const entries: SessionTreeEntry[] = [];
 	let leafId: string | null = null;
+	let tailRecovered = false;
 	for (let i = 1; i < lines.length; i++) {
-		const entry = parseEntryLine(lines[i]!, filePath, i + 1);
+		const line = lines[i]!;
+		if (!line.trim()) continue;
+		let entry: SessionTreeEntry;
+		try {
+			entry = parseEntryLine(line, filePath, i + 1);
+		} catch (error) {
+			const isUnterminatedTail = i === lines.length - 1 && !content.endsWith("\n");
+			if (!options.repairPartialTail || !isUnterminatedTail) throw error;
+			const repairedContent = `${lines.slice(0, i).join("\n").replace(/\n*$/, "")}\n`;
+			getFileSystemResultOrThrow(
+				await fs.writeFile(filePath, repairedContent),
+				`Failed to repair partial session tail ${filePath}`,
+			);
+			tailRecovered = true;
+			break;
+		}
 		entries.push(entry);
 		leafId = leafIdAfterEntry(entry);
 	}
-	return { header, entries, leafId };
+	return { header, entries, leafId, tailRecovered };
+}
+
+export interface JsonlSessionOpenOptions {
+	/** Remove a malformed final line only when it is unterminated, as produced by an interrupted append. Defaults to true. */
+	repairPartialTail?: boolean;
 }
 
 export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata> {
@@ -185,6 +208,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	private byId: Map<string, SessionTreeEntry>;
 	private labelsById: Map<string, string>;
 	private currentLeafId: string | null;
+	private readonly tailRecovered: boolean;
 
 	private constructor(
 		fs: JsonlSessionStorageFileSystem,
@@ -192,6 +216,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		header: SessionHeader,
 		entries: SessionTreeEntry[],
 		leafId: string | null,
+		tailRecovered: boolean,
 	) {
 		this.fs = fs;
 		this.filePath = filePath;
@@ -200,11 +225,18 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		this.byId = new Map(entries.map((entry) => [entry.id, entry]));
 		this.labelsById = buildLabelsById(entries);
 		this.currentLeafId = leafId;
+		this.tailRecovered = tailRecovered;
 	}
 
-	static async open(fs: JsonlSessionStorageFileSystem, filePath: string): Promise<JsonlSessionStorage> {
-		const loaded = await loadJsonlStorage(fs, filePath);
-		return new JsonlSessionStorage(fs, filePath, loaded.header, loaded.entries, loaded.leafId);
+	static async open(
+		fs: JsonlSessionStorageFileSystem,
+		filePath: string,
+		options: JsonlSessionOpenOptions = {},
+	): Promise<JsonlSessionStorage> {
+		const loaded = await loadJsonlStorage(fs, filePath, {
+			repairPartialTail: options.repairPartialTail ?? true,
+		});
+		return new JsonlSessionStorage(fs, filePath, loaded.header, loaded.entries, loaded.leafId, loaded.tailRecovered);
 	}
 
 	static async create(
@@ -230,7 +262,12 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 			await fs.writeFile(filePath, `${JSON.stringify(header)}\n`),
 			`Failed to create session ${filePath}`,
 		);
-		return new JsonlSessionStorage(fs, filePath, header, [], null);
+		return new JsonlSessionStorage(fs, filePath, header, [], null, false);
+	}
+
+	/** Whether open repaired an interrupted, unterminated final append. */
+	wasPartialTailRecovered(): boolean {
+		return this.tailRecovered;
 	}
 
 	async getMetadata(): Promise<JsonlSessionMetadata> {
