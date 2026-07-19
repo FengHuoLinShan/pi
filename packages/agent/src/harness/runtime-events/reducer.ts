@@ -325,20 +325,25 @@ function validateCheckpoint(event: RuntimeCheckpointEvent, state: RuntimeRecover
 	if (event.state.sessionId !== state.sessionId || event.state.lastSequence !== event.throughSequence) {
 		throw new RuntimeEventError("invalid_event", "Checkpoint snapshot does not match its envelope position");
 	}
+	if (canonicalState(event.state) !== canonicalState(state)) {
+		throw new RuntimeEventError("invalid_event", "Checkpoint snapshot does not match the replayed state");
+	}
 }
 
-function restoreCheckpoint(envelope: RuntimeEventEnvelope<RuntimeCheckpointEvent>): RuntimeRecoveryState {
-	const event = envelope.event;
-	if (event.throughSequence !== envelope.sequence - 1) {
-		throw new RuntimeEventError("invalid_sequence", "Checkpoint is not adjacent to the state it snapshots");
-	}
-	if (event.state.sessionId !== envelope.sessionId || event.state.lastSequence !== event.throughSequence) {
-		throw new RuntimeEventError("invalid_event", "Checkpoint snapshot does not match its envelope");
-	}
-	return { ...event.state, lastSequence: envelope.sequence, lastEventId: envelope.eventId };
+function canonicalState(state: RuntimeRecoveryState): string {
+	const normalize = (value: unknown): unknown => {
+		if (Array.isArray(value)) return value.map(normalize);
+		if (value === null || typeof value !== "object") return value;
+		return Object.fromEntries(
+			Object.entries(value as Record<string, unknown>)
+				.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+				.map(([key, nested]) => [key, normalize(nested)]),
+		);
+	};
+	return JSON.stringify(normalize(state));
 }
 
-/** Replay canonical events, starting from the latest valid checkpoint when one is present. */
+/** Replay canonical events and verify that every checkpoint matches the preceding event history. */
 export function replayRuntimeEvents(sessionId: string, events: readonly RuntimeEventEnvelope[]): RuntimeRecoveryState {
 	let previousSequence = 0;
 	const eventIds = new Set<string>();
@@ -359,21 +364,8 @@ export function replayRuntimeEvents(sessionId: string, events: readonly RuntimeE
 		previousSequence = envelope.sequence;
 	}
 
-	let checkpointIndex = -1;
-	for (let i = events.length - 1; i >= 0; i--) {
-		if (events[i]?.event.type === "checkpoint") {
-			checkpointIndex = i;
-			break;
-		}
-	}
 	let state = createRuntimeRecoveryState(sessionId);
-	let startIndex = 0;
-	if (checkpointIndex >= 0) {
-		const checkpoint = events[checkpointIndex] as RuntimeEventEnvelope<RuntimeCheckpointEvent>;
-		state = restoreCheckpoint(checkpoint);
-		startIndex = checkpointIndex + 1;
-	}
-	for (let i = startIndex; i < events.length; i++) {
+	for (let i = 0; i < events.length; i++) {
 		state = reduceRuntimeEvent(state, events[i]!);
 	}
 	return state;

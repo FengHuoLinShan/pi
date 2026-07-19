@@ -86,6 +86,31 @@ describe("runtime event reducer", () => {
 		expect(replayed.operations["operation-1"]?.status).toBe("finished");
 	});
 
+	it("rejects a checkpoint whose nested snapshot does not match replayed history", () => {
+		const first = envelope(1, {
+			type: "queue_enqueued",
+			queueItemId: "queue-1",
+			queue: "steer",
+			message: "original",
+		});
+		const stateAtFirst = reduceRuntimeEvent(createRuntimeRecoveryState("session-1"), first);
+		const checkpoint = envelope(2, {
+			type: "checkpoint",
+			throughSequence: 1,
+			state: {
+				...stateAtFirst,
+				queueItems: {
+					...stateAtFirst.queueItems,
+					"queue-1": { ...stateAtFirst.queueItems["queue-1"]!, message: "tampered" },
+				},
+			},
+		});
+
+		expect(() => replayRuntimeEvents("session-1", [first, checkpoint])).toThrow(
+			"Checkpoint snapshot does not match the replayed state",
+		);
+	});
+
 	it("plans conservative recovery without consuming queues or retrying tools", () => {
 		const events: RuntimeEvent[] = [
 			{ type: "queue_enqueued", queueItemId: "queue-1", queue: "follow_up", message: "next" },

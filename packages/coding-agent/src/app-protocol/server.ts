@@ -293,6 +293,16 @@ export class AppProtocolServerConnection {
 		try {
 			const request = parseProtocolClientRequest(message);
 			this.validateRequestCapabilities(request);
+			if (
+				request.method === "turn/start" &&
+				[...this.pendingClientRequests.values()].filter((method) => method === "turn/start").length >=
+					this.requireNegotiatedLimits().maxQueuedTurns
+			) {
+				throw new ProtocolValidationError(APP_PROTOCOL_ERROR_CODES.OVERLOADED, "Too many queued turns", {
+					data: { retryAfterMs: 100 },
+					requestId: request.id,
+				});
+			}
 			this.pendingClientRequests.set(request.id, request.method);
 			return { outbound: [], actions: [{ kind: "request", request }], issues: [] };
 		} catch (error: unknown) {

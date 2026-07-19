@@ -45,7 +45,7 @@ function initialize(
 		supportedProtocolVersions?: string[];
 		capabilities?: Partial<AppCapabilities>;
 		requiredCapabilities?: Array<keyof AppCapabilities>;
-		limits?: { maxPendingRequests?: number; maxEventReplayEvents?: number };
+		limits?: { maxPendingRequests?: number; maxQueuedTurns?: number; maxEventReplayEvents?: number };
 	} = {},
 ): InitializeResult {
 	const response = connection.receive({
@@ -458,5 +458,39 @@ describe("stable app protocol", () => {
 			result: { threadId: "thread-1" },
 		});
 		expect(connection.receive(request).actions[0]?.kind).toBe("request");
+	});
+
+	test("enforces the negotiated queued-turn limit independently of other requests", () => {
+		const connection = new AppProtocolServerConnection(serverOptions());
+		initialize(connection, { limits: { maxQueuedTurns: 1 } });
+		const firstTurn = {
+			jsonrpc: "2.0",
+			id: "turn-1",
+			method: "turn/start",
+			params: { schemaVersion: 1, threadId: "thread-1", input: [{ type: "text", text: "first" }] },
+		};
+		const secondTurn = {
+			...firstTurn,
+			id: "turn-2",
+			params: { ...firstTurn.params, input: [{ type: "text", text: "second" }] },
+		};
+
+		expect(connection.receive(firstTurn).actions[0]?.kind).toBe("request");
+		const overloaded = errorResponse(connection.receive(secondTurn));
+		expect(overloaded.error).toMatchObject({
+			code: APP_PROTOCOL_ERROR_CODES.OVERLOADED,
+			message: "Too many queued turns",
+		});
+
+		const nonTurn = connection.receive({
+			jsonrpc: "2.0",
+			id: "thread-1",
+			method: "thread/start",
+			params: { schemaVersion: 1 },
+		});
+		expect(nonTurn.actions[0]?.kind).toBe("request");
+
+		connection.completeRequest("turn-1", { turnId: "turn-1" });
+		expect(connection.receive(secondTurn).actions[0]?.kind).toBe("request");
 	});
 });

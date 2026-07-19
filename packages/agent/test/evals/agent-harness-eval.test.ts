@@ -90,4 +90,22 @@ describe("AgentHarness eval runner", () => {
 		expect(comparison.passed).toBe(false);
 		expect(comparison.replayFailures).toEqual(["tool-roundtrip"]);
 	});
+
+	it("refuses to create a baseline that would fail its own replay gate", async () => {
+		const report = await runAgentHarnessEvalSuite(await loadCoreSuite());
+		report.scenarios[0]!.replay.enabled = false;
+
+		expect(() => createAgentHarnessEvalBaseline(report)).toThrow(
+			"Refusing to create an eval baseline without deterministic replay for: tool-roundtrip",
+		);
+
+		const baseline = createAgentHarnessEvalBaseline(report, {
+			minimumPassRate: 1,
+			maximumFailedScenarios: 0,
+			maximumRegressions: 0,
+			maximumUnbaselinedScenarios: 0,
+			requireReplayDeterminism: false,
+		});
+		expect(baseline.thresholds.requireReplayDeterminism).toBe(false);
+	});
 });

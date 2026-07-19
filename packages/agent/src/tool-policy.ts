@@ -77,7 +77,7 @@ export interface ToolApprovalRequirement {
 	expiresInMs: number;
 	/** Authority represented by a resulting grant. */
 	scope: ApprovalScopeKind;
-	/** Consume the grant after its first successful use. */
+	/** Consume the grant after its first successful authorization. */
 	oneShot: boolean;
 }
 

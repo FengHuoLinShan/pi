@@ -39,7 +39,7 @@ export type WriteToolInput = Static<typeof writeSchema>;
 export interface WriteToolDetails {
 	/** Revision before the write, or missing/unknown when the backend cannot provide one. */
 	beforeRevision: FileRevisionState;
-	/** Revision verified after the write. */
+	/** Revision verified after the write when the backend supports readback; otherwise the intended content revision. */
 	afterRevision: FileRevision;
 	/** Display-oriented diff when the previous content was available. */
 	diff?: string;

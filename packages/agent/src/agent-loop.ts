@@ -38,6 +38,7 @@ export function agentLoop(
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
+	validateRunBudget(config.runBudget);
 	const stream = createAgentStream();
 
 	void runAgentLoop(
@@ -78,6 +79,7 @@ export function agentLoopContinue(
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
+	validateRunBudget(config.runBudget);
 	const stream = createAgentStream();
 
 	void runAgentLoopContinue(
@@ -103,6 +105,7 @@ export async function runAgentLoop(
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
 ): Promise<AgentMessage[]> {
+	validateRunBudget(config.runBudget);
 	const newMessages: AgentMessage[] = [...prompts];
 	const currentContext: AgentContext = {
 		...context,
@@ -135,6 +138,7 @@ export async function runAgentLoopContinue(
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
+	validateRunBudget(config.runBudget);
 	const newMessages: AgentMessage[] = [];
 	const currentContext: AgentContext = { ...context };
 
@@ -168,6 +172,32 @@ type RunControl = {
 };
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function validateRunBudget(runBudget: AgentLoopConfig["runBudget"]): void {
+	if (!runBudget) return;
+
+	validateNonNegativeSafeInteger(runBudget.maxSteps, "maxSteps");
+	validateNonNegativeSafeInteger(runBudget.maxModelCalls, "maxModelCalls");
+	validateNonNegativeSafeInteger(runBudget.maxToolCalls, "maxToolCalls");
+	validateFiniteNonNegativeNumber(runBudget.maxWallTimeMs, "maxWallTimeMs");
+	validateFiniteNonNegativeNumber(runBudget.maxModelTokens, "maxModelTokens");
+	validateFiniteNonNegativeNumber(runBudget.maxCost, "maxCost");
+	validateFiniteNonNegativeNumber(runBudget.deadline, "deadline");
+}
+
+function validateNonNegativeSafeInteger(value: unknown, field: string): void {
+	if (value === undefined) return;
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+		throw new Error(`Agent run budget ${field} must be a non-negative safe integer`);
+	}
+}
+
+function validateFiniteNonNegativeNumber(value: unknown, field: string): void {
+	if (value === undefined) return;
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+		throw new Error(`Agent run budget ${field} must be a finite non-negative number`);
+	}
+}
 
 function createRunControl(config: AgentLoopConfig, signal: AbortSignal | undefined): RunControl {
 	const startedAt = Date.now();

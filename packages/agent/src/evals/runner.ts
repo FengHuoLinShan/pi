@@ -629,6 +629,16 @@ export function createAgentHarnessEvalBaseline(
 ): AgentHarnessEvalBaseline {
 	if (!report.passed) throw new Error("Refusing to create an eval baseline from a failing report");
 	validateAgentHarnessEvalThresholds(thresholds);
+	if (thresholds.requireReplayDeterminism) {
+		const replayFailures = report.scenarios
+			.filter((scenario) => !scenario.replay.enabled || !scenario.replay.deterministic)
+			.map((scenario) => scenario.id);
+		if (replayFailures.length > 0) {
+			throw new Error(
+				`Refusing to create an eval baseline without deterministic replay for: ${replayFailures.join(", ")}`,
+			);
+		}
+	}
 	return {
 		version: 1,
 		suiteName: report.suiteName,

@@ -10,6 +10,9 @@
 - Added an attested SDK execution-boundary contract for routing built-in tools and session bash through external OS, container, VM, or remote-sandbox backends, with fail-closed workspace, process, network, and environment policy validation.
 - Added local content-addressed artifact storage and recoverable process-session lifecycle primitives with artifact-backed output and execution-boundary binding.
 - Added a transport-independent, negotiated app protocol with strict JSON-RPC validation, typed Thread/Turn/Item events, reverse approval/input requests, and bounded cursor replay.
+
+### Changed
+
 - Changed SDK-created coding sessions with a selected model to run through the durable AgentHarness runtime while preserving the public `Agent` facade and extension lifecycle, with direct run-budget, loop-detection, and tool-policy configuration.
 
 ### Fixed

@@ -262,6 +262,7 @@ export class AgentHarness<
 	private followUpQueue: DurableQueuedMessage[] = [];
 	private followUpQueueMode: QueueMode;
 	private nextTurnQueue: DurableQueuedMessage[] = [];
+	private nextTurnContext?: AgentContext;
 	private consumedQueueItemIds: string[] = [];
 	private activeOperationId?: string;
 	private activeTurnId?: string;
@@ -657,8 +658,10 @@ export class AgentHarness<
 				await this.flushPendingSessionWrites();
 				const nextTurnState = await this.createTurnState();
 				setTurnState(nextTurnState);
+				const context = this.nextTurnContext ?? this.createContext(nextTurnState);
+				this.nextTurnContext = undefined;
 				return {
-					context: this.createContext(nextTurnState),
+					context,
 					model: nextTurnState.model,
 					thinkingLevel: nextTurnState.thinkingLevel,
 				};
@@ -1021,6 +1024,7 @@ export class AgentHarness<
 			try {
 				await this.flushPendingSessionWrites();
 			} finally {
+				this.nextTurnContext = undefined;
 				this.acceptsTurnInput = false;
 				this.runAbortController = undefined;
 			}
@@ -1064,7 +1068,7 @@ export class AgentHarness<
 	}
 
 	/** Run an application-prepared message batch without re-running text expansion hooks. */
-	async promptMessages(messages: AgentMessage[]): Promise<AssistantMessage> {
+	async promptMessages(messages: AgentMessage[], contextMessages?: AgentMessage[]): Promise<AssistantMessage> {
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
 		if (messages.length === 0) throw new AgentHarnessError("invalid_argument", "promptMessages() requires messages");
 		this.phase = "turn";
@@ -1072,7 +1076,9 @@ export class AgentHarness<
 		try {
 			await this.startRuntimeOperation("turn");
 			const turnState = await this.createTurnState();
-			return await this.executeRun(turnState, [...(await this.drainNextTurnMessages()), ...messages]);
+			return await this.executeRun(turnState, [...(await this.drainNextTurnMessages()), ...messages], {
+				contextMessages,
+			});
 		} catch (error) {
 			throw await this.normalizeOperationFailure(error, "unknown");
 		} finally {
@@ -1369,6 +1375,15 @@ export class AgentHarness<
 		return this.pendingSessionWrites.map((pending) => pending.write);
 	}
 
+	/** Replace the context returned at the next in-run save point. */
+	setNextTurnContext(context: AgentContext): void {
+		this.nextTurnContext = {
+			systemPrompt: context.systemPrompt,
+			messages: [...context.messages],
+			tools: context.tools ? [...context.tools] : undefined,
+		};
+	}
+
 	/** Update host-owned runtime projections without creating duplicate session entries. */
 	synchronizeRuntimeState(state: {
 		model: Model<any>;
@@ -1620,7 +1635,7 @@ export class AgentHarness<
 
 	async abort(): Promise<AbortResult> {
 		const activeRun = this.runAbortController;
-		activeRun?.abort();
+		this.requestAbort();
 		const errors: Error[] = [];
 		const clearedSteer = await this.discardQueuedMessages(this.steerQueue, "abort", errors);
 		const clearedFollowUp = await this.discardQueuedMessages(this.followUpQueue, "abort", errors);
@@ -1646,6 +1661,11 @@ export class AgentHarness<
 			throw normalizeHarnessError(cause, "hook");
 		}
 		return { clearedSteer, clearedFollowUp };
+	}
+
+	/** Abort the active model/tool run synchronously; asynchronous cleanup remains owned by {@link abort}. */
+	requestAbort(): void {
+		this.runAbortController?.abort();
 	}
 
 	async waitForIdle(): Promise<void> {

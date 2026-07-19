@@ -55,6 +55,14 @@ function isAgentEvent(event: AgentHarnessEvent): event is AgentEvent {
 	);
 }
 
+function cloneAgentContext(context: AgentContext): AgentContext {
+	return {
+		systemPrompt: context.systemPrompt,
+		messages: [...context.messages],
+		tools: context.tools ? [...context.tools] : undefined,
+	};
+}
+
 /**
  * Compatibility facade that keeps the public `Agent` surface while delegating turns,
  * queues, persistence, and recovery to the production AgentHarness.
@@ -80,6 +88,8 @@ export class CodingAgentHarnessRuntime extends Agent {
 	private nextScheduledQueueItemId = 0;
 	private scheduledQueueItems = new Map<number, "steer" | "follow_up">();
 	private lastTurnEnd?: Extract<AgentEvent, { type: "turn_end" }>;
+	private activeLoopContext?: AgentContext;
+	private currentRunMessages?: AgentMessage[];
 
 	constructor(options: CodingAgentHarnessRuntimeOptions) {
 		super(options);
@@ -178,23 +188,13 @@ export class CodingAgentHarnessRuntime extends Agent {
 
 	private installHarnessHooks(): void {
 		this.unsubscribeHarness = this.harness.subscribe(async (event, signal) => {
-			if (!isAgentEvent(event) || event.type === "message_end") return;
-			await this.dispatch(event, signal ?? this.harness.signal ?? new AbortController().signal);
-		});
-		this.harness.on("before_message_persist", async (event, _context, signal) => {
-			const index = this.state.messages.length;
-			this.state.messages.push(event.message);
-			try {
-				await this.dispatch(
-					{ type: "message_end", message: event.message },
-					signal ?? this.harness.signal ?? new AbortController().signal,
-				);
-			} catch (error) {
-				this.state.messages = this.state.messages.slice(0, index);
-				throw error;
+			if (!isAgentEvent(event)) return;
+			if (event.type === "message_end") {
+				this.state.messages.push(event.message);
+				this.currentRunMessages?.push(event.message);
+				this.activeLoopContext?.messages.push(event.message);
 			}
-			const message = this.state.messages[index] ?? event.message;
-			return message === event.message ? undefined : { message };
+			await this.dispatch(event, signal ?? this.harness.signal ?? new AbortController().signal);
 		});
 		this.harness.on("context", async (event, _context, signal) => {
 			if (!this.transformContext) return undefined;
@@ -249,7 +249,7 @@ export class CodingAgentHarnessRuntime extends Agent {
 			assistantMessage,
 			toolCall,
 			args,
-			context: this.createContext(),
+			context: this.activeLoopContext ? cloneAgentContext(this.activeLoopContext) : this.createContext(),
 		};
 	}
 
@@ -267,8 +267,8 @@ export class CodingAgentHarnessRuntime extends Agent {
 		const turn: PrepareNextTurnContext = {
 			message: this.lastTurnEnd.message,
 			toolResults: this.lastTurnEnd.toolResults,
-			context: this.createContext(),
-			newMessages: [],
+			context: this.activeLoopContext ? cloneAgentContext(this.activeLoopContext) : this.createContext(),
+			newMessages: [...(this.currentRunMessages ?? [])],
 		};
 		const update = this.prepareNextTurnWithContext
 			? await this.prepareNextTurnWithContext(turn, signal)
@@ -278,6 +278,10 @@ export class CodingAgentHarnessRuntime extends Agent {
 		if (update?.model) this.state.model = update.model;
 		if (update?.thinkingLevel) this.state.thinkingLevel = update.thinkingLevel;
 		this.synchronizeHarness();
+		if (update?.context) {
+			this.activeLoopContext = cloneAgentContext(update.context);
+			this.harness.setNextTurnContext(update.context);
+		}
 	}
 
 	private synchronizeHarness(): void {
@@ -333,12 +337,16 @@ export class CodingAgentHarnessRuntime extends Agent {
 				: [input];
 		this.streaming = true;
 		this.lastErrorMessage = undefined;
+		this.activeLoopContext = this.createContext();
+		this.currentRunMessages = [];
 		try {
-			await this.harness.promptMessages(messages);
+			await this.harness.promptMessages(messages, this.activeLoopContext.messages);
 		} finally {
 			this.streaming = false;
 			this.streamingMessage = undefined;
 			this.pendingToolCalls = new Set();
+			this.activeLoopContext = undefined;
+			this.currentRunMessages = undefined;
 		}
 	}
 
@@ -347,12 +355,16 @@ export class CodingAgentHarnessRuntime extends Agent {
 		await this.prepareHarness();
 		this.streaming = true;
 		this.lastErrorMessage = undefined;
+		this.activeLoopContext = this.createContext();
+		this.currentRunMessages = [];
 		try {
-			await this.harness.continue(this.state.messages);
+			await this.harness.continue(this.activeLoopContext.messages);
 		} finally {
 			this.streaming = false;
 			this.streamingMessage = undefined;
 			this.pendingToolCalls = new Set();
+			this.activeLoopContext = undefined;
+			this.currentRunMessages = undefined;
 		}
 	}
 
@@ -429,6 +441,7 @@ export class CodingAgentHarnessRuntime extends Agent {
 
 	override abort(): void {
 		if (!this.harnessRuntime) return;
+		this.harness.requestAbort();
 		this.scheduleControl(async () => {
 			await this.harness.abort();
 		});
@@ -445,6 +458,8 @@ export class CodingAgentHarnessRuntime extends Agent {
 		this.streamingMessage = undefined;
 		this.pendingToolCalls = new Set();
 		this.lastErrorMessage = undefined;
+		this.activeLoopContext = undefined;
+		this.currentRunMessages = undefined;
 		this.clearAllQueues();
 	}
 
