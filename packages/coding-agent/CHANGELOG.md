@@ -15,11 +15,13 @@
 - Added explicit Shadow Runs over comparable isolated overlays with completion-contract gates and caller-defined ranking.
 - Added an opt-in process-session completion verifier that keeps command output in ArtifactStore and exposes only structured status and opaque evidence references.
 - Added an opt-in workspace-change discipline verifier with synchronous or asynchronous PatchSet capture, path, operation, minimum/maximum file-count, and byte-count gates, and privacy-preserving completion evidence.
+- Added request-only safe context trimming for reproducible tool results and unsigned plaintext thinking, with content-free `context_trim` TUI, JSON, and RPC observability.
 
 ### Changed
 
 - Changed SDK-created coding sessions with a selected model to run through the durable AgentHarness runtime while preserving the public `Agent` facade and extension lifecycle, with direct run-budget, loop-detection, and tool-policy configuration.
 - Forwarded optional core tool-attempt outcomes through extension `tool_execution_end` events.
+- Changed compaction to use complete calibrated request estimates, reserve estimation and summary headroom, guard every final provider-ready request, validate up to two compact candidates, and fall back to non-persistent safe trimming for automatic overflow recovery.
 
 ### Fixed
 

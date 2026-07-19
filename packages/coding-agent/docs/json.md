@@ -16,11 +16,12 @@ type AgentSessionEvent =
   | { type: "queue_update"; steering: readonly string[]; followUp: readonly string[] }
   | { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
   | { type: "compaction_end"; reason: "manual" | "threshold" | "overflow"; result: CompactionResult | undefined; aborted: boolean; willRetry: boolean; errorMessage?: string }
+  | { type: "context_trim"; trimmedBlocks: number; toolResultTextBlocks: number; toolResultImages: number; thinkingBlocks: number; estimatedTokensBefore: number; estimatedTokensAfter: number; safeInputTokens: number; remainingOverage: number; protectedTokens?: number; succeeded: boolean }
   | { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
   | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
 ```
 
-`queue_update` emits the full pending steering and follow-up queues whenever they change. `compaction_start` and `compaction_end` cover both manual and automatic compaction.
+`queue_update` emits the full pending steering and follow-up queues whenever they change. `compaction_start` and `compaction_end` cover both manual and automatic compaction. `context_trim` reports only counts and token estimates for request-only trimming; it never includes trimmed content.
 
 Base events from [`AgentEvent`](https://github.com/earendil-works/pi-mono/blob/main/packages/agent/src/types.ts#L179):
 

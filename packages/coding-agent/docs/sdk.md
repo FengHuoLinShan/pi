@@ -326,9 +326,10 @@ session.subscribe((event) => {
     case "queue_update":
       console.log(event.steering, event.followUp);
       break;
-    case "compaction_start":
-    case "compaction_end":
-    case "auto_retry_start":
+		case "compaction_start":
+		case "compaction_end":
+		case "context_trim":
+		case "auto_retry_start":
     case "auto_retry_end":
       break;
   }

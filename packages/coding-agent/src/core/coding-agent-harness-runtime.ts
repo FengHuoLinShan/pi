@@ -170,6 +170,8 @@ export class CodingAgentHarnessRuntime extends Agent {
 			activeToolNames: this.state.tools.map((tool) => tool.name),
 			systemPrompt: () => this.state.systemPrompt,
 			convertToLlm: this.convertToLlm,
+			shouldStopBeforeModelRequest: async (context, signal) =>
+				(await this.shouldStopBeforeModelRequest?.(context, signal)) ?? false,
 			streamFn: async (model, context, options) => await this.streamFn(model, context, options),
 			streamOptions: this.getStreamOptions?.(),
 			steeringMode: this.steeringMode,

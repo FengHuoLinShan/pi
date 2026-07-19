@@ -1,4 +1,5 @@
 import type {
+	Context,
 	ImageContent,
 	Message,
 	Model,
@@ -14,6 +15,7 @@ import type {
 	AgentMessage,
 	AgentRunBudget,
 	AgentTool,
+	BeforeModelRequestContext,
 	QueueMode,
 	StreamFn,
 	ThinkingLevel,
@@ -866,6 +868,13 @@ export interface AgentHarnessOptions<
 	streamFn?: StreamFn;
 	/** Application message projection. Defaults to the harness generic converter. */
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+	/** Optional request-only transform after message conversion. */
+	transformModelRequestContext?: (context: Context, signal?: AbortSignal) => Context | Promise<Context>;
+	/** Optional graceful stop check over the final provider-ready context. */
+	shouldStopBeforeModelRequest?: (
+		context: BeforeModelRequestContext,
+		signal?: AbortSignal,
+	) => boolean | Promise<boolean>;
 	/** Optional hard limits for each user-initiated harness run. */
 	runBudget?: AgentRunBudget;
 	/** Optional repeated-tool-call detection for each user-initiated harness run. */

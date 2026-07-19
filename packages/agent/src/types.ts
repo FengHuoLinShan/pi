@@ -233,6 +233,14 @@ export interface AgentLoopTurnUpdate {
 
 export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 
+/** Final provider-ready request inspected immediately before a model call starts. */
+export interface BeforeModelRequestContext {
+	/** Model selected for the pending provider request. */
+	model: Model<any>;
+	/** Context after agent transforms and LLM message conversion. */
+	context: Context;
+}
+
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 
@@ -285,6 +293,22 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * ```
 	 */
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+
+	/**
+	 * Optional final transform applied after `convertToLlm` and before request guards.
+	 * Use this for request-only projections that must not mutate canonical agent history.
+	 */
+	transformModelRequestContext?: (context: Context, signal?: AbortSignal) => Context | Promise<Context>;
+
+	/**
+	 * Called after all context transformations, immediately before a
+	 * provider request and its run-budget counters start. Return true to end the
+	 * current run without sending the request.
+	 */
+	shouldStopBeforeModelRequest?: (
+		context: BeforeModelRequestContext,
+		signal?: AbortSignal,
+	) => boolean | Promise<boolean>;
 
 	/**
 	 * Resolves an API key dynamically for each LLM call.

@@ -252,6 +252,16 @@ export class AgentHarness<
 	private thinkingLevel: ThinkingLevel;
 	private systemPrompt: AgentHarnessOptions<TSkill, TPromptTemplate, TTool>["systemPrompt"];
 	private convertMessages: NonNullable<AgentHarnessOptions<TSkill, TPromptTemplate, TTool>["convertToLlm"]>;
+	private transformModelRequestContext: AgentHarnessOptions<
+		TSkill,
+		TPromptTemplate,
+		TTool
+	>["transformModelRequestContext"];
+	private shouldStopBeforeModelRequest: AgentHarnessOptions<
+		TSkill,
+		TPromptTemplate,
+		TTool
+	>["shouldStopBeforeModelRequest"];
 	private streamOptions: AgentHarnessStreamOptions;
 	private streamFn?: StreamFn;
 	private runBudget?: AgentRunBudget;
@@ -296,6 +306,8 @@ export class AgentHarness<
 		this.streamFn = options.streamFn;
 		this.systemPrompt = options.systemPrompt;
 		this.convertMessages = options.convertToLlm ?? convertToLlm;
+		this.transformModelRequestContext = options.transformModelRequestContext;
+		this.shouldStopBeforeModelRequest = options.shouldStopBeforeModelRequest;
 		this.runBudget = options.runBudget ? { ...options.runBudget } : undefined;
 		this.loopDetection = options.loopDetection ? { ...options.loopDetection } : undefined;
 		this.validateUniqueNames(
@@ -623,6 +635,8 @@ export class AgentHarness<
 			model: turnState.model,
 			reasoning: turnState.thinkingLevel === "off" ? undefined : turnState.thinkingLevel,
 			convertToLlm: this.convertMessages,
+			transformModelRequestContext: this.transformModelRequestContext,
+			shouldStopBeforeModelRequest: this.shouldStopBeforeModelRequest,
 			runBudget: turnState.runBudget,
 			loopDetection: turnState.loopDetection,
 			transformContext: async (messages) => {

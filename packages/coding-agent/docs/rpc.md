@@ -380,7 +380,7 @@ Response:
 }
 ```
 
-`estimatedTokensAfter` is a heuristic estimate over the rebuilt message context immediately after compaction, not a provider-exact token count.
+`estimatedTokensAfter` is the conservative calibrated estimate over the complete rebuilt provider context immediately after compaction, not a provider tokenizer result.
 
 #### set_auto_compaction
 
@@ -821,6 +821,7 @@ Events are streamed to stdout as JSON lines during agent operation. Events do NO
 | `queue_update` | Pending steering/follow-up queue changed |
 | `compaction_start` | Compaction begins |
 | `compaction_end` | Compaction completes |
+| `context_trim` | Request-only reproducible context trimming completes or fails closed |
 | `auto_retry_start` | Auto-retry begins (after transient error) |
 | `auto_retry_end` | Auto-retry completes (success or final failure) |
 | `extension_error` | Extension threw an error |
@@ -1008,6 +1009,25 @@ If `reason` was `"overflow"` and compaction succeeds, `willRetry` is `true` and 
 If compaction was aborted, `result` is `null` and `aborted` is `true`.
 
 If compaction failed (e.g., API quota exceeded), `result` is `null`, `aborted` is `false`, and `errorMessage` contains the error description.
+
+### context_trim
+
+Emitted when automatic overflow recovery trims only the provider request projection. It contains counts and token estimates, never message content. `succeeded: false` means protected content still exceeds the safe input budget and no provider request is sent.
+
+```json
+{
+  "type": "context_trim",
+  "trimmedBlocks": 2,
+  "toolResultTextBlocks": 1,
+  "toolResultImages": 1,
+  "thinkingBlocks": 0,
+  "estimatedTokensBefore": 180000,
+  "estimatedTokensAfter": 120000,
+  "safeInputTokens": 128000,
+  "remainingOverage": 0,
+  "succeeded": true
+}
+```
 
 ### auto_retry_start / auto_retry_end
 

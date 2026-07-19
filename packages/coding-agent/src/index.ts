@@ -35,13 +35,18 @@ export {
 	type BranchPreparation,
 	type BranchSummaryResult,
 	type CollectEntriesResult,
+	type CompactionBudgetReport,
+	type CompactionFitMode,
 	type CompactionResult,
+	type CompactionTrimReport,
+	type ContextBudgetEvaluation,
 	type CutPointResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateTokens,
+	evaluateContextBudget,
 	type FileOperations,
 	findCutPoint,
 	findTurnStartIndex,
@@ -52,6 +57,7 @@ export {
 	prepareBranchEntries,
 	serializeConversation,
 	shouldCompact,
+	validateCompactionTokenSettings,
 } from "./core/compaction/index.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
 export {

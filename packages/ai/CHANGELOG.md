@@ -5,6 +5,7 @@
 ### Added
 
 - Added provider/model capability profiles and canonical tool-schema compilation with stable hashes, provider views, loss diagnostics, and observable deferred-tool placement.
+- Added public conservative context token estimation for provider-ready messages, system prompts, tool definitions, images, framing, and provider signatures, with persisted same-model usage calibration.
 
 ### Fixed
 

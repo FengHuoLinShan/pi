@@ -27,7 +27,13 @@ export {
 } from "./agent-session-services.ts";
 export { type BashExecutorOptions, type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 export * from "./code-graph.ts";
-export type { CompactionResult } from "./compaction/index.ts";
+export type {
+	CompactionBudgetReport,
+	CompactionFitMode,
+	CompactionResult,
+	CompactionTrimReport,
+	ContextBudgetEvaluation,
+} from "./compaction/index.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./event-bus.ts";
 export { areExperimentalFeaturesEnabled } from "./experimental.ts";
 // Extensions system

@@ -88,15 +88,17 @@ describe("AgentSession.getSessionStats", () => {
 
 			const stats = session.getSessionStats();
 			expect(stats.contextUsage).toEqual(session.getContextUsage());
-			expect(stats.contextUsage?.tokens).toBe(200);
+			expect(stats.contextUsage?.tokens).toBe(stats.contextUsage?.rawTokens);
 			expect(stats.contextUsage?.contextWindow).toBe(model.contextWindow);
-			expect(stats.contextUsage?.percent).toBe((200 / model.contextWindow) * 100);
+			expect(stats.contextUsage?.estimateSource).toBe("heuristic");
+			expect(stats.contextUsage?.breakdown?.messageFraming).toBeGreaterThan(0);
+			expect(stats.contextUsage?.safeInputTokens).toBeLessThan(model.contextWindow);
 		} finally {
 			session.dispose();
 		}
 	});
 
-	it("reports unknown current context usage immediately after compaction", async () => {
+	it("reports a current context estimate immediately after compaction", async () => {
 		const { session, sessionManager } = await createSession();
 
 		try {
@@ -112,14 +114,15 @@ describe("AgentSession.getSessionStats", () => {
 			// Totals cover ALL entries, including history compacted away (180k + 195k).
 			expect(stats.tokens.input).toBe(375_000);
 			expect(stats.contextUsage).toBeDefined();
-			expect(stats.contextUsage?.tokens).toBeNull();
-			expect(stats.contextUsage?.percent).toBeNull();
+			expect(stats.contextUsage?.tokens).toBeGreaterThan(0);
+			expect(stats.contextUsage?.percent).toBeGreaterThan(0);
+			expect(stats.contextUsage?.estimateSource).toBe("heuristic");
 		} finally {
 			session.dispose();
 		}
 	});
 
-	it("uses post-compaction usage for current context instead of stale kept usage", async () => {
+	it("uses post-compaction same-model usage only as an upward calibration", async () => {
 		const { session, sessionManager } = await createSession();
 
 		try {
@@ -129,15 +132,18 @@ describe("AgentSession.getSessionStats", () => {
 			sessionManager.appendMessage(createAssistantMessage("response2", 195_000, 4));
 			sessionManager.appendCompaction("summary", keptUserId, 195_000);
 			sessionManager.appendMessage(createUserMessage("third", 5));
-			sessionManager.appendMessage(createAssistantMessage("response3", 25_000, 6));
+			const response3 = createAssistantMessage("response3", 25_000, 6);
+			response3.requestContextEstimate = { version: 1, heuristicInputTokens: 12_500 };
+			sessionManager.appendMessage(response3);
 			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
 			// Totals cover ALL entries, including history compacted away (180k + 195k + 25k).
 			expect(stats.tokens.input).toBe(400_000);
 			expect(stats.contextUsage).toBeDefined();
-			expect(stats.contextUsage?.tokens).toBe(25_000);
-			expect(stats.contextUsage?.percent).toBe((25_000 / model.contextWindow) * 100);
+			expect(stats.contextUsage?.calibrationFactor).toBe(2);
+			expect(stats.contextUsage?.estimateSource).toBe("calibrated");
+			expect(stats.contextUsage?.tokens).toBe((stats.contextUsage?.rawTokens ?? 0) * 2);
 		} finally {
 			session.dispose();
 		}
@@ -153,15 +159,17 @@ describe("AgentSession.getSessionStats", () => {
 			sessionManager.appendMessage(createAssistantMessage("response2", 195_000, 4));
 			sessionManager.appendCompaction("summary", keptUserId, 195_000);
 			sessionManager.appendMessage(createUserMessage("third", 5));
-			sessionManager.appendMessage(createAssistantMessage("response3", 25_000, 6));
+			const response3 = createAssistantMessage("response3", 25_000, 6);
+			response3.requestContextEstimate = { version: 1, heuristicInputTokens: 12_500 };
+			sessionManager.appendMessage(response3);
 			sessionManager.appendMessage(createUserMessage("continue", 7));
 			sessionManager.appendMessage(createAssistantMessage("partial", 0, 8));
 			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
 			expect(stats.contextUsage).toBeDefined();
-			expect(stats.contextUsage?.tokens).not.toBeNull();
-			expect(stats.contextUsage?.tokens ?? 0).toBeGreaterThan(25_000);
+			expect(stats.contextUsage?.calibrationFactor).toBe(2);
+			expect(stats.contextUsage?.tokens).toBe((stats.contextUsage?.rawTokens ?? 0) * 2);
 		} finally {
 			session.dispose();
 		}

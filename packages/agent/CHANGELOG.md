@@ -17,6 +17,8 @@
 - Added forkable trace replay with explicit event boundaries, model/tool overrides, branch integrity hashes, adapter-gated execution, and content-free outcome comparison.
 - Added explicit Verified Runs that compose one Harness turn with a completion contract, actual usage, structured status, and opaque artifact/evidence references.
 - Added low-sensitivity tool-attempt outcomes to `tool_execution_end` events, distinguishing non-execution, tool-body, and after-hook terminal paths while preserving legacy event compatibility.
+- Added an optional final provider-context guard that can gracefully stop an agent run immediately before any model request.
+- Added a final provider-context transform hook for request-only projections and persisted raw request estimates on assistant messages for token-estimator calibration.
 
 ### Changed
 

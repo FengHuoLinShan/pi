@@ -266,6 +266,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 				totalTokens: thresholdTokens,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
+			requestContextEstimate: { version: 1, heuristicInputTokens: 1 },
 			stopReason: "stop",
 			timestamp: Date.now(),
 		};

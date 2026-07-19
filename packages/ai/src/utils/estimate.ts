@@ -1,21 +1,60 @@
-import type { AssistantMessage, Context, ImageContent, Message, TextContent, Tool, Usage } from "../types.ts";
+import type { Context, ImageContent, Message, Model, TextContent, Tool, Usage } from "../types.ts";
+
+export interface ContextTokenBreakdown {
+	systemPrompt: number;
+	tools: number;
+	messages: number;
+	messageFraming: number;
+	contentFraming: number;
+	images: number;
+}
+
+export type ContextEstimateSource = "heuristic" | "calibrated";
 
 export interface ContextUsageEstimate {
-	/** Estimated total context tokens. */
+	/** Conservative full-context estimate after optional same-model calibration. */
 	tokens: number;
-	/** Tokens reported by the most recent applicable assistant usage block. */
+	/** Full-context estimate before calibration. */
+	rawTokens: number;
+	/** Upward-only same-model calibration factor. */
+	calibrationFactor: number;
+	/** Whether the result used only the heuristic or a persisted usage calibration. */
+	source: ContextEstimateSource;
+	/** Raw-token contribution by request component. */
+	breakdown: ContextTokenBreakdown;
+	/** Input tokens from the calibration response, or zero when unavailable. */
 	usageTokens: number;
-	/** Estimated tokens after the most recent applicable assistant usage block. */
+	/** @deprecated Full-context estimation no longer uses a usage prefix plus trailing estimate. */
 	trailingTokens: number;
-	/** Index of the applicable message that provided usage, or null when none exists. */
+	/** Index of the assistant message used for calibration, or null when unavailable. */
 	lastUsageIndex: number | null;
 }
 
-const CHARS_PER_TOKEN = 4;
-const ESTIMATED_IMAGE_CHARS = 4800;
+export interface ContextEstimateOptions {
+	/** Pending request model. Required for same-model calibration. */
+	model?: Pick<Model<any>, "api" | "provider" | "id">;
+	/** Disable persisted usage calibration when recording a request's raw estimate. */
+	calibrate?: boolean;
+}
+
+const ASCII_CODE_POINT_MAX = 0x7f;
+const ASCII_CODE_POINTS_PER_TOKEN = 4;
+const ESTIMATED_IMAGE_TOKENS = 1200;
+const MESSAGE_FRAMING_TOKENS = 4;
+const CONTENT_BLOCK_FRAMING_TOKENS = 1;
+const TOOL_FRAMING_TOKENS = 8;
+const MAX_ESTIMATION_MARGIN_TOKENS = 4096;
+
+export function calculateContextEstimationMarginTokens(contextWindow: number): number {
+	return Math.min(MAX_ESTIMATION_MARGIN_TOKENS, Math.ceil(contextWindow * 0.02));
+}
 
 export function calculateContextTokens(usage: Usage): number {
 	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+export function calculateInputTokens(usage: Usage): number {
+	return usage.input + usage.cacheRead + usage.cacheWrite;
 }
 
 function safeJsonStringify(value: unknown): string {
@@ -26,118 +65,187 @@ function safeJsonStringify(value: unknown): string {
 	}
 }
 
-function estimateTextAndImageContentChars(content: string | Array<TextContent | ImageContent>): number {
-	if (typeof content === "string") return content.length;
-
-	let chars = 0;
-	for (const block of content) chars += block.type === "text" ? block.text.length : ESTIMATED_IMAGE_CHARS;
-	return chars;
+export function estimateTextTokens(text: string): number {
+	let weightedCodePoints = 0;
+	for (const codePoint of text) {
+		weightedCodePoints += (codePoint.codePointAt(0) ?? 0) <= ASCII_CODE_POINT_MAX ? 1 : ASCII_CODE_POINTS_PER_TOKEN;
+	}
+	return Math.ceil(weightedCodePoints / ASCII_CODE_POINTS_PER_TOKEN);
 }
 
-export function estimateTextTokens(text: string): number {
-	return Math.ceil(text.length / CHARS_PER_TOKEN);
+function estimateOptionalText(text: string | undefined): number {
+	return text ? estimateTextTokens(text) : 0;
+}
+
+function emptyBreakdown(): ContextTokenBreakdown {
+	return {
+		systemPrompt: 0,
+		tools: 0,
+		messages: 0,
+		messageFraming: 0,
+		contentFraming: 0,
+		images: 0,
+	};
+}
+
+function estimateContentBlock(block: TextContent | ImageContent): { content: number; image: number } {
+	if (block.type === "image") return { content: 0, image: ESTIMATED_IMAGE_TOKENS };
+	return { content: estimateTextTokens(block.text) + estimateOptionalText(block.textSignature), image: 0 };
 }
 
 export function estimateTextAndImageContentTokens(content: string | Array<TextContent | ImageContent>): number {
-	return Math.ceil(estimateTextAndImageContentChars(content) / CHARS_PER_TOKEN);
+	if (typeof content === "string") {
+		return CONTENT_BLOCK_FRAMING_TOKENS + estimateTextTokens(content);
+	}
+	let tokens = 0;
+	for (const block of content) {
+		const estimate = estimateContentBlock(block);
+		tokens += CONTENT_BLOCK_FRAMING_TOKENS + estimate.content + estimate.image;
+	}
+	return tokens;
 }
 
 export function estimateMessageTokens(message: Message): number {
-	let chars = 0;
+	let tokens = MESSAGE_FRAMING_TOKENS;
 
-	if (message.role === "user") return estimateTextAndImageContentTokens(message.content);
-	if (message.role === "toolResult") return estimateTextAndImageContentTokens(message.content);
+	if (message.role === "user") return tokens + estimateTextAndImageContentTokens(message.content);
+	if (message.role === "toolResult") {
+		tokens +=
+			estimateTextTokens(message.toolCallId) +
+			estimateTextTokens(message.toolName) +
+			estimateTextTokens(safeJsonStringify(message.addedToolNames ?? []));
+		return tokens + estimateTextAndImageContentTokens(message.content);
+	}
 
+	tokens += estimateOptionalText(message.responseId);
 	for (const block of message.content) {
+		tokens += CONTENT_BLOCK_FRAMING_TOKENS;
 		if (block.type === "text") {
-			chars += block.text.length;
+			tokens += estimateTextTokens(block.text) + estimateOptionalText(block.textSignature);
 		} else if (block.type === "thinking") {
-			chars += block.thinking.length;
+			tokens += estimateTextTokens(block.thinking) + estimateOptionalText(block.thinkingSignature);
 		} else {
-			chars += block.name.length + safeJsonStringify(block.arguments).length;
+			tokens +=
+				estimateTextTokens(block.id) +
+				estimateTextTokens(block.name) +
+				estimateTextTokens(safeJsonStringify(block.arguments)) +
+				estimateOptionalText(block.thoughtSignature);
 		}
 	}
-	return Math.ceil(chars / CHARS_PER_TOKEN);
-}
-
-function getLastAssistantUsageInfo(messages: readonly Message[]): { usage: Usage; index: number } | undefined {
-	let latestPrefixTimestamp = Number.NEGATIVE_INFINITY;
-	let usageInfo: { usage: Usage; index: number } | undefined;
-
-	for (let i = 0; i < messages.length; i++) {
-		const message = messages[i];
-		if (message.role === "assistant") {
-			const assistant = message as AssistantMessage;
-			// A newer prefix message was inserted after this response (for example, a
-			// compaction summary), so its usage cannot describe the current prefix.
-			const usageAppliesToPrefix = assistant.timestamp >= latestPrefixTimestamp;
-			if (
-				usageAppliesToPrefix &&
-				assistant.stopReason !== "aborted" &&
-				assistant.stopReason !== "error" &&
-				calculateContextTokens(assistant.usage) > 0
-			) {
-				usageInfo = { usage: assistant.usage, index: i };
-			}
-		}
-		latestPrefixTimestamp = Math.max(latestPrefixTimestamp, message.timestamp);
-	}
-
-	return usageInfo;
-}
-
-function estimateMessages(messages: readonly Message[]): ContextUsageEstimate {
-	const usageInfo = getLastAssistantUsageInfo(messages);
-	if (usageInfo) {
-		const usageTokens = calculateContextTokens(usageInfo.usage);
-		let trailingTokens = 0;
-		for (let i = usageInfo.index + 1; i < messages.length; i++) {
-			trailingTokens += estimateMessageTokens(messages[i]);
-		}
-		return { tokens: usageTokens + trailingTokens, usageTokens, trailingTokens, lastUsageIndex: usageInfo.index };
-	}
-
-	let tokens = 0;
-	for (const message of messages) tokens += estimateMessageTokens(message);
-	return { tokens, usageTokens: 0, trailingTokens: tokens, lastUsageIndex: null };
+	return tokens;
 }
 
 function estimateToolsTokens(tools: readonly Tool[] | undefined): number {
-	if (!tools || tools.length === 0) return 0;
-	return estimateTextTokens(safeJsonStringify(tools));
+	let tokens = 0;
+	for (const tool of tools ?? []) {
+		tokens +=
+			TOOL_FRAMING_TOKENS +
+			estimateTextTokens(tool.name) +
+			estimateTextTokens(tool.description) +
+			estimateTextTokens(safeJsonStringify(tool.parameters));
+	}
+	return tokens;
+}
+
+function estimateRawContext(context: Context): { rawTokens: number; breakdown: ContextTokenBreakdown } {
+	const breakdown = emptyBreakdown();
+	breakdown.systemPrompt = estimateOptionalText(context.systemPrompt);
+	breakdown.tools = estimateToolsTokens(context.tools);
+
+	for (const message of context.messages) {
+		breakdown.messageFraming += MESSAGE_FRAMING_TOKENS;
+		if (message.role === "user") {
+			const blocks =
+				typeof message.content === "string" ? [{ type: "text" as const, text: message.content }] : message.content;
+			for (const block of blocks) {
+				breakdown.contentFraming += CONTENT_BLOCK_FRAMING_TOKENS;
+				const estimate = estimateContentBlock(block);
+				breakdown.messages += estimate.content;
+				breakdown.images += estimate.image;
+			}
+		} else if (message.role === "toolResult") {
+			breakdown.messages +=
+				estimateTextTokens(message.toolCallId) +
+				estimateTextTokens(message.toolName) +
+				estimateTextTokens(safeJsonStringify(message.addedToolNames ?? []));
+			for (const block of message.content) {
+				breakdown.contentFraming += CONTENT_BLOCK_FRAMING_TOKENS;
+				const estimate = estimateContentBlock(block);
+				breakdown.messages += estimate.content;
+				breakdown.images += estimate.image;
+			}
+		} else {
+			breakdown.messages += estimateOptionalText(message.responseId);
+			for (const block of message.content) {
+				breakdown.contentFraming += CONTENT_BLOCK_FRAMING_TOKENS;
+				if (block.type === "text") {
+					breakdown.messages += estimateTextTokens(block.text) + estimateOptionalText(block.textSignature);
+				} else if (block.type === "thinking") {
+					breakdown.messages += estimateTextTokens(block.thinking) + estimateOptionalText(block.thinkingSignature);
+				} else {
+					breakdown.messages +=
+						estimateTextTokens(block.id) +
+						estimateTextTokens(block.name) +
+						estimateTextTokens(safeJsonStringify(block.arguments)) +
+						estimateOptionalText(block.thoughtSignature);
+				}
+			}
+		}
+	}
+
+	return { rawTokens: Object.values(breakdown).reduce((sum, value) => sum + value, 0), breakdown };
+}
+
+function findCalibration(
+	messages: readonly Message[],
+	model: ContextEstimateOptions["model"],
+): { factor: number; usageTokens: number; index: number } | undefined {
+	if (!model) return undefined;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (
+			message.role !== "assistant" ||
+			message.api !== model.api ||
+			message.provider !== model.provider ||
+			message.model !== model.id ||
+			message.stopReason === "aborted" ||
+			message.stopReason === "error" ||
+			message.requestContextEstimate?.version !== 1 ||
+			message.requestContextEstimate.heuristicInputTokens <= 0
+		) {
+			continue;
+		}
+		const usageTokens = calculateInputTokens(message.usage);
+		if (usageTokens <= 0) continue;
+		const factor = usageTokens / message.requestContextEstimate.heuristicInputTokens;
+		if (!Number.isFinite(factor) || factor <= 1) return { factor: 1, usageTokens, index };
+		return { factor, usageTokens, index };
+	}
+	return undefined;
 }
 
 function isMessageArray(value: Context | readonly Message[]): value is readonly Message[] {
 	return Array.isArray(value);
 }
 
-export function estimateContextTokens(context: Context | readonly Message[]): ContextUsageEstimate {
-	if (isMessageArray(context)) return estimateMessages(context);
-
-	const estimate = estimateMessages(context.messages);
-	if (estimate.lastUsageIndex !== null) {
-		const addedNames = new Set(
-			context.messages
-				.slice(estimate.lastUsageIndex + 1)
-				.filter((message) => message.role === "toolResult")
-				.flatMap((message) => message.addedToolNames ?? []),
-		);
-		const addedToolTokens = estimateToolsTokens(context.tools?.filter((tool) => addedNames.has(tool.name)));
-		return {
-			tokens: estimate.tokens + addedToolTokens,
-			usageTokens: estimate.usageTokens,
-			trailingTokens: estimate.trailingTokens + addedToolTokens,
-			lastUsageIndex: estimate.lastUsageIndex,
-		};
-	}
-
-	const prefixTokens =
-		(context.systemPrompt ? estimateTextTokens(context.systemPrompt) : 0) + estimateToolsTokens(context.tools);
-
+export function estimateContextTokens(
+	contextOrMessages: Context | readonly Message[],
+	options: ContextEstimateOptions = {},
+): ContextUsageEstimate {
+	const context: Context = isMessageArray(contextOrMessages)
+		? { messages: [...contextOrMessages] }
+		: contextOrMessages;
+	const { rawTokens, breakdown } = estimateRawContext(context);
+	const calibration = options.calibrate === false ? undefined : findCalibration(context.messages, options.model);
+	const calibrationFactor = calibration?.factor ?? 1;
 	return {
-		tokens: estimate.tokens + prefixTokens,
-		usageTokens: estimate.usageTokens,
-		trailingTokens: estimate.trailingTokens + prefixTokens,
-		lastUsageIndex: estimate.lastUsageIndex,
+		tokens: Math.ceil(rawTokens * calibrationFactor),
+		rawTokens,
+		calibrationFactor,
+		source: calibrationFactor > 1 ? "calibrated" : "heuristic",
+		breakdown,
+		usageTokens: calibration?.usageTokens ?? 0,
+		trailingTokens: rawTokens,
+		lastUsageIndex: calibration?.index ?? null,
 	};
 }

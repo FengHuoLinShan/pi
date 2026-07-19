@@ -3082,6 +3082,19 @@ export class InteractiveMode {
 				break;
 			}
 
+			case "context_trim": {
+				if (event.succeeded) {
+					this.showStatus(`Trimmed ${event.trimmedBlocks} reproducible context block(s) for this model request`);
+				} else {
+					this.showError(
+						`Context exceeds the safe input budget by ${event.remainingOverage} estimated tokens after all reproducible content was trimmed. Protected content is approximately ${event.protectedTokens ?? event.estimatedTokensAfter} tokens.`,
+					);
+				}
+				this.footer.invalidate();
+				this.ui.requestRender();
+				break;
+			}
+
 			case "auto_retry_start": {
 				// Set up escape to abort retry
 				this.retryEscapeHandler = this.defaultEditor.onEscape;

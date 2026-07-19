@@ -7,6 +7,7 @@ import {
 	type AssistantMessage,
 	type Context,
 	EventStream,
+	estimateContextTokens,
 	streamSimple,
 	type ToolResultMessage,
 	validateToolArguments,
@@ -433,9 +434,24 @@ async function runLoop(
 					pendingMessages = [];
 				}
 
+				const llmContext = await prepareLlmContext(currentContext, config, control.signal);
+				if (
+					await config.shouldStopBeforeModelRequest?.({ model: config.model, context: llmContext }, control.signal)
+				) {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+
 				control.usage.steps++;
 				control.usage.modelCalls++;
-				const message = await streamAssistantResponse(currentContext, config, control.signal, emit, streamFn);
+				const message = await streamAssistantResponse(
+					currentContext,
+					llmContext,
+					config,
+					control.signal,
+					emit,
+					streamFn,
+				);
 				newMessages.push(message);
 				recordAssistantUsage(message, control);
 
@@ -571,34 +587,44 @@ function recordAssistantUsage(message: AssistantMessage, control: RunControl): v
 	control.usage.cost += Math.max(0, usage.cost.total || costParts);
 }
 
-/**
- * Stream an assistant response from the LLM.
- * This is where AgentMessage[] gets transformed to Message[] for the LLM.
- */
-async function streamAssistantResponse(
+async function prepareLlmContext(
 	context: AgentContext,
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
-	emit: AgentEventSink,
-	streamFn?: StreamFn,
-): Promise<AssistantMessage> {
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
+): Promise<Context> {
 	let messages = context.messages;
 	if (config.transformContext) {
 		messages = await config.transformContext(messages, signal);
 	}
 
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
-
-	// Build LLM context
 	const llmContext: Context = {
 		systemPrompt: context.systemPrompt,
-		messages: llmMessages,
+		messages: await config.convertToLlm(messages),
 		tools: context.tools,
 	};
+	return config.transformModelRequestContext
+		? await config.transformModelRequestContext(llmContext, signal)
+		: llmContext;
+}
 
+/**
+ * Stream an assistant response from the LLM.
+ * The provider-ready context has already passed request guards.
+ */
+async function streamAssistantResponse(
+	context: AgentContext,
+	llmContext: Context,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFn?: StreamFn,
+): Promise<AssistantMessage> {
 	const streamFunction = streamFn || streamSimple;
+	const requestContextEstimate = {
+		version: 1 as const,
+		heuristicInputTokens: estimateContextTokens(llmContext, { calibrate: false }).rawTokens,
+	};
+	const finalizeMessage = (message: AssistantMessage): AssistantMessage => ({ ...message, requestContextEstimate });
 
 	// Resolve API key (important for expiring tokens)
 	const resolvedApiKey =
@@ -644,7 +670,7 @@ async function streamAssistantResponse(
 
 			case "done":
 			case "error": {
-				const finalMessage = await response.result();
+				const finalMessage = finalizeMessage(await response.result());
 				if (addedPartial) {
 					context.messages[context.messages.length - 1] = finalMessage;
 				} else {
@@ -659,7 +685,7 @@ async function streamAssistantResponse(
 		}
 	}
 
-	const finalMessage = await response.result();
+	const finalMessage = finalizeMessage(await response.result());
 	if (addedPartial) {
 		context.messages[context.messages.length - 1] = finalMessage;
 	} else {

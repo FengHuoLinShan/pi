@@ -4,6 +4,7 @@ LLMs have limited context windows. When conversations grow too long, pi uses com
 
 **Source files** ([pi-mono](https://github.com/earendil-works/pi-mono)):
 - [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Auto-compaction logic
+- [`packages/coding-agent/src/core/compaction/budget.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/budget.ts) - Final-context budget validation
 - [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
 - [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
 - [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
@@ -26,23 +27,30 @@ Both use the same structured summary format and track file operations cumulative
 
 ### When It Triggers
 
-Auto-compaction triggers when:
+Auto-compaction uses this safe input limit:
 
 ```
-contextTokens > contextWindow - reserveTokens
+estimationMarginTokens = min(4096, ceil(contextWindow * 0.02))
+safeInputTokens = contextWindow - reserveTokens - estimationMarginTokens
 ```
 
-By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). This leaves room for the LLM's response.
+Immediately before every provider request, pi estimates the complete final transformed context, including multilingual text, messages and content framing, images, system prompt, tool definitions, tool arguments, and provider signatures. A successful response from the same model can calibrate this conservative estimate upward, but never downward. If the request exceeds `safeInputTokens`, pi stops before contacting the provider, compacts, and resumes the pending turn. The existing post-response threshold and overflow checks remain as recovery paths.
+
+By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). This leaves room for the LLM's response. `reserveTokens` must be positive and smaller than the selected model's context window.
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
 
 ### How It Works
 
-1. **Find cut point**: Walk backwards from newest message, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`) is reached
-2. **Extract messages**: Collect messages from the previous kept boundary (or session start) up to the cut point
-3. **Generate summary**: Call LLM to summarize with structured format, passing the previous summary as iterative context when present
-4. **Append entry**: Save `CompactionEntry` with summary and `firstKeptEntryId`
-5. **Reload**: Session reloads, using summary + messages from `firstKeptEntryId` onwards
+1. **Set the recent-history target**: Treat `keepRecentTokens` (default 20k) as an upper target and reduce it when the safe input budget cannot accommodate fixed context and summary headroom. Summary headroom is capped at the model output limit, 80% of `reserveTokens`, and 8192 tokens; split turns reserve up to twice that amount.
+2. **Find cut point**: Walk backwards from the newest message, accumulating token estimates until the effective recent-history target is reached
+3. **Extract messages**: Collect messages from the previous kept boundary (or session start) up to the cut point
+4. **Generate summary**: Call LLM to summarize with structured format, passing the previous summary as iterative context when present
+5. **Validate the candidate**: Rebuild the exact post-compaction provider context and estimate it against `safeInputTokens`
+6. **Retry once if needed**: If the candidate is too large, lower the recent-history target, request a shorter checkpoint, and regenerate once. Manual and extension-provided compactions fail if they still exceed the budget.
+7. **Trim a request projection when automatic recovery still cannot fit**: Replace old tool-result images, truncate old tool-result text, then truncate unsigned, non-redacted plaintext thinking. User input, system prompt, tools, assistant text, tool calls, signed/redacted thinking, and summaries are never trimmed. If protected content alone is too large, the provider request is blocked.
+8. **Append entry**: Save only a validated `CompactionEntry` with its summary and `firstKeptEntryId`. Request trimming never changes JSONL history, exports, or later session history.
+9. **Reload**: Session reloads, using summary + messages from `firstKeptEntryId` onwards.
 
 ```
 Before compaction:
@@ -137,10 +145,13 @@ interface CompactionEntry<T = unknown> {
 interface CompactionDetails {
   readFiles: string[];
   modifiedFiles: string[];
+  budget?: CompactionBudgetReport;
 }
 ```
 
-Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure.
+`CompactionResult` also exposes `estimatedTokensAfter` and a `budget` report containing before/after estimates, context window, response reserve, estimation margin, fixed-prefix cost, summary headroom, configured and effective recent-history targets, generation attempts, and fit mode. Default compaction persists that report in `details.budget` alongside file operations.
+
+Extensions can store any JSON-serializable data in `details`. Extension-provided compactions keep their custom details shape, but pi still rebuilds and validates their final context before saving. An over-budget extension result fails instead of being regenerated by the default summarizer.
 
 See [`prepareCompaction()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) and [`compact()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) for the implementation.
 
@@ -285,6 +296,9 @@ pi.on("session_before_compact", async (event, ctx) => {
   // preparation.tokensBefore - context tokens before compaction
   // preparation.firstKeptEntryId - where kept messages start
   // preparation.settings - compaction settings
+  // preparation.effectiveKeepRecentTokens - model-adapted recent-history target
+  // preparation.estimatedTokensBefore - complete provider-context estimate before compaction
+  // preparation.summaryHeadroomTokens - response space reserved for the checkpoint
 
   // branchEntries - all entries on current branch (for custom state)
   // reason - "manual" (/compact), "threshold", or "overflow"
@@ -390,7 +404,7 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Enable auto-compaction |
-| `reserveTokens` | `16384` | Tokens to reserve for LLM response |
-| `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
+| `reserveTokens` | `16384` | Positive token count reserved for the response; must be smaller than the model context window |
+| `keepRecentTokens` | `20000` | Non-negative upper target for recent tokens to keep; pi may reduce it to fit the selected model |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.

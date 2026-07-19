@@ -15,6 +15,7 @@ import {
 	type SessionEntry,
 	sessionEntryToContextMessages,
 } from "../session-manager.ts";
+import type { CompactionBudgetReport } from "./budget.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -33,6 +34,7 @@ import {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	budget?: CompactionBudgetReport;
 }
 
 /**
@@ -89,6 +91,7 @@ export interface CompactionResult<T = unknown> {
 	firstKeptEntryId: string;
 	tokensBefore: number;
 	estimatedTokensAfter?: number;
+	budget?: CompactionBudgetReport;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
 }
@@ -170,8 +173,8 @@ function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; in
 }
 
 /**
- * Estimate context tokens from messages, using the last assistant usage when available.
- * If there are messages after the last usage, estimate their tokens with estimateTokens.
+ * Legacy message-only estimate used for compaction cut-point preparation.
+ * Provider-request safety uses the complete Context estimator from pi-ai.
  */
 export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
@@ -628,11 +631,18 @@ export interface CompactionPreparation {
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
 	settings: CompactionSettings;
+	/** Actual recent-token target after model-window adaptation. */
+	effectiveKeepRecentTokens?: number;
+	/** Complete provider-context estimate before compaction. */
+	estimatedTokensBefore?: number;
+	/** Summary space reserved while solving the recent-history target. */
+	summaryHeadroomTokens?: number;
 }
 
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	effectiveKeepRecentTokens = settings.keepRecentTokens,
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -658,7 +668,7 @@ export function prepareCompaction(
 
 	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
 
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, effectiveKeepRecentTokens);
 
 	// Get UUID of first kept entry
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
@@ -708,6 +718,7 @@ export function prepareCompaction(
 		previousSummary,
 		fileOps,
 		settings,
+		effectiveKeepRecentTokens,
 	};
 }
 

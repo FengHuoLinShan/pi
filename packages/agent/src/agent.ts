@@ -1,4 +1,5 @@
 import {
+	type Context,
 	type ImageContent,
 	type Message,
 	type Model,
@@ -19,6 +20,7 @@ import type {
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	BeforeModelRequestContext,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
 	PrepareNextTurnContext,
@@ -98,6 +100,11 @@ export interface AgentOptions {
 	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>;
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+	transformModelRequestContext?: (context: Context, signal?: AbortSignal) => Context | Promise<Context>;
+	shouldStopBeforeModelRequest?: (
+		context: BeforeModelRequestContext,
+		signal?: AbortSignal,
+	) => boolean | Promise<boolean>;
 	streamFn?: StreamFn;
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 	onPayload?: SimpleStreamOptions["onPayload"];
@@ -176,6 +183,11 @@ export class Agent {
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+	public transformModelRequestContext?: (context: Context, signal?: AbortSignal) => Context | Promise<Context>;
+	public shouldStopBeforeModelRequest?: (
+		context: BeforeModelRequestContext,
+		signal?: AbortSignal,
+	) => boolean | Promise<boolean>;
 	public streamFn: StreamFn;
 	public getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 	public onPayload?: SimpleStreamOptions["onPayload"];
@@ -211,6 +223,8 @@ export class Agent {
 		this._state = createMutableAgentState(options.initialState);
 		this.convertToLlm = options.convertToLlm ?? defaultConvertToLlm;
 		this.transformContext = options.transformContext;
+		this.transformModelRequestContext = options.transformModelRequestContext;
+		this.shouldStopBeforeModelRequest = options.shouldStopBeforeModelRequest;
 		this.streamFn = options.streamFn ?? streamSimple;
 		this.getApiKey = options.getApiKey;
 		this.onPayload = options.onPayload;
@@ -454,6 +468,8 @@ export class Agent {
 					: undefined,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
+			transformModelRequestContext: this.transformModelRequestContext,
+			shouldStopBeforeModelRequest: this.shouldStopBeforeModelRequest,
 			getApiKey: this.getApiKey,
 			getSteeringMessages: async () => {
 				if (skipInitialSteeringPoll) {

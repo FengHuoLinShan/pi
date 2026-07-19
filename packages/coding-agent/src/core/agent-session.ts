@@ -27,6 +27,7 @@ import type {
 import type {
 	AssistantMessage,
 	AuthResult,
+	Context,
 	ImageContent,
 	Message,
 	Model,
@@ -51,15 +52,22 @@ import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
+	COMPACTION_RETRY_MARGIN_TOKENS,
+	type CompactionBudgetReport,
+	type CompactionDetails,
+	type CompactionPreparation,
 	type CompactionResult,
-	calculateContextTokens,
+	type CompactionSettings,
+	calculateEstimationMarginTokens,
+	calculateSummaryHeadroomTokens,
 	collectEntriesForBranchSummary,
 	compact,
-	estimateContextTokens,
-	estimateTokens,
+	estimateFixedPrefixTokens,
+	evaluateContextBudget,
 	generateBranchSummary,
 	prepareCompaction,
-	shouldCompact,
+	trimContextToBudget,
+	validateCompactionTokenSettings,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { type ExecutionBoundary, filterBoundaryEnvironment, resolveExecutionBoundary } from "./execution-boundary.ts";
@@ -92,13 +100,18 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
-import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
+import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
+import {
+	buildSessionContext,
+	CURRENT_SESSION_VERSION,
+	getLatestCompactionEntry,
+	type SessionHeader,
+} from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -150,6 +163,19 @@ export type AgentSessionEvent =
 			followUp: readonly string[];
 	  }
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| {
+			type: "context_trim";
+			trimmedBlocks: number;
+			toolResultTextBlocks: number;
+			toolResultImages: number;
+			thinkingBlocks: number;
+			estimatedTokensBefore: number;
+			estimatedTokensAfter: number;
+			safeInputTokens: number;
+			remainingOverage: number;
+			protectedTokens?: number;
+			succeeded: boolean;
+	  }
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
@@ -271,14 +297,6 @@ interface ToolDefinitionEntry {
 	sourceInfo: SourceInfo;
 }
 
-function estimateMessagesTokens(messages: AgentMessage[]): number {
-	let tokens = 0;
-	for (const message of messages) {
-		tokens += estimateTokens(message);
-	}
-	return tokens;
-}
-
 // ============================================================================
 // Constants
 // ============================================================================
@@ -315,6 +333,11 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _proactiveCompactionPending = false;
+	private _requestTrimEnabled = false;
+	private _requestTrimBlocked = false;
+	private _lastBudgetContextMessageCount = 0;
+	private _requestProjection: { context: Context; sourceMessageCount: number } | undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -403,6 +426,8 @@ export class AgentSession {
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
+		this._installAgentRequestContextTransform();
+		this._installAgentRequestBudgetGuard();
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -552,6 +577,68 @@ export class AgentSession {
 		};
 	}
 
+	private _installAgentRequestContextTransform(): void {
+		const previousTransform = this.agent.transformModelRequestContext;
+		this.agent.transformModelRequestContext = async (requestContext, signal) => {
+			let projectedContext = requestContext;
+			if (this._requestProjection) {
+				projectedContext = {
+					...this._requestProjection.context,
+					systemPrompt: requestContext.systemPrompt,
+					tools: requestContext.tools,
+					messages: [
+						...this._requestProjection.context.messages,
+						...requestContext.messages.slice(this._requestProjection.sourceMessageCount),
+					],
+				};
+			}
+			const transformedContext = previousTransform
+				? await previousTransform(projectedContext, signal)
+				: projectedContext;
+			if (!this._requestTrimEnabled || signal?.aborted) return transformedContext;
+
+			const settings = this.settingsManager.getCompactionSettings();
+			const result = trimContextToBudget(transformedContext, this.agent.state.model, settings.reserveTokens);
+			this._requestTrimBlocked = result.evaluation.overBudget;
+			this._emit({
+				type: "context_trim",
+				...result.stats,
+				safeInputTokens: result.evaluation.safeInputTokens,
+				remainingOverage: result.evaluation.overBudgetBy,
+				protectedTokens: result.protectedTokens,
+				succeeded: !result.evaluation.overBudget,
+			});
+			return result.context;
+		};
+	}
+
+	private _installAgentRequestBudgetGuard(): void {
+		const previousGuard = this.agent.shouldStopBeforeModelRequest;
+		this.agent.shouldStopBeforeModelRequest = async (request, signal) => {
+			if (await previousGuard?.(request, signal)) return true;
+			if (signal?.aborted) return false;
+
+			const settings = this.settingsManager.getCompactionSettings();
+			if (!settings.enabled || request.model.contextWindow <= 0) return false;
+
+			try {
+				validateCompactionTokenSettings(settings, request.model.contextWindow);
+				const evaluation = evaluateContextBudget(request.context, request.model, settings.reserveTokens);
+				this._lastBudgetContextMessageCount = request.context.messages.length;
+				if (!evaluation.overBudget) return false;
+			} catch {
+				// Stop before sending; the compaction path emits the actionable error.
+			}
+
+			if (this._requestTrimEnabled) {
+				this._requestTrimBlocked = true;
+				return true;
+			}
+			this._proactiveCompactionPending = true;
+			return true;
+		};
+	}
+
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -698,18 +785,6 @@ export class AgentSession {
 		if (typeof content === "string") return content;
 		const textBlocks = content.filter((c) => c.type === "text");
 		return textBlocks.map((c) => (c as TextContent).text).join("");
-	}
-
-	/** Find the last assistant message in agent state (including aborted ones) */
-	private _findLastAssistantMessage(): AssistantMessage | undefined {
-		const messages = this.agent.state.messages;
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const msg = messages[i];
-			if (msg.role === "assistant") {
-				return msg as AssistantMessage;
-			}
-		}
-		return undefined;
 	}
 
 	private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
@@ -1081,12 +1156,20 @@ export class AgentSession {
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
 		this._isAgentRunActive = true;
+		this._requestTrimEnabled = false;
+		this._requestTrimBlocked = false;
+		this._requestProjection = undefined;
+		this._proactiveCompactionPending = false;
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
 		} finally {
+			this._requestTrimEnabled = false;
+			this._requestTrimBlocked = false;
+			this._requestProjection = undefined;
+			this._proactiveCompactionPending = false;
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
 			await this._emitAgentSettled();
@@ -1096,6 +1179,11 @@ export class AgentSession {
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
+		if (this._proactiveCompactionPending) {
+			this._proactiveCompactionPending = false;
+			return await this._runAutoCompaction("threshold", true, true);
+		}
+		if (this._requestTrimBlocked) return false;
 		if (!msg) {
 			return false;
 		}
@@ -1213,13 +1301,6 @@ export class AgentSession {
 					);
 				}
 				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
-			}
-
-			// Check if we need to compact before sending (catches aborted responses).
-			// The user's new prompt is sent below, so do not call agent.continue() here.
-			const lastAssistant = this._findLastAssistantMessage();
-			if (lastAssistant) {
-				await this._checkCompaction(lastAssistant, false);
 			}
 
 			// Build messages array (custom message if any, then user message)
@@ -1796,6 +1877,238 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private _prepareBudgetedCompaction(
+		pathEntries: SessionEntry[],
+		settings: CompactionSettings,
+		model: Model<any>,
+	): CompactionPreparation | undefined {
+		validateCompactionTokenSettings(settings, model.contextWindow);
+		const safeInputTokens =
+			model.contextWindow - settings.reserveTokens - calculateEstimationMarginTokens(model.contextWindow);
+		const fixedPrefixTokens = estimateFixedPrefixTokens({
+			systemPrompt: this.agent.state.systemPrompt,
+			tools: this.agent.state.tools,
+		});
+		if (fixedPrefixTokens >= safeInputTokens) {
+			throw new Error(
+				`Compaction cannot fit the system prompt and tool definitions (${fixedPrefixTokens} estimated tokens) within the safe input budget (${safeInputTokens})`,
+			);
+		}
+
+		let summaryHeadroomTokens = calculateSummaryHeadroomTokens(model, settings.reserveTokens, false);
+		let effectiveKeepRecentTokens = Math.min(
+			settings.keepRecentTokens,
+			Math.max(0, safeInputTokens - fixedPrefixTokens - summaryHeadroomTokens),
+		);
+		let preparation = prepareCompaction(pathEntries, settings, effectiveKeepRecentTokens);
+		if (preparation?.isSplitTurn) {
+			summaryHeadroomTokens = calculateSummaryHeadroomTokens(model, settings.reserveTokens, true);
+			effectiveKeepRecentTokens = Math.min(
+				settings.keepRecentTokens,
+				Math.max(0, safeInputTokens - fixedPrefixTokens - summaryHeadroomTokens),
+			);
+			preparation = prepareCompaction(pathEntries, settings, effectiveKeepRecentTokens);
+		}
+		if (preparation) {
+			preparation.summaryHeadroomTokens = summaryHeadroomTokens;
+			preparation.estimatedTokensBefore = evaluateContextBudget(
+				{
+					systemPrompt: this.agent.state.systemPrompt,
+					messages: convertToLlm(buildSessionContext(pathEntries).messages),
+					tools: this.agent.state.tools,
+				},
+				model,
+				settings.reserveTokens,
+			).estimatedTokens;
+		}
+		return preparation;
+	}
+
+	private async _projectCompactionContext(
+		pathEntries: SessionEntry[],
+		result: CompactionResult,
+		signal: AbortSignal,
+	): Promise<Context> {
+		if (!pathEntries.some((entry) => entry.id === result.firstKeptEntryId)) {
+			throw new Error(`Compaction firstKeptEntryId was not found on the active branch: ${result.firstKeptEntryId}`);
+		}
+		const parentId = pathEntries[pathEntries.length - 1]?.id ?? null;
+		const projectedEntry: CompactionEntry = {
+			type: "compaction",
+			id: "__projected_compaction__",
+			parentId,
+			timestamp: new Date().toISOString(),
+			summary: result.summary,
+			firstKeptEntryId: result.firstKeptEntryId,
+			tokensBefore: result.tokensBefore,
+			details: result.details,
+		};
+		let messages = buildSessionContext([...pathEntries, projectedEntry]).messages;
+		if (this.agent.transformContext) {
+			messages = await this.agent.transformContext(messages, signal);
+		}
+		return {
+			systemPrompt: this.agent.state.systemPrompt,
+			messages: await this.agent.convertToLlm(messages),
+			tools: this.agent.state.tools,
+		};
+	}
+
+	private async _evaluateCompactionResult(
+		pathEntries: SessionEntry[],
+		result: CompactionResult,
+		settings: CompactionSettings,
+		model: Model<any>,
+		preparation: CompactionPreparation,
+		attempts: number,
+		fromExtension: boolean,
+		signal: AbortSignal,
+	): Promise<{ result: CompactionResult; overBudget: boolean; overBudgetBy: number }> {
+		const context = await this._projectCompactionContext(pathEntries, result, signal);
+		const evaluation = evaluateContextBudget(context, model, settings.reserveTokens);
+		const fixedPrefixTokens = estimateFixedPrefixTokens({
+			systemPrompt: context.systemPrompt,
+			tools: context.tools,
+		});
+		const budget: CompactionBudgetReport = {
+			contextWindow: model.contextWindow,
+			reserveTokens: settings.reserveTokens,
+			estimationMarginTokens: evaluation.estimationMarginTokens,
+			safeInputTokens: evaluation.safeInputTokens,
+			fixedPrefixTokens,
+			summaryHeadroomTokens:
+				preparation.summaryHeadroomTokens ??
+				calculateSummaryHeadroomTokens(model, settings.reserveTokens, preparation.isSplitTurn),
+			configuredKeepRecentTokens: settings.keepRecentTokens,
+			effectiveKeepRecentTokens: preparation.effectiveKeepRecentTokens ?? settings.keepRecentTokens,
+			estimatedTokensBefore: preparation.estimatedTokensBefore ?? preparation.tokensBefore + fixedPrefixTokens,
+			estimatedTokensAfter: evaluation.estimatedTokens,
+			attempts,
+			fitMode: evaluation.overBudget ? "trim_required" : "compacted",
+		};
+		let details = result.details;
+		if (!fromExtension) {
+			const generatedDetails = result.details as CompactionDetails | undefined;
+			details = {
+				readFiles: generatedDetails?.readFiles ?? [],
+				modifiedFiles: generatedDetails?.modifiedFiles ?? [],
+				budget,
+			} satisfies CompactionDetails;
+		}
+		return {
+			result: {
+				...result,
+				estimatedTokensAfter: evaluation.estimatedTokens,
+				budget,
+				details,
+			},
+			overBudget: evaluation.overBudget,
+			overBudgetBy: evaluation.overBudgetBy,
+		};
+	}
+
+	private async _generateValidatedCompaction(
+		pathEntries: SessionEntry[],
+		initialPreparation: CompactionPreparation,
+		settings: CompactionSettings,
+		model: Model<any>,
+		auth: { apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> },
+		customInstructions: string | undefined,
+		signal: AbortSignal,
+		allowOverBudgetCandidate = false,
+	): Promise<CompactionResult> {
+		let preparation = initialPreparation;
+		let generationInstructions = customInstructions;
+		let smallestCandidate: CompactionResult | undefined;
+		let smallestCandidateTokens = Number.POSITIVE_INFINITY;
+
+		for (let attempts = 1; attempts <= 2; attempts++) {
+			const effectiveKeepRecentTokens = preparation.effectiveKeepRecentTokens ?? settings.keepRecentTokens;
+			const generated = await compact(
+				preparation,
+				model,
+				auth.apiKey,
+				auth.headers,
+				generationInstructions,
+				signal,
+				this.thinkingLevel,
+				this.agent.streamFn,
+				auth.env,
+			);
+			if (signal.aborted) throw new Error("Compaction cancelled");
+
+			const evaluated = await this._evaluateCompactionResult(
+				pathEntries,
+				generated,
+				settings,
+				model,
+				preparation,
+				attempts,
+				false,
+				signal,
+			);
+			if (!evaluated.overBudget) return evaluated.result;
+			if ((evaluated.result.estimatedTokensAfter ?? Number.POSITIVE_INFINITY) < smallestCandidateTokens) {
+				smallestCandidate = evaluated.result;
+				smallestCandidateTokens = evaluated.result.estimatedTokensAfter ?? Number.POSITIVE_INFINITY;
+			}
+			if (attempts === 2) {
+				if (allowOverBudgetCandidate && smallestCandidate) return smallestCandidate;
+				throw new Error(
+					`Compaction still exceeds the safe input budget by ${evaluated.overBudgetBy} estimated tokens after two attempts`,
+				);
+			}
+
+			const nextKeepRecentTokens = Math.max(
+				0,
+				effectiveKeepRecentTokens - evaluated.overBudgetBy - COMPACTION_RETRY_MARGIN_TOKENS,
+			);
+			const nextPreparation = prepareCompaction(pathEntries, settings, nextKeepRecentTokens);
+			if (!nextPreparation) {
+				throw new Error("Compaction cannot retain a valid continuation while fitting the safe input budget");
+			}
+			nextPreparation.estimatedTokensBefore = initialPreparation.estimatedTokensBefore;
+			nextPreparation.summaryHeadroomTokens = calculateSummaryHeadroomTokens(
+				model,
+				settings.reserveTokens,
+				nextPreparation.isSplitTurn,
+			);
+			preparation = nextPreparation;
+			const retryInstruction = `The previous checkpoint exceeded the safe input budget by ${evaluated.overBudgetBy} estimated tokens. Produce a substantially shorter checkpoint while preserving only continuation-critical facts.`;
+			generationInstructions = customInstructions
+				? `${customInstructions}\n\n${retryInstruction}`
+				: retryInstruction;
+		}
+
+		throw new Error("Compaction failed to produce a validated result");
+	}
+
+	private async _validateExtensionCompaction(
+		pathEntries: SessionEntry[],
+		preparation: CompactionPreparation,
+		result: CompactionResult,
+		settings: CompactionSettings,
+		model: Model<any>,
+		signal: AbortSignal,
+	): Promise<CompactionResult> {
+		const evaluated = await this._evaluateCompactionResult(
+			pathEntries,
+			result,
+			settings,
+			model,
+			preparation,
+			1,
+			true,
+			signal,
+		);
+		if (evaluated.overBudget) {
+			throw new Error(
+				`Extension compaction exceeds the safe input budget by ${evaluated.overBudgetBy} estimated tokens`,
+			);
+		}
+		return evaluated.result;
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
@@ -1817,7 +2130,7 @@ export class AgentSession {
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
 
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = this._prepareBudgetedCompaction(pathEntries, settings, this.model);
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -1851,50 +2164,41 @@ export class AgentSession {
 				}
 			}
 
-			let summary: string;
-			let firstKeptEntryId: string;
-			let tokensBefore: number;
-			let details: unknown;
-
-			if (extensionCompaction) {
-				// Extension provided compaction content
-				summary = extensionCompaction.summary;
-				firstKeptEntryId = extensionCompaction.firstKeptEntryId;
-				tokensBefore = extensionCompaction.tokensBefore;
-				details = extensionCompaction.details;
-			} else {
-				// Generate compaction result
-				const result = await compact(
-					preparation,
-					this.model,
-					apiKey,
-					headers,
-					customInstructions,
-					this._compactionAbortController.signal,
-					this.thinkingLevel,
-					this.agent.streamFn,
-					env,
-				);
-				summary = result.summary;
-				firstKeptEntryId = result.firstKeptEntryId;
-				tokensBefore = result.tokensBefore;
-				details = result.details;
-			}
+			const compactionResult = extensionCompaction
+				? await this._validateExtensionCompaction(
+						pathEntries,
+						preparation,
+						extensionCompaction,
+						settings,
+						this.model,
+						this._compactionAbortController.signal,
+					)
+				: await this._generateValidatedCompaction(
+						pathEntries,
+						preparation,
+						settings,
+						this.model,
+						{ apiKey, headers, env },
+						customInstructions,
+						this._compactionAbortController.signal,
+					);
 
 			if (this._compactionAbortController.signal.aborted) {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
-			const newEntries = this.sessionManager.getEntries();
+			const compactionEntryId = this.sessionManager.appendCompaction(
+				compactionResult.summary,
+				compactionResult.firstKeptEntryId,
+				compactionResult.tokensBefore,
+				compactionResult.details,
+				fromExtension,
+			);
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
-			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
 			// Get the saved compaction entry for the extension event
-			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
-				| CompactionEntry
-				| undefined;
+			const savedCompactionEntry = this.sessionManager.getEntry(compactionEntryId) as CompactionEntry | undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
 				await this._extensionRunner.emit({
@@ -1906,13 +2210,6 @@ export class AgentSession {
 				});
 			}
 
-			const compactionResult: CompactionResult = {
-				summary,
-				firstKeptEntryId,
-				tokensBefore,
-				estimatedTokensAfter,
-				details,
-			};
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
@@ -1956,14 +2253,14 @@ export class AgentSession {
 
 	/**
 	 * Check if compaction is needed and run it.
-	 * Called after agent_end and before prompt submission.
+	 * Called after agent_end. Final provider requests also have a separate budget guard.
 	 *
 	 * Two cases:
 	 * 1. Overflow: LLM returned context overflow error, remove error message from agent state, compact, auto-retry
 	 * 2. Threshold: Context over threshold, compact, NO auto-retry (user continues manually)
 	 *
 	 * @param assistantMessage The assistant message to check
-	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
+	 * @param skipAbortedCheck Whether to ignore aborted assistant messages. Default: true
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
@@ -1972,14 +2269,15 @@ export class AgentSession {
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return false;
 
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const model = this.model;
+		if (!model) return false;
+		const contextWindow = model.contextWindow;
 
 		// Skip overflow check if the message came from a different model.
 		// This handles the case where user switched from a smaller-context model (e.g. opus)
 		// to a larger-context model (e.g. codex) - the overflow error from the old model
 		// shouldn't trigger compaction for the new model.
-		const sameModel =
-			this.model && assistantMessage.provider === this.model.provider && assistantMessage.model === this.model.id;
+		const sameModel = assistantMessage.provider === model.provider && assistantMessage.model === model.id;
 
 		// Skip compaction checks if this assistant message is older than the latest
 		// compaction boundary. This prevents a stale pre-compaction usage/error
@@ -2025,32 +2323,18 @@ export class AgentSession {
 			return await this._runAutoCompaction("overflow", willRetry);
 		}
 
-		// Case 2: Threshold - context is getting large
-		// For error messages or all-zero usage messages, estimate from the last valid response.
-		// This ensures sessions that hit persistent API errors (e.g. 529) or malformed zero-usage
-		// responses can still compact and do not reset context accounting.
-		let contextTokens: number;
-		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
-		if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
-			const messages = this.agent.state.messages;
-			const estimate = estimateContextTokens(messages);
-			if (estimate.lastUsageIndex === null) return false; // No usage data at all
-			// Verify the usage source is post-compaction. Kept pre-compaction messages
-			// have stale usage reflecting the old (larger) context and would falsely
-			// trigger compaction right after one just finished.
-			const usageMsg = messages[estimate.lastUsageIndex];
-			if (
-				compactionEntry &&
-				usageMsg.role === "assistant" &&
-				(usageMsg as AssistantMessage).timestamp <= new Date(compactionEntry.timestamp).getTime()
-			) {
-				return false;
-			}
-			contextTokens = estimate.tokens;
-		} else {
-			contextTokens = directContextTokens;
-		}
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
+		// Case 2: estimate the complete current request shape. Same-model usage only
+		// calibrates the conservative heuristic; it never replaces a context prefix.
+		const evaluation = evaluateContextBudget(
+			{
+				systemPrompt: this.agent.state.systemPrompt,
+				messages: convertToLlm(this.agent.state.messages),
+				tools: this.agent.state.tools,
+			},
+			model,
+			settings.reserveTokens,
+		);
+		if (evaluation.overBudget) {
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
@@ -2059,38 +2343,43 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		required = false,
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
+		const canTrimRequestProjection = required || willRetry;
 
 		try {
 			if (!this.model) {
-				return false;
-			}
-
-			let apiKey: string | undefined;
-			let headers: Record<string, string> | undefined;
-			let env: Record<string, string> | undefined;
-			if (this.agent.streamFn === streamSimple) {
-				const authResult = await this._modelRuntime.getAuth(this.model);
-				if (!authResult?.auth.apiKey) return false;
-				apiKey = authResult.auth.apiKey;
-				headers = withoutDeletedHeaders(authResult.auth.headers);
-				env = authResult.env;
-			} else {
-				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model));
+				if (!required) return false;
+				throw new Error(formatNoModelSelectedMessage());
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
 
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = this._prepareBudgetedCompaction(pathEntries, settings, this.model);
 			if (!preparation) {
-				return false;
+				if (!required) return false;
+				this._emit({ type: "compaction_start", reason });
+				this._emit({
+					type: "compaction_end",
+					reason,
+					result: undefined,
+					aborted: false,
+					willRetry: true,
+				});
+				this._requestTrimEnabled = true;
+				this._requestTrimBlocked = false;
+				return true;
 			}
 
 			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
 			started = true;
+			const { apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
@@ -2107,14 +2396,7 @@ export class AgentSession {
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (extensionResult?.cancel) {
-					this._emit({
-						type: "compaction_end",
-						reason,
-						result: undefined,
-						aborted: true,
-						willRetry: false,
-					});
-					return false;
+					throw new Error("Compaction cancelled");
 				}
 
 				if (extensionResult?.compaction) {
@@ -2123,35 +2405,25 @@ export class AgentSession {
 				}
 			}
 
-			let summary: string;
-			let firstKeptEntryId: string;
-			let tokensBefore: number;
-			let details: unknown;
-
-			if (extensionCompaction) {
-				// Extension provided compaction content
-				summary = extensionCompaction.summary;
-				firstKeptEntryId = extensionCompaction.firstKeptEntryId;
-				tokensBefore = extensionCompaction.tokensBefore;
-				details = extensionCompaction.details;
-			} else {
-				// Generate compaction result
-				const compactResult = await compact(
-					preparation,
-					this.model,
-					apiKey,
-					headers,
-					undefined,
-					this._autoCompactionAbortController.signal,
-					this.thinkingLevel,
-					this.agent.streamFn,
-					env,
-				);
-				summary = compactResult.summary;
-				firstKeptEntryId = compactResult.firstKeptEntryId;
-				tokensBefore = compactResult.tokensBefore;
-				details = compactResult.details;
-			}
+			const result = extensionCompaction
+				? await this._validateExtensionCompaction(
+						pathEntries,
+						preparation,
+						extensionCompaction,
+						settings,
+						this.model,
+						this._autoCompactionAbortController.signal,
+					)
+				: await this._generateValidatedCompaction(
+						pathEntries,
+						preparation,
+						settings,
+						this.model,
+						{ apiKey, headers, env },
+						undefined,
+						this._autoCompactionAbortController.signal,
+						canTrimRequestProjection,
+					);
 
 			if (this._autoCompactionAbortController.signal.aborted) {
 				this._emit({
@@ -2164,16 +2436,33 @@ export class AgentSession {
 				return false;
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
-			const newEntries = this.sessionManager.getEntries();
+			if (result.budget?.fitMode === "trim_required") {
+				this._requestProjection = {
+					context: await this._projectCompactionContext(
+						pathEntries,
+						result,
+						this._autoCompactionAbortController.signal,
+					),
+					sourceMessageCount: this._lastBudgetContextMessageCount,
+				};
+				this._requestTrimEnabled = true;
+				this._requestTrimBlocked = false;
+				this._emit({ type: "compaction_end", reason, result: undefined, aborted: false, willRetry: true });
+				return true;
+			}
+
+			const compactionEntryId = this.sessionManager.appendCompaction(
+				result.summary,
+				result.firstKeptEntryId,
+				result.tokensBefore,
+				result.details,
+				fromExtension,
+			);
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
-			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
 			// Get the saved compaction entry for the extension event
-			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
-				| CompactionEntry
-				| undefined;
+			const savedCompactionEntry = this.sessionManager.getEntry(compactionEntryId) as CompactionEntry | undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
 				await this._extensionRunner.emit({
@@ -2185,13 +2474,6 @@ export class AgentSession {
 				});
 			}
 
-			const result: CompactionResult = {
-				summary,
-				firstKeptEntryId,
-				tokensBefore,
-				estimatedTokensAfter,
-				details,
-			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
 
 			if (willRetry) {
@@ -2208,18 +2490,32 @@ export class AgentSession {
 			return this.agent.hasQueuedMessages();
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
+			const aborted =
+				errorMessage === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError");
+			const willTrimRequestProjection = !aborted && canTrimRequestProjection;
+			if (required && !started) {
+				this._emit({ type: "compaction_start", reason });
+				started = true;
+			}
 			if (started) {
 				this._emit({
 					type: "compaction_end",
 					reason,
 					result: undefined,
-					aborted: false,
-					willRetry: false,
-					errorMessage:
-						reason === "overflow"
+					aborted,
+					willRetry: willTrimRequestProjection,
+					errorMessage: aborted
+						? undefined
+						: reason === "overflow"
 							? `Context overflow recovery failed: ${errorMessage}`
 							: `Auto-compaction failed: ${errorMessage}`,
 				});
+			}
+			if (willTrimRequestProjection) {
+				this._requestProjection = undefined;
+				this._requestTrimEnabled = true;
+				this._requestTrimBlocked = false;
+				return true;
 			}
 			return false;
 		} finally {
@@ -3181,42 +3477,28 @@ export class AgentSession {
 		const contextWindow = model.contextWindow ?? 0;
 		if (contextWindow <= 0) return undefined;
 
-		// After compaction, the last assistant usage reflects pre-compaction context size.
-		// We can only trust usage from an assistant that responded after the latest compaction.
-		// If no such assistant exists, context token count is unknown until the next LLM response.
-		const branchEntries = this.sessionManager.getBranch();
-		const latestCompaction = getLatestCompactionEntry(branchEntries);
-
-		if (latestCompaction) {
-			// Check if there's a valid assistant usage after the compaction boundary
-			const compactionIndex = branchEntries.lastIndexOf(latestCompaction);
-			let hasPostCompactionUsage = false;
-			for (let i = branchEntries.length - 1; i > compactionIndex; i--) {
-				const entry = branchEntries[i];
-				if (entry.type === "message" && entry.message.role === "assistant") {
-					const assistant = entry.message;
-					if (assistant.stopReason !== "aborted" && assistant.stopReason !== "error") {
-						const contextTokens = calculateContextTokens(assistant.usage);
-						if (contextTokens > 0) {
-							hasPostCompactionUsage = true;
-							break;
-						}
-					}
-				}
-			}
-
-			if (!hasPostCompactionUsage) {
-				return { tokens: null, contextWindow, percent: null };
-			}
-		}
-
-		const estimate = estimateContextTokens(this.messages);
-		const percent = (estimate.tokens / contextWindow) * 100;
+		const settings = this.settingsManager.getCompactionSettings();
+		const evaluation = evaluateContextBudget(
+			{
+				systemPrompt: this.agent.state.systemPrompt,
+				messages: convertToLlm(this.messages),
+				tools: this.agent.state.tools,
+			},
+			model,
+			settings.reserveTokens,
+		);
+		const percent = (evaluation.estimatedTokens / contextWindow) * 100;
 
 		return {
-			tokens: estimate.tokens,
+			tokens: evaluation.estimatedTokens,
 			contextWindow,
 			percent,
+			rawTokens: evaluation.rawEstimatedTokens,
+			calibrationFactor: evaluation.calibrationFactor,
+			estimateSource: evaluation.estimateSource,
+			breakdown: evaluation.breakdown,
+			safeInputTokens: evaluation.safeInputTokens,
+			estimationMarginTokens: evaluation.estimationMarginTokens,
 		};
 	}
 

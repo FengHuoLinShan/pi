@@ -1028,7 +1028,7 @@ pi.on("tool_call", (event, ctx) => {
 
 ### ctx.getContextUsage()
 
-Returns current context usage for the active model. Uses last assistant usage when available, then estimates tokens for trailing messages.
+Returns a conservative complete-context estimate for the active model, including system prompt, tools, framing, images, and signatures. Same-model provider usage may calibrate the estimate upward. The result also exposes the raw estimate, calibration factor/source, component breakdown, safe input limit, and estimation margin.
 
 ```typescript
 const usage = ctx.getContextUsage();
