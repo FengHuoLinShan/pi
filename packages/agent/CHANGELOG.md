@@ -7,10 +7,27 @@
 - Added a deterministic AgentHarness eval runner with declarative faux-provider scenarios, semantic replay checks, JSON reports, and baseline quality gates for local and CI regression testing.
 - Added privacy-safe telemetry, redacted checksummed trace bundles, and five-level UI/state/model/tool/live replay with explicit recording availability.
 - Added structured `ToolSpec` declarations with explicit retry-safety metadata, deterministic tool policy decisions, exact resolved-action-bound approval requests and grants, one-shot grant tracking, and native fail-closed `AgentHarness`/loop adapters.
+- Added an opt-in, content-minimized tool-policy authorization observer whose failures cannot affect authorization outcomes.
+- Added an opt-in per-run Harness discipline audit and construction-snapshotted completion verifier for privacy-minimized authorization, execution-start, and settlement correlation.
 - Added typed, source-aware `AgentHarness` hooks with ordered reducers, cleanup scopes, explicit error policy, and a stable hook context facade.
 - Added optional low-level agent run budgets, absolute deadlines, structured termination events, and configurable repeated-tool-call loop detection.
 - Added a session-backed canonical runtime event store with pure replay/checkpoint reduction, conservative interrupted-run recovery, and partial JSONL tail repair.
 - Added deterministic context compilation with budgeted source selection, repository maps, and freshness-aware evidence ledgers.
+- Added explicit completion contracts with deterministic verifier reports, context trust labels with prompt-injection containment and provenance, capability-based model routing, and one-action structured recovery plans.
+- Added forkable trace replay with explicit event boundaries, model/tool overrides, branch integrity hashes, adapter-gated execution, and content-free outcome comparison.
+- Added explicit Verified Runs that compose one Harness turn with a completion contract, actual usage, structured status, and opaque artifact/evidence references.
+- Added low-sensitivity tool-attempt outcomes to `tool_execution_end` events, distinguishing non-execution, tool-body, and after-hook terminal paths while preserving legacy event compatibility.
+
+### Changed
+
+- Added privacy-safe provider completion and tool-result telemetry dimensions for model compatibility analysis without capturing content.
+- Projected bounded tool-attempt outcomes into privacy-safe telemetry and upgraded Harness discipline audit snapshots to version 2 with aggregate terminal-outcome policies and anomalies.
+
+### Fixed
+
+- Fixed AgentHarness terminal settlement, startup abort barriers, concurrent durable callback writes, final follow-up closure, and an abort race that could wait on a newer run.
+- Fixed parallel tool preflight to skip prepared tool bodies when cancellation arrives before body invocation.
+- Fixed tool-attempt finalization so hostile before-hook result getters, unstringifiable thrown values, and rejected update listeners produce classified end events instead of interrupting the event sequence.
 
 ## [0.80.10] - 2026-07-16
 

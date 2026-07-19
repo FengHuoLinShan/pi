@@ -106,6 +106,7 @@ import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-promp
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
+import type { WorkspaceOverlay } from "./workspace-overlay.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -191,6 +192,8 @@ export interface AgentSessionConfig {
 	customTools?: ToolDefinition[];
 	/** Optional attested boundary for built-in tools and session bash execution. */
 	executionBoundary?: ExecutionBoundary;
+	/** Optional explicit materialized workspace for built-in tools and session bash execution. */
+	workspaceOverlay?: WorkspaceOverlay;
 	/** Canonical model/auth runtime used by coding-agent internals. */
 	modelRuntime: ModelRuntime;
 	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
@@ -338,6 +341,7 @@ export class AgentSession {
 	private _excludedToolNames?: Set<string>;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _executionBoundary?: ExecutionBoundary;
+	private _workspaceOverlay?: WorkspaceOverlay;
 	private _agentOwnsSessionPersistence: boolean;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
@@ -365,6 +369,12 @@ export class AgentSession {
 		if (config.executionBoundary && config.baseToolsOverride) {
 			throw new Error("baseToolsOverride cannot be combined with executionBoundary");
 		}
+		if (config.executionBoundary && config.workspaceOverlay) {
+			throw new Error("executionBoundary cannot be combined with workspaceOverlay");
+		}
+		if (config.workspaceOverlay && config.baseToolsOverride) {
+			throw new Error("baseToolsOverride cannot be combined with workspaceOverlay");
+		}
 		if (config.executionBoundary && config.customTools && config.customTools.length > 0) {
 			throw new Error(
 				"customTools cannot be enabled with executionBoundary because they execute in the host process",
@@ -385,6 +395,7 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._executionBoundary = config.executionBoundary;
+		this._workspaceOverlay = config.workspaceOverlay;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 
 		// Always subscribe to agent events for internal handling
@@ -401,6 +412,10 @@ export class AgentSession {
 
 	get modelRuntime(): ModelRuntime {
 		return this._modelRuntime;
+	}
+
+	get workspaceOverlay(): WorkspaceOverlay | undefined {
+		return this._workspaceOverlay;
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -792,6 +807,7 @@ export class AgentSession {
 				toolName: event.toolName,
 				result: event.result,
 				isError: event.isError,
+				...(event.attemptOutcome === undefined ? {} : { attemptOutcome: event.attemptOutcome }),
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		}
@@ -2558,6 +2574,7 @@ export class AgentSession {
 				)
 			: createAllToolDefinitions(this._cwd, {
 					boundary: this._executionBoundary,
+					overlay: this._workspaceOverlay,
 					read: { autoResizeImages },
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
@@ -2745,6 +2762,14 @@ export class AgentSession {
 			this._bashAbortController = undefined;
 			throw new Error("Cannot override bash operations when an execution boundary is configured");
 		}
+		if (this._workspaceOverlay && options?.operations) {
+			this._bashAbortController = undefined;
+			throw new Error("Cannot override bash operations when a workspace overlay is configured");
+		}
+		if (this._workspaceOverlay && this._workspaceOverlay.getState() !== "active") {
+			this._bashAbortController = undefined;
+			throw new Error(`Cannot execute bash with a ${this._workspaceOverlay.getState()} workspace overlay`);
+		}
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
 		const prefix = this.settingsManager.getShellCommandPrefix();
@@ -2760,7 +2785,7 @@ export class AgentSession {
 		try {
 			const result = await executeBashWithOperations(
 				resolvedCommand,
-				boundary?.cwd ?? this.sessionManager.getCwd(),
+				boundary?.cwd ?? this._workspaceOverlay?.getWorkingDirectory() ?? this.sessionManager.getCwd(),
 				bashOperations,
 				{
 					onChunk,

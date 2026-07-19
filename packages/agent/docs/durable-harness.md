@@ -227,6 +227,10 @@ JSONL session open also repairs a malformed final line only when the line is unt
 5. Unfinished tool calls are never retried automatically; retry-safe metadata only makes them eligible for an explicit host decision.
 6. Provider streams resume only from durable boundaries.
 
+## Related explicit primitives
+
+Runtime recovery only restores durable state and marks interrupted work. Applications that need acceptance gates, capability-based routing, or a visible retry/fallback decision can use the separate [completion contracts, model routing, and structured recovery](completion-routing-recovery.md) APIs. These primitives return reports or plans and never start an autonomous retry loop.
+
 ## Open questions
 
 - Which remaining harness config entries should move into session first: resources, stream options, system prompt refs?

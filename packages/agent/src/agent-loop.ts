@@ -23,6 +23,7 @@ import type {
 	AgentToolCall,
 	AgentToolResult,
 	StreamFn,
+	ToolAttemptOutcome,
 } from "./types.ts";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
@@ -452,6 +453,7 @@ async function runLoop(
 					const toolResults = await failToolCallsWithoutExecution(
 						toolCalls,
 						`Run terminated before tool execution: ${postModelTermination.reason}`,
+						terminationToToolAttemptOutcome(postModelTermination),
 						emit,
 					);
 					for (const result of toolResults) {
@@ -705,6 +707,21 @@ function planToolCalls(toolCalls: AgentToolCall[], control: RunControl): ToolCal
 	};
 }
 
+function terminationToToolAttemptOutcome(
+	termination: AgentRunTermination,
+): Extract<ToolAttemptOutcome, "not_executed_budget" | "not_executed_deadline" | "not_executed_loop"> {
+	switch (termination.status) {
+		case "budget_exhausted":
+			return "not_executed_budget";
+		case "deadline_exceeded":
+			return "not_executed_deadline";
+		case "loop_detected":
+			return "not_executed_loop";
+	}
+	const exhaustive: never = termination;
+	return exhaustive;
+}
+
 function detectRepeatedToolCall(
 	toolCall: AgentToolCall,
 	admittedInBatch: AgentToolCall[],
@@ -769,7 +786,7 @@ function stableValueSignature(value: unknown): string {
 	try {
 		return JSON.stringify(normalize(value));
 	} catch (error) {
-		return `[unserializable:${error instanceof Error ? error.message : String(error)}]`;
+		return `[unserializable:${errorMessage(error)}]`;
 	}
 }
 
@@ -852,6 +869,7 @@ async function failToolCallsFromTruncatedMessage(
 				`Tool call "${toolCall.name}" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.`,
 			),
 			isError: true,
+			attemptOutcome: "not_executed_truncated",
 		};
 		await emitToolExecutionEnd(finalized, emit);
 		const toolResultMessage = createToolResultMessage(finalized);
@@ -865,6 +883,7 @@ async function failToolCallsFromTruncatedMessage(
 			...(await failToolCallsWithoutExecution(
 				plan.blocked,
 				`Tool call was not executed: ${plan.termination.reason}`,
+				terminationToToolAttemptOutcome(plan.termination),
 				emit,
 			)),
 		);
@@ -876,6 +895,7 @@ async function failToolCallsFromTruncatedMessage(
 async function failToolCallsWithoutExecution(
 	toolCalls: AgentToolCall[],
 	reason: string,
+	attemptOutcome: Extract<ToolAttemptOutcome, "not_executed_budget" | "not_executed_deadline" | "not_executed_loop">,
 	emit: AgentEventSink,
 ): Promise<ToolResultMessage[]> {
 	const messages: ToolResultMessage[] = [];
@@ -890,6 +910,7 @@ async function failToolCallsWithoutExecution(
 			toolCall,
 			result: createErrorToolResult(reason),
 			isError: true,
+			attemptOutcome,
 		};
 		await emitToolExecutionEnd(finalized, emit);
 		const message = createToolResultMessage(finalized);
@@ -923,6 +944,7 @@ async function executeToolCalls(
 			...(await failToolCallsWithoutExecution(
 				plan.blocked,
 				`Tool call was not executed: ${plan.termination.reason}`,
+				terminationToToolAttemptOutcome(plan.termination),
 				emit,
 			)),
 		);
@@ -966,6 +988,7 @@ async function executeToolCallsSequential(
 				toolCall,
 				result: preparation.result,
 				isError: preparation.isError,
+				attemptOutcome: preparation.attemptOutcome,
 			};
 		} else {
 			const executed = await executePreparedToolCall(preparation, control.signal, emit);
@@ -990,6 +1013,7 @@ async function executeToolCallsSequential(
 				...(await failToolCallsWithoutExecution(
 					toolCalls.slice(index + 1),
 					`Tool call was not executed: ${loopTermination.reason}`,
+					"not_executed_loop",
 					emit,
 				)),
 			);
@@ -1032,6 +1056,7 @@ async function executeToolCallsParallel(
 				toolCall,
 				result: preparation.result,
 				isError: preparation.isError,
+				attemptOutcome: preparation.attemptOutcome,
 			} satisfies FinalizedToolCallOutcome;
 			await emitToolExecutionEnd(finalized, emit);
 			finalizedCalls.push(finalized);
@@ -1088,17 +1113,27 @@ type ImmediateToolCallOutcome = {
 	kind: "immediate";
 	result: AgentToolResult<any>;
 	isError: boolean;
+	attemptOutcome: Extract<
+		ToolAttemptOutcome,
+		| "not_executed_missing_tool"
+		| "not_executed_preparation_error"
+		| "not_executed_before_hook_error"
+		| "not_executed_blocked"
+		| "not_executed_aborted_before_body"
+	>;
 };
 
 type ExecutedToolCallOutcome = {
 	result: AgentToolResult<any>;
 	isError: boolean;
+	attemptOutcome: Extract<ToolAttemptOutcome, "not_executed_aborted_before_body" | "body_success" | "body_error">;
 };
 
 type FinalizedToolCallOutcome = {
 	toolCall: AgentToolCall;
 	result: AgentToolResult<any>;
 	isError: boolean;
+	attemptOutcome: ToolAttemptOutcome;
 };
 
 type FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>);
@@ -1121,6 +1156,22 @@ function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall)
 	};
 }
 
+function createImmediateToolCallOutcome(
+	message: string,
+	attemptOutcome: ImmediateToolCallOutcome["attemptOutcome"],
+): ImmediateToolCallOutcome {
+	return { kind: "immediate", result: createErrorToolResult(message), isError: true, attemptOutcome };
+}
+
+function errorMessage(error: unknown): string {
+	try {
+		const message = error instanceof Error ? error.message : String(error);
+		return typeof message === "string" ? message : "Unknown error";
+	} catch {
+		return "Unknown error";
+	}
+}
+
 async function prepareToolCall(
 	currentContext: AgentContext,
 	assistantMessage: AssistantMessage,
@@ -1128,19 +1179,30 @@ async function prepareToolCall(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
-	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
-	if (!tool) {
-		return {
-			kind: "immediate",
-			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
-			isError: true,
-		};
+	if (signal?.aborted) {
+		return createImmediateToolCallOutcome("Operation aborted", "not_executed_aborted_before_body");
 	}
 
+	let tool: AgentTool<any> | undefined;
+	try {
+		tool = currentContext.tools?.find((candidate) => candidate.name === toolCall.name);
+	} catch (error) {
+		return createImmediateToolCallOutcome(errorMessage(error), "not_executed_preparation_error");
+	}
+	if (!tool) {
+		return createImmediateToolCallOutcome(`Tool ${toolCall.name} not found`, "not_executed_missing_tool");
+	}
+
+	let validatedArgs: unknown;
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
-		const validatedArgs = validateToolArguments(tool, preparedToolCall);
-		if (config.beforeToolCall) {
+		validatedArgs = validateToolArguments(tool, preparedToolCall);
+	} catch (error) {
+		return createImmediateToolCallOutcome(errorMessage(error), "not_executed_preparation_error");
+	}
+
+	if (config.beforeToolCall) {
+		try {
 			const beforeResult = await config.beforeToolCall(
 				{
 					assistantMessage,
@@ -1151,40 +1213,25 @@ async function prepareToolCall(
 				signal,
 			);
 			if (signal?.aborted) {
-				return {
-					kind: "immediate",
-					result: createErrorToolResult("Operation aborted"),
-					isError: true,
-				};
+				return createImmediateToolCallOutcome("Operation aborted", "not_executed_aborted_before_body");
 			}
 			if (beforeResult?.block) {
-				return {
-					kind: "immediate",
-					result: createErrorToolResult(beforeResult.reason || "Tool execution was blocked"),
-					isError: true,
-				};
+				return createImmediateToolCallOutcome(
+					beforeResult.reason || "Tool execution was blocked",
+					"not_executed_blocked",
+				);
 			}
+		} catch (error) {
+			if (signal?.aborted) {
+				return createImmediateToolCallOutcome("Operation aborted", "not_executed_aborted_before_body");
+			}
+			return createImmediateToolCallOutcome(errorMessage(error), "not_executed_before_hook_error");
 		}
-		if (signal?.aborted) {
-			return {
-				kind: "immediate",
-				result: createErrorToolResult("Operation aborted"),
-				isError: true,
-			};
-		}
-		return {
-			kind: "prepared",
-			toolCall,
-			tool,
-			args: validatedArgs,
-		};
-	} catch (error) {
-		return {
-			kind: "immediate",
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
-			isError: true,
-		};
 	}
+	if (signal?.aborted) {
+		return createImmediateToolCallOutcome("Operation aborted", "not_executed_aborted_before_body");
+	}
+	return { kind: "prepared", toolCall, tool, args: validatedArgs };
 }
 
 async function executePreparedToolCall(
@@ -1194,6 +1241,13 @@ async function executePreparedToolCall(
 ): Promise<ExecutedToolCallOutcome> {
 	const updateEvents: Promise<void>[] = [];
 	let acceptingUpdates = true;
+	if (signal?.aborted) {
+		return {
+			result: createErrorToolResult("Operation aborted"),
+			isError: true,
+			attemptOutcome: "not_executed_aborted_before_body",
+		};
+	}
 
 	try {
 		const result = await prepared.tool.execute(
@@ -1216,18 +1270,36 @@ async function executePreparedToolCall(
 			},
 		);
 		acceptingUpdates = false;
-		await Promise.all(updateEvents);
-		return { result, isError: false };
+		const updateResult = await settleToolUpdates(updateEvents);
+		if (!updateResult.ok) {
+			return {
+				result: createErrorToolResult(errorMessage(updateResult.error)),
+				isError: true,
+				attemptOutcome: "body_error",
+			};
+		}
+		return { result, isError: false, attemptOutcome: "body_success" };
 	} catch (error) {
 		acceptingUpdates = false;
-		await Promise.all(updateEvents);
+		await Promise.allSettled(updateEvents);
 		return {
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			result: createErrorToolResult(errorMessage(error)),
 			isError: true,
+			attemptOutcome: "body_error",
 		};
 	} finally {
 		acceptingUpdates = false;
 	}
+}
+
+async function settleToolUpdates(
+	updateEvents: readonly Promise<void>[],
+): Promise<{ ok: true } | { ok: false; error: unknown }> {
+	const settlements = await Promise.allSettled(updateEvents);
+	const rejected = settlements.find(
+		(settlement): settlement is PromiseRejectedResult => settlement.status === "rejected",
+	);
+	return rejected ? { ok: false, error: rejected.reason } : { ok: true };
 }
 
 async function finalizeExecutedToolCall(
@@ -1240,6 +1312,11 @@ async function finalizeExecutedToolCall(
 ): Promise<FinalizedToolCallOutcome> {
 	let result = executed.result;
 	let isError = executed.isError;
+	let attemptOutcome: ToolAttemptOutcome = executed.attemptOutcome;
+
+	if (attemptOutcome === "not_executed_aborted_before_body") {
+		return { toolCall: prepared.toolCall, result, isError, attemptOutcome };
+	}
 
 	if (config.afterToolCall) {
 		try {
@@ -1264,8 +1341,9 @@ async function finalizeExecutedToolCall(
 				isError = afterResult.isError ?? isError;
 			}
 		} catch (error) {
-			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+			result = createErrorToolResult(errorMessage(error));
 			isError = true;
+			attemptOutcome = "after_hook_error";
 		}
 	}
 
@@ -1273,6 +1351,7 @@ async function finalizeExecutedToolCall(
 		toolCall: prepared.toolCall,
 		result,
 		isError,
+		attemptOutcome,
 	};
 }
 
@@ -1290,6 +1369,7 @@ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: A
 		toolName: finalized.toolCall.name,
 		result: finalized.result,
 		isError: finalized.isError,
+		attemptOutcome: finalized.attemptOutcome,
 	});
 }
 

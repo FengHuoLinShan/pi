@@ -1,4 +1,4 @@
-import type { AgentTool } from "../../types.ts";
+import type { AgentTool, ToolAttemptOutcome } from "../../types.ts";
 import type { AgentHarness } from "../agent-harness.ts";
 import { uuidv7 } from "../session/uuid.ts";
 import type { AgentHarnessEvent, PromptTemplate, Skill } from "../types.ts";
@@ -110,6 +110,44 @@ function assistantStatus(message: unknown): TelemetrySpanStatus {
 	return message.stopReason === "error" ? "error" : "ok";
 }
 
+function assistantCompletionAttributes(message: unknown): Record<string, TelemetryAttribute> {
+	if (typeof message !== "object" || message === null || !("stopReason" in message)) {
+		return { stopReason: "unknown", hasErrorMessage: false };
+	}
+	const stopReason =
+		message.stopReason === "stop" ||
+		message.stopReason === "length" ||
+		message.stopReason === "toolUse" ||
+		message.stopReason === "error" ||
+		message.stopReason === "aborted"
+			? message.stopReason
+			: "unknown";
+	return {
+		stopReason,
+		hasErrorMessage: "errorMessage" in message && typeof message.errorMessage === "string",
+	};
+}
+
+function normalizeToolAttemptOutcome(value: unknown): ToolAttemptOutcome | "unknown" {
+	switch (value) {
+		case "not_executed_missing_tool":
+		case "not_executed_preparation_error":
+		case "not_executed_before_hook_error":
+		case "not_executed_blocked":
+		case "not_executed_aborted_before_body":
+		case "not_executed_truncated":
+		case "not_executed_budget":
+		case "not_executed_deadline":
+		case "not_executed_loop":
+		case "body_success":
+		case "body_error":
+		case "after_hook_error":
+			return value;
+		default:
+			return "unknown";
+	}
+}
+
 /**
  * Projects harness lifecycle events into privacy-safe logs, metrics, and causal spans.
  *
@@ -170,6 +208,8 @@ export class HarnessTelemetryCollector {
 				break;
 			case "after_provider_response":
 				this.emitLog(event.status >= 400 ? "warn" : "debug", "pi.provider.response_headers", {
+					provider: this.provider?.attributes.provider ?? "unknown",
+					model: this.provider?.attributes.model ?? "unknown",
 					statusCode: event.status,
 					headerCount: Object.keys(event.headers).length,
 					contentCaptured: false,
@@ -178,15 +218,33 @@ export class HarnessTelemetryCollector {
 			case "message_end": {
 				const role = messageRole(event.message);
 				this.emitMetric("pi.agent.message_bytes", "histogram", messageSize(event.message), "byte", { role });
-				if (role === "assistant") this.endProvider(assistantStatus(event.message));
+				if (role === "assistant") {
+					const status = assistantStatus(event.message);
+					this.emitLog(status === "error" ? "warn" : "debug", "pi.provider.completion", {
+						provider: this.provider?.attributes.provider ?? "unknown",
+						model: this.provider?.attributes.model ?? "unknown",
+						...assistantCompletionAttributes(event.message),
+						contentCaptured: false,
+					});
+					this.endProvider(status);
+				}
 				break;
 			}
 			case "tool_execution_start":
 				this.startTool(event.toolCallId, event.toolName);
 				break;
-			case "tool_execution_end":
-				this.endTool(event.toolCallId, event.isError ? "error" : "ok");
+			case "tool_execution_end": {
+				const attemptOutcome = normalizeToolAttemptOutcome(event.attemptOutcome);
+				this.emitLog(event.isError ? "warn" : "debug", "pi.agent.tool_result", {
+					tool: event.toolName,
+					isError: event.isError,
+					attemptOutcome,
+					contentCaptured: false,
+				});
+				this.emitMetric("pi.agent.tool_attempt_outcomes", "counter", 1, "1", { attemptOutcome });
+				this.endTool(event.toolCallId, event.isError ? "error" : "ok", attemptOutcome);
 				break;
+			}
 			case "turn_end":
 				this.endTurn(assistantStatus(event.message));
 				break;
@@ -269,11 +327,15 @@ export class HarnessTelemetryCollector {
 		this.provider = undefined;
 	}
 
-	private endTool(toolCallId: string, status: TelemetrySpanStatus): void {
+	private endTool(
+		toolCallId: string,
+		status: TelemetrySpanStatus,
+		attemptOutcome: ToolAttemptOutcome | "unknown" = "unknown",
+	): void {
 		const span = this.tools.get(toolCallId);
 		if (!span) return;
 		this.raiseRunStatus(status);
-		this.endSpan(span, status, {});
+		this.endSpan(span, status, { attemptOutcome });
 		this.emitDuration("pi.agent.tool_duration", span, status, span.attributes);
 		this.tools.delete(toolCallId);
 	}

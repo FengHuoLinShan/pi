@@ -13,6 +13,7 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ThinkingLevel,
+	ToolAttemptOutcome,
 	ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
 import type {
@@ -82,7 +83,7 @@ import type {
 
 export type { ExecOptions, ExecResult } from "../exec.ts";
 export type { BuildSystemPromptOptions } from "../system-prompt.ts";
-export type { AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode };
+export type { AgentToolResult, AgentToolUpdateCallback, ToolAttemptOutcome, ToolExecutionMode };
 export type { AppKeybinding, KeybindingsManager } from "../keybindings.ts";
 
 // ============================================================================
@@ -763,13 +764,15 @@ export interface ToolExecutionUpdateEvent {
 	partialResult: any;
 }
 
-/** Fired when a tool finishes executing */
+/** Fired when a tool attempt is finalized; the tool body may not have executed. */
 export interface ToolExecutionEndEvent {
 	type: "tool_execution_end";
 	toolCallId: string;
 	toolName: string;
 	result: any;
 	isError: boolean;
+	/** Present on current AgentLoop events. Optional for legacy event producers. */
+	attemptOutcome?: ToolAttemptOutcome;
 }
 
 // ============================================================================

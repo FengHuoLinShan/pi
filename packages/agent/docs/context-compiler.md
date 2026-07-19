@@ -84,3 +84,36 @@ const freshness = ledger.checkFreshness(currentSourceVersions);
 ```
 
 For reproducible builds and tests, callers should supply stable priorities, hashes, and observation timestamps. Persist `EvidenceLedgerSnapshot` and the compiled context result alongside application/session state when replay diagnostics need to explain why a fragment was present.
+
+## Trust labels and prompt-injection containment
+
+`protectContext()` is an explicit pre-compilation boundary for retrieved or application-supplied context. Each `LabeledContextFragment` declares:
+
+- whether it is an `instruction` or `data` fragment;
+- `trusted`, `partially_trusted`, or `untrusted` authority;
+- a disclosure sensitivity;
+- stable source provenance.
+
+The default policy quarantines every non-trusted instruction. Non-trusted data is XML-escaped inside an explicit data boundary before it reaches `compileContext()`. A conservative lexical prompt-injection detector contributes signals, not authority: applications can replace detectors and policy, and every allow, drop, quarantine, escape, or demote decision is recorded in diagnostics and provenance.
+
+```ts
+const protectedContext = protectContext({
+  fragments: [{
+    id: "issue-body",
+    kind: "retrieved_text",
+    content: issueBody,
+    priority: 10,
+    role: "data",
+    trust: "untrusted",
+    sensitivity: "internal",
+    source: { kind: "issue", id: issueId, labels: ["external"] },
+  }],
+});
+
+const compiled = compileContext({
+  tokenBudget: 4_000,
+  fragments: protectedContext.fragments,
+});
+```
+
+Escaping is containment metadata for the model, not a proof that arbitrary content is safe. Tool policy, approvals, filesystem/process isolation, and secret controls remain independent enforcement layers.

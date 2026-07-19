@@ -34,6 +34,8 @@ The default projection never copies:
 
 It may record counts and encoded byte lengths. Sink exceptions and rejected promises are isolated from harness execution. Telemetry listeners are passive; use hooks for control-plane behavior.
 
+Tool-result logs and tool span ends include the bounded `attemptOutcome` classification. Missing or unsupported values are bucketed as `unknown` on logs, spans, and the `pi.agent.tool_attempt_outcomes` counter. That counter uses only the normalized classification as a dimension; it never adds tool names, call ids, reasons, or other dynamic values.
+
 ## Trace bundles
 
 `createTraceBundle()` builds a versioned bundle containing:
@@ -45,6 +47,8 @@ It may record counts and encoded byte lengths. Sink exceptions and rejected prom
 - workspace revision and an optional diff reference;
 - optional model/tool exchange recordings and artifact metadata;
 - metrics and a redaction report.
+
+Per-call tool-attempt outcomes are an operational telemetry and audit projection, not an additional trace-bundle event or replay claim. Hosts may export fixed-name aggregate counts through `metrics`, but must not construct metric names from tools, call ids, errors, or reasons.
 
 ```ts
 const bundle = await createTraceBundle({
@@ -105,6 +109,34 @@ const result = await recordedTools.invoke({
 
 Model output is usually nondeterministic. Live replay reports `match`, `different`, `not_comparable`, or `error`; it does not promise identical output. Live adapters are an explicit side-effect boundary and must apply current policy, sandbox, approval, network, and secret controls.
 
+## Forkable replay
+
+`createReplayBranch()` creates an immutable branch plan before one canonical event sequence. The prefix is reduced into `stateAtFork`; model and tool exchanges at or after the boundary become ordered branch steps. Creating a branch performs no provider or tool work.
+
+Exact recorded inputs are required unless the caller supplies an explicit input override. A changed provider, model, tool name, or input never reuses the old response implicitly: the caller must provide an override response or opt into an adapter invocation.
+
+```ts
+const branch = await createReplayBranch(bundle, {
+  branchId: "alternate-model",
+  forkBeforeSequence: 42,
+  overrides: [{
+    kind: "model",
+    requestId: "request-7",
+    provider: "provider-b",
+    modelId: "model-b",
+    input: { value: alternateInput },
+    response: { source: "adapter" },
+  }],
+});
+
+const execution = await executeReplayBranch(branch, {
+  invokeModel: (step, signal) => callModel(step, signal),
+  invokeTool: (step, signal) => callSandboxedTool(step, signal),
+});
+```
+
+Recorded and override responses never call adapters. Missing adapters produce a blocked execution instead of silently performing live work. `verifyReplayBranch()` detects plan mutation, and `compareReplayBranches()` compares result hashes without copying raw result content into the comparison.
+
 ## Operational rules
 
 - Verify the bundle checksum before import or replay.
@@ -112,4 +144,5 @@ Model output is usually nondeterministic. Live replay reports `match`, `differen
 - Treat exact content capture as privileged diagnostic access.
 - Never execute real tools during deterministic-tool replay.
 - Reapply current authorization and isolation for live replay.
+- Treat every branch adapter as a new live execution boundary.
 - Keep event-log retention and telemetry retention independently configurable.

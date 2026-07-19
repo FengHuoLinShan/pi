@@ -151,6 +151,7 @@ describe("privacy-safe harness telemetry", () => {
 			streamOptions: { headers: { authorization: "BEARER SECRET" } },
 		});
 		collector.record({ type: "before_provider_payload", model, payload: { prompt: "MODEL PRIVATE CONTENT" } });
+		collector.record({ type: "after_provider_response", status: 200, headers: { "x-request-id": "PRIVATE-ID" } });
 		collector.record({
 			type: "tool_execution_start",
 			toolCallId: "tool-call-1",
@@ -163,6 +164,7 @@ describe("privacy-safe harness telemetry", () => {
 			toolName: "read",
 			result: { content: "TOOL PRIVATE CONTENT" },
 			isError: false,
+			attemptOutcome: "body_success",
 		});
 		collector.record({ type: "message_end", message: assistant });
 		collector.record({ type: "turn_end", message: assistant, toolResults: [] });
@@ -174,6 +176,7 @@ describe("privacy-safe harness telemetry", () => {
 			"SESSION PRIVATE VALUE",
 			"BEARER SECRET",
 			"MODEL PRIVATE CONTENT",
+			"PRIVATE-ID",
 			"/private/path",
 			"TOOL PRIVATE CONTENT",
 		]) {
@@ -185,10 +188,73 @@ describe("privacy-safe harness telemetry", () => {
 		const tool = starts.find((record) => record.name === "pi.agent.tool_call");
 		expect(provider?.parentSpanId).toBe(turn?.spanId);
 		expect(tool?.parentSpanId).toBe(turn?.spanId);
+		expect(
+			sink.records.find((record) => record.type === "log" && record.name === "pi.provider.response_headers"),
+		).toMatchObject({
+			attributes: { provider: "telemetry-faux", model: model.id, statusCode: 200, contentCaptured: false },
+		});
+		expect(
+			sink.records.find((record) => record.type === "log" && record.name === "pi.provider.completion"),
+		).toMatchObject({
+			attributes: {
+				provider: "telemetry-faux",
+				model: model.id,
+				stopReason: "stop",
+				hasErrorMessage: false,
+				contentCaptured: false,
+			},
+		});
+		expect(
+			sink.records.find((record) => record.type === "log" && record.name === "pi.agent.tool_result"),
+		).toMatchObject({
+			attributes: { tool: "read", isError: false, attemptOutcome: "body_success", contentCaptured: false },
+		});
+		expect(
+			sink.records.find((record) => record.type === "span_end" && record.name === "pi.agent.tool_call"),
+		).toMatchObject({ attributes: { tool: "read", attemptOutcome: "body_success" } });
+		const outcomeMetric = sink.records.find(
+			(record): record is Extract<HarnessTelemetryRecord, { type: "metric" }> =>
+				record.type === "metric" && record.name === "pi.agent.tool_attempt_outcomes",
+		);
+		expect(outcomeMetric?.dimensions).toEqual({ attemptOutcome: "body_success" });
 		for (const metric of sink.records.filter((record) => record.type === "metric")) {
 			expect(Object.keys(metric.dimensions)).not.toContain("sessionId");
 			expect(Object.keys(metric.dimensions)).not.toContain("traceId");
 		}
+	});
+
+	it("buckets missing and invalid tool attempt outcomes without exporting dynamic values", () => {
+		const sink = new InMemoryHarnessTelemetrySink();
+		const collector = new HarnessTelemetryCollector(sink, { createId: idFactory(), now: clock() });
+		collector.record({ type: "agent_start" });
+		collector.record({ type: "tool_execution_start", toolCallId: "missing", toolName: "read", args: {} });
+		collector.record({
+			type: "tool_execution_end",
+			toolCallId: "missing",
+			toolName: "read",
+			result: {},
+			isError: true,
+		});
+		collector.record({ type: "tool_execution_start", toolCallId: "invalid", toolName: "read", args: {} });
+		collector.record({
+			type: "tool_execution_end",
+			toolCallId: "invalid",
+			toolName: "read",
+			result: {},
+			isError: true,
+			attemptOutcome: "PRIVATE INVALID OUTCOME",
+		} as unknown as Parameters<HarnessTelemetryCollector["record"]>[0]);
+
+		const outcomeMetrics = sink.records.filter(
+			(record): record is Extract<HarnessTelemetryRecord, { type: "metric" }> =>
+				record.type === "metric" && record.name === "pi.agent.tool_attempt_outcomes",
+		);
+		expect(outcomeMetrics).toHaveLength(2);
+		expect(outcomeMetrics.map((record) => record.dimensions)).toEqual([
+			{ attemptOutcome: "unknown" },
+			{ attemptOutcome: "unknown" },
+		]);
+		expect(JSON.stringify(sink.records)).not.toContain("PRIVATE INVALID OUTCOME");
 	});
 
 	it("isolates synchronous and asynchronous sink failures", async () => {
@@ -206,6 +272,24 @@ describe("privacy-safe harness telemetry", () => {
 		expect(() => collector.record({ type: "agent_start" })).not.toThrow();
 		expect(() => collector.record({ type: "turn_start" })).not.toThrow();
 		await Promise.resolve();
+	});
+
+	it("allowlists completion status values instead of recording message-owned strings", () => {
+		const sink = new InMemoryHarnessTelemetrySink();
+		const collector = new HarnessTelemetryCollector(sink, { createId: idFactory(), now: clock() });
+		const assistant = fauxAssistantMessage("PRIVATE ASSISTANT BODY");
+		Reflect.set(assistant, "stopReason", "PRIVATE INVALID STOP REASON");
+		Reflect.set(assistant, "errorMessage", "PRIVATE ERROR MESSAGE");
+
+		collector.record({ type: "agent_start" });
+		collector.record({ type: "message_end", message: assistant });
+
+		const serialized = JSON.stringify(sink.records);
+		expect(serialized).not.toContain("PRIVATE INVALID STOP REASON");
+		expect(serialized).not.toContain("PRIVATE ERROR MESSAGE");
+		expect(
+			sink.records.find((record) => record.type === "log" && record.name === "pi.provider.completion"),
+		).toMatchObject({ attributes: { stopReason: "unknown", hasErrorMessage: true, contentCaptured: false } });
 	});
 
 	it("marks budget and loop terminations as failed runs", () => {

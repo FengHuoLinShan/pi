@@ -1,3 +1,4 @@
+import { realpath as fsRealpath } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
@@ -8,6 +9,12 @@ import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts"
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import {
+	captureFilePathSnapshot,
+	type FilePathOperations,
+	type FilePathPolicy,
+	revalidateFilePathSnapshot,
+} from "./file-transaction.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -15,6 +22,39 @@ import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } fr
 
 function toPosixPath(value: string): string {
 	return value.split(path.sep).join("/");
+}
+
+function closestContainingRoot(targetPath: string, roots: readonly string[]): string | undefined {
+	return roots
+		.filter((root) => {
+			const relativePath = path.relative(root, targetPath);
+			return (
+				relativePath === "" ||
+				(relativePath !== ".." && !relativePath.startsWith(`..${path.sep}`) && !path.isAbsolute(relativePath))
+			);
+		})
+		.sort((left, right) => right.length - left.length)[0];
+}
+
+async function normalizeSearchResultPath(
+	rawPath: string,
+	searchPath: string,
+	operations: FindOperations,
+	policyEnabled: boolean,
+): Promise<string> {
+	const hadTrailingSlash = rawPath.endsWith("/") || rawPath.endsWith("\\");
+	const absolutePath = path.isAbsolute(rawPath) ? rawPath : path.resolve(searchPath, rawPath);
+	const snapshot = await captureFilePathSnapshot(
+		absolutePath,
+		rawPath,
+		policyEnabled ? [searchPath] : undefined,
+		operations.realpath,
+		true,
+	);
+	await revalidateFilePathSnapshot(snapshot, rawPath, policyEnabled ? [searchPath] : undefined, operations.realpath);
+	let relativePath = path.relative(searchPath, snapshot.targetPath) || ".";
+	if (hadTrailingSlash && !relativePath.endsWith(path.sep)) relativePath += path.sep;
+	return toPosixPath(relativePath);
 }
 
 const findSchema = Type.Object({
@@ -38,7 +78,7 @@ export interface FindToolDetails {
  * Pluggable operations for the find tool.
  * Override these to delegate file search to remote systems (for example SSH).
  */
-export interface FindOperations {
+export interface FindOperations extends FilePathOperations {
 	/** Check if path exists */
 	exists: (absolutePath: string) => Promise<boolean> | boolean;
 	/** Find files matching glob pattern. Returns relative or absolute paths. */
@@ -47,11 +87,12 @@ export interface FindOperations {
 
 const defaultFindOperations: FindOperations = {
 	exists: pathExists,
+	realpath: fsRealpath,
 	// This is a placeholder. Actual fd execution happens in execute() when no custom glob is provided.
 	glob: () => [],
 };
 
-export interface FindToolOptions {
+export interface FindToolOptions extends FilePathPolicy {
 	/** Custom operations for find. Default: local filesystem plus fd */
 	operations?: FindOperations;
 }
@@ -111,6 +152,7 @@ export function createFindToolDefinition(
 	options?: FindToolOptions,
 ): ToolDefinition<typeof findSchema, FindToolDetails | undefined> {
 	const customOps = options?.operations;
+	const allowedRoots = options?.allowedRoots?.map((root) => resolveToCwd(root, cwd));
 	return {
 		name: "find",
 		label: "find",
@@ -147,16 +189,25 @@ export function createFindToolDefinition(
 
 				(async () => {
 					try {
-						const searchPath = resolveToCwd(searchDir || ".", cwd);
 						const effectiveLimit = limit ?? DEFAULT_LIMIT;
 						const ops = customOps ?? defaultFindOperations;
+						const requestedSearchPath = resolveToCwd(searchDir || ".", cwd);
+						const pathSnapshot = await captureFilePathSnapshot(
+							requestedSearchPath,
+							searchDir || ".",
+							allowedRoots,
+							ops.realpath,
+							true,
+						);
+						const searchPath = pathSnapshot.targetPath;
+						if (!(await ops.exists(searchPath))) {
+							settle(() => reject(new Error(`Path not found: ${searchPath}`)));
+							return;
+						}
+						await revalidateFilePathSnapshot(pathSnapshot, searchDir || ".", allowedRoots, ops.realpath);
 
 						// If custom operations provide glob(), use that instead of fd.
 						if (customOps?.glob) {
-							if (!(await ops.exists(searchPath))) {
-								settle(() => reject(new Error(`Path not found: ${searchPath}`)));
-								return;
-							}
 							if (signal?.aborted) {
 								settle(() => reject(new Error("Operation aborted")));
 								return;
@@ -179,11 +230,15 @@ export function createFindToolDefinition(
 								return;
 							}
 
-							// Relativize paths against the search root for stable output.
-							const relativized = results.map((p) => {
-								if (p.startsWith(searchPath)) return toPosixPath(p.slice(searchPath.length + 1));
-								return toPosixPath(path.relative(searchPath, p));
-							});
+							// Validate backend results independently. An attested/custom backend cannot
+							// smuggle paths outside the requested search root into the response.
+							const relativized = await Promise.all(
+								results
+									.slice(0, effectiveLimit)
+									.map((resultPath) =>
+										normalizeSearchResultPath(resultPath, searchPath, ops, allowedRoots !== undefined),
+									),
+							);
 							const resultLimitReached = relativized.length >= effectiveLimit;
 							const rawOutput = relativized.join("\n");
 							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
@@ -221,18 +276,20 @@ export function createFindToolDefinition(
 							return;
 						}
 
-						const args: string[] = ["--glob", "--color=never", "--hidden"];
+						const args: string[] = ["--glob", "--color=never", "--hidden", "--no-follow"];
 
 						// fd normally ignores .gitignore outside git repos, so keep --no-require-git
 						// there. Inside repos, use fd's default git-aware behavior so parent
 						// .gitignore rules stop at nested repo boundaries:
 						// https://github.com/earendil-works/pi/issues/5960
 						let insideGitRepo = false;
+						const ancestorBoundary = closestContainingRoot(searchPath, pathSnapshot.canonicalRoots);
 						for (let current = searchPath; ; ) {
 							if (await pathExists(path.join(current, ".git"))) {
 								insideGitRepo = true;
 								break;
 							}
+							if (current === ancestorBoundary) break;
 							const parent = path.dirname(current);
 							if (parent === current) break;
 							current = parent;
@@ -280,70 +337,68 @@ export function createFindToolDefinition(
 							settle(() => reject(new Error(`Failed to run fd: ${error.message}`)));
 						});
 
-						child.on("close", (code) => {
+						child.on("close", async (code) => {
 							cleanup();
-							if (signal?.aborted) {
-								settle(() => reject(new Error("Operation aborted")));
-								return;
-							}
-							const output = lines.join("\n");
-							if (code !== 0) {
-								const errorMsg = stderr.trim() || `fd exited with code ${code}`;
-								if (!output) {
-									settle(() => reject(new Error(errorMsg)));
+							try {
+								if (signal?.aborted) {
+									settle(() => reject(new Error("Operation aborted")));
 									return;
 								}
-							}
-							if (!output) {
+								const output = lines.join("\n");
+								if (code !== 0) {
+									const errorMsg = stderr.trim() || `fd exited with code ${code}`;
+									if (!output) {
+										settle(() => reject(new Error(errorMsg)));
+										return;
+									}
+								}
+								if (!output) {
+									settle(() =>
+										resolve({
+											content: [{ type: "text", text: "No files found matching pattern" }],
+											details: undefined,
+										}),
+									);
+									return;
+								}
+
+								const relativized = await Promise.all(
+									lines
+										.map((rawLine) => rawLine.replace(/\r$/, "").trim())
+										.filter((line) => line.length > 0)
+										.map((line) =>
+											normalizeSearchResultPath(line, searchPath, ops, allowedRoots !== undefined),
+										),
+								);
+
+								const resultLimitReached = relativized.length >= effectiveLimit;
+								const rawOutput = relativized.join("\n");
+								const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+								let resultOutput = truncation.content;
+								const details: FindToolDetails = {};
+								const notices: string[] = [];
+								if (resultLimitReached) {
+									notices.push(
+										`${effectiveLimit} results limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`,
+									);
+									details.resultLimitReached = effectiveLimit;
+								}
+								if (truncation.truncated) {
+									notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+									details.truncation = truncation;
+								}
+								if (notices.length > 0) {
+									resultOutput += `\n\n[${notices.join(". ")}]`;
+								}
 								settle(() =>
 									resolve({
-										content: [{ type: "text", text: "No files found matching pattern" }],
-										details: undefined,
+										content: [{ type: "text", text: resultOutput }],
+										details: Object.keys(details).length > 0 ? details : undefined,
 									}),
 								);
-								return;
+							} catch (error) {
+								settle(() => reject(error instanceof Error ? error : new Error(String(error))));
 							}
-
-							const relativized: string[] = [];
-							for (const rawLine of lines) {
-								const line = rawLine.replace(/\r$/, "").trim();
-								if (!line) continue;
-								const hadTrailingSlash = line.endsWith("/") || line.endsWith("\\");
-								let relativePath = line;
-								if (line.startsWith(searchPath)) {
-									relativePath = line.slice(searchPath.length + 1);
-								} else {
-									relativePath = path.relative(searchPath, line);
-								}
-								if (hadTrailingSlash && !relativePath.endsWith("/")) relativePath += "/";
-								relativized.push(toPosixPath(relativePath));
-							}
-
-							const resultLimitReached = relativized.length >= effectiveLimit;
-							const rawOutput = relativized.join("\n");
-							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
-							let resultOutput = truncation.content;
-							const details: FindToolDetails = {};
-							const notices: string[] = [];
-							if (resultLimitReached) {
-								notices.push(
-									`${effectiveLimit} results limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`,
-								);
-								details.resultLimitReached = effectiveLimit;
-							}
-							if (truncation.truncated) {
-								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-								details.truncation = truncation;
-							}
-							if (notices.length > 0) {
-								resultOutput += `\n\n[${notices.join(". ")}]`;
-							}
-							settle(() =>
-								resolve({
-									content: [{ type: "text", text: resultOutput }],
-									details: Object.keys(details).length > 0 ? details : undefined,
-								}),
-							);
 						});
 					} catch (e) {
 						if (signal?.aborted) {

@@ -1,5 +1,6 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
+import type { ToolPolicyAuthorizationObservation } from "../src/index.ts";
 import {
 	createApprovalGrant,
 	createApprovalRequest,
@@ -351,6 +352,57 @@ describe("tool policy adapter", () => {
 		expect(digest).not.toContain("secret.txt");
 	});
 
+	it("rejects lossy hash inputs and preserves prototype-like keys", async () => {
+		const prototypeLike = Object.create(null) as Record<string, unknown>;
+		prototypeLike.__proto__ = "retained-value";
+		const emptyHash = await hashToolPolicyInvocation({
+			toolCallId: "empty",
+			toolName: "mutate",
+			arguments: {},
+		});
+		const prototypeHash = await hashToolPolicyInvocation({
+			toolCallId: "prototype",
+			toolName: "mutate",
+			arguments: prototypeLike,
+		});
+		const symbolArguments = { visible: true } as Record<string | symbol, unknown>;
+		symbolArguments[Symbol("private")] = "private-value";
+		const sparseArguments = new Array(1) as unknown[];
+		const namedArray = ["visible"] as unknown[] & { private?: string };
+		namedArray.private = "private-value";
+		const accessorArguments = Object.defineProperty({}, "value", { get: () => "private-value" });
+
+		expect(prototypeHash).not.toBe(emptyHash);
+		await expect(
+			hashToolPolicyInvocation({
+				toolCallId: "symbol",
+				toolName: "mutate",
+				arguments: symbolArguments,
+			}),
+		).rejects.toThrow("contains symbol keys");
+		await expect(
+			hashToolPolicyInvocation({
+				toolCallId: "sparse",
+				toolName: "mutate",
+				arguments: sparseArguments,
+			}),
+		).rejects.toThrow("contains a sparse array");
+		await expect(
+			hashToolPolicyInvocation({
+				toolCallId: "named-array",
+				toolName: "mutate",
+				arguments: namedArray,
+			}),
+		).rejects.toThrow("array contains named properties");
+		await expect(
+			hashToolPolicyInvocation({
+				toolCallId: "accessor",
+				toolName: "mutate",
+				arguments: accessorArguments,
+			}),
+		).rejects.toThrow("contains accessor properties");
+	});
+
 	it("blocks missing declarations and declined approvals", async () => {
 		const missing = createToolPolicyAdapter({ policy, specs: [], now: () => 1_000 });
 		expect(await missing.beforeToolCall(beforeToolCallContext("unknown", "call-x"))).toMatchObject({
@@ -375,6 +427,291 @@ describe("tool policy adapter", () => {
 		expect(await adapter.authorizeInvocation(invocation("inspect", "harness-call"))).toMatchObject({
 			allowed: true,
 			decision: { ruleId: "allow-read" },
+		});
+	});
+
+	it("observes content-minimized allow, deny, granted, and not-granted outcomes", async () => {
+		const observations: ToolPolicyAuthorizationObservation[] = [];
+		const observeAuthorization = (observation: ToolPolicyAuthorizationObservation) => {
+			observations.push(observation);
+		};
+		const direct = createToolPolicyAdapter({
+			policy,
+			specs: [readSpec],
+			now: () => 1_000,
+			observeAuthorization,
+		});
+		await direct.authorizeInvocation({
+			...invocation("inspect", "allow-call"),
+			arguments: { path: "private/allow-secret.txt" },
+			sessionId: "private-session",
+			resources: [{ kind: "workspace", access: "read", locator: "private/allow-secret.txt" }],
+		});
+		await direct.authorizeInvocation({
+			toolCallId: "deny-call",
+			toolName: "private-custom-tool",
+			arguments: { token: "private-token" },
+		});
+
+		let currentTime = 1_000;
+		const granted = createToolPolicyAdapter({
+			policy,
+			specs: [writeSpec],
+			now: () => currentTime,
+			observeAuthorization,
+			requestApproval: async (request) => {
+				currentTime++;
+				return createApprovalGrant(request, { id: "private-grant-id", issuedAt: currentTime });
+			},
+		});
+		await granted.authorizeInvocation(invocation("mutate", "granted-call"));
+
+		const notGranted = createToolPolicyAdapter({
+			policy,
+			specs: [writeSpec],
+			now: () => 1_000,
+			observeAuthorization,
+		});
+		await notGranted.authorizeInvocation(invocation("mutate", "not-granted-call"));
+
+		expect(observations).toMatchObject([
+			{
+				version: 1,
+				toolCallId: "allow-call",
+				toolName: "inspect",
+				policyRevision: "policy@7",
+				toolSpecRevision: "inspect@1",
+				ruleId: "allow-read",
+				decision: "allow",
+				allowed: true,
+				approval: "not_required",
+			},
+			{
+				toolCallId: "deny-call",
+				toolName: "private-custom-tool",
+				decision: "deny",
+				allowed: false,
+				approval: "not_required",
+			},
+			{
+				toolCallId: "granted-call",
+				decision: "require_approval",
+				allowed: true,
+				approval: "granted",
+			},
+			{
+				toolCallId: "not-granted-call",
+				decision: "require_approval",
+				allowed: false,
+				approval: "not_granted",
+			},
+		]);
+		const allowedObservationKeys = new Set([
+			"version",
+			"toolCallId",
+			"toolName",
+			"resolvedCallHash",
+			"policyRevision",
+			"toolSpecRevision",
+			"ruleId",
+			"decision",
+			"allowed",
+			"approval",
+		]);
+		for (const observation of observations) {
+			expect(observation.resolvedCallHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+			expect(Object.keys(observation).every((key) => allowedObservationKeys.has(key))).toBe(true);
+			for (const forbidden of ["arguments", "resources", "locator", "sessionId", "reason", "approvalGrantId"]) {
+				expect(observation).not.toHaveProperty(forbidden);
+			}
+		}
+		const serialized = JSON.stringify(observations);
+		for (const secret of [
+			"private/allow-secret.txt",
+			"private-session",
+			"private-token",
+			"private-grant-id",
+			"Durable writes require approval",
+		]) {
+			expect(serialized).not.toContain(secret);
+		}
+	});
+
+	it("observes stored grants and every completed approval rejection branch", async () => {
+		const observations: ToolPolicyAuthorizationObservation[] = [];
+		const observeAuthorization = (observation: ToolPolicyAuthorizationObservation) => {
+			observations.push(observation);
+		};
+		let currentTime = 1_000;
+		let requestCount = 0;
+		const reusablePolicy: ToolPolicy = {
+			...policy,
+			rules: [
+				{
+					...policy.rules[0],
+					approval: { expiresInMs: 1_000, scope: "tool", oneShot: false },
+				},
+			],
+		};
+		const reusable = createToolPolicyAdapter({
+			policy: reusablePolicy,
+			specs: [writeSpec],
+			now: () => currentTime,
+			observeAuthorization,
+			requestApproval: async (request) => {
+				requestCount++;
+				currentTime++;
+				return createApprovalGrant(request, { id: "reusable-grant", issuedAt: currentTime });
+			},
+		});
+		await reusable.authorizeInvocation(invocation("mutate", "new-grant"));
+		await reusable.authorizeInvocation(invocation("mutate", "stored-grant"));
+		expect(requestCount).toBe(1);
+
+		const sessionApprovalPolicy: ToolPolicy = {
+			...policy,
+			rules: [
+				{
+					...policy.rules[0],
+					approval: { expiresInMs: 1_000, scope: "session", oneShot: false },
+				},
+			],
+		};
+		const missingSession = createToolPolicyAdapter({
+			policy: sessionApprovalPolicy,
+			specs: [writeSpec],
+			now: () => currentTime,
+			observeAuthorization,
+		});
+		expect(await missingSession.authorizeInvocation(invocation("mutate", "missing-session"))).toMatchObject({
+			allowed: false,
+			reason: "Session-scoped approval requires a session id",
+		});
+
+		const declined = createToolPolicyAdapter({
+			policy,
+			specs: [writeSpec],
+			now: () => currentTime,
+			observeAuthorization,
+			requestApproval: async () => undefined,
+		});
+		expect(await declined.authorizeInvocation(invocation("mutate", "declined"))).toMatchObject({
+			allowed: false,
+			reason: "Approval was not granted",
+		});
+
+		const abortController = new AbortController();
+		const aborted = createToolPolicyAdapter({
+			policy,
+			specs: [writeSpec],
+			now: () => currentTime,
+			observeAuthorization,
+			requestApproval: async (request) => {
+				abortController.abort();
+				currentTime++;
+				return createApprovalGrant(request, { id: "aborted-grant", issuedAt: currentTime });
+			},
+		});
+		expect(await aborted.authorizeInvocation(invocation("mutate", "aborted"), abortController.signal)).toMatchObject({
+			allowed: false,
+			reason: "Approval request was aborted",
+		});
+
+		const invalidGrant = createToolPolicyAdapter({
+			policy,
+			specs: [writeSpec],
+			now: () => currentTime,
+			observeAuthorization,
+			requestApproval: async (request) => {
+				currentTime++;
+				return {
+					...createApprovalGrant(request, { id: "invalid-grant", issuedAt: currentTime }),
+					resolvedCallHash: `sha256:${"0".repeat(64)}`,
+				};
+			},
+		});
+		expect(await invalidGrant.authorizeInvocation(invocation("mutate", "invalid-grant"))).toMatchObject({
+			allowed: false,
+			reason: "Grant resolved call hash does not match",
+		});
+
+		const consumedInvocation = await resolvedInvocation("mutate", "consumed-grant");
+		const consumedDecision = evaluateToolPolicy(policy, writeSpec, consumedInvocation);
+		const consumedRequest = createApprovalRequest(consumedDecision, consumedInvocation, {
+			id: "consumed-request",
+			now: 4_000,
+		});
+		const consumedStore = new InMemoryApprovalGrantStore();
+		const consumedGrant = createApprovalGrant(consumedRequest, { id: "consumed-grant", issuedAt: 4_001 });
+		consumedStore.add(consumedGrant);
+		consumedStore.consume(consumedGrant.id);
+		let consumedTime = 4_500;
+		const reusedGrantId = createToolPolicyAdapter({
+			policy,
+			specs: [writeSpec],
+			grantStore: consumedStore,
+			now: () => consumedTime,
+			observeAuthorization,
+			requestApproval: async (request) => {
+				consumedTime++;
+				return createApprovalGrant(request, { id: consumedGrant.id, issuedAt: consumedTime });
+			},
+		});
+		expect(await reusedGrantId.authorizeInvocation(invocation("mutate", "consumed-grant"))).toMatchObject({
+			allowed: false,
+			reason: "One-shot approval grant was already consumed",
+		});
+
+		expect(observations.map((observation) => [observation.toolCallId, observation.approval])).toEqual([
+			["new-grant", "granted"],
+			["stored-grant", "granted"],
+			["missing-session", "not_granted"],
+			["declined", "not_granted"],
+			["aborted", "not_granted"],
+			["invalid-grant", "not_granted"],
+			["consumed-grant", "not_granted"],
+		]);
+	});
+
+	it("isolates synchronous and asynchronous authorization observer failures", async () => {
+		const synchronous = createToolPolicyAdapter({
+			policy,
+			specs: [readSpec],
+			observeAuthorization: () => {
+				throw new Error("synchronous observer failure");
+			},
+		});
+		await expect(synchronous.authorizeInvocation(invocation("inspect"))).resolves.toMatchObject({
+			allowed: true,
+			decision: { decision: "allow" },
+		});
+
+		const asynchronous = createToolPolicyAdapter({
+			policy,
+			specs: [readSpec],
+			observeAuthorization: () => Promise.reject(new Error("asynchronous observer failure")),
+		});
+		await expect(asynchronous.authorizeInvocation(invocation("inspect"))).resolves.toMatchObject({
+			allowed: true,
+			decision: { decision: "allow" },
+		});
+		await Promise.resolve();
+
+		const mutating = createToolPolicyAdapter({
+			policy,
+			specs: [readSpec],
+			observeAuthorization: (observation) => {
+				const mutable = observation as {
+					allowed: boolean;
+					approval: ToolPolicyAuthorizationObservation["approval"];
+				};
+				mutable.allowed = false;
+				mutable.approval = "not_granted";
+			},
+		});
+		await expect(mutating.authorizeInvocation(invocation("inspect"))).resolves.toMatchObject({
+			allowed: true,
+			decision: { decision: "allow" },
 		});
 	});
 });

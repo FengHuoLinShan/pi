@@ -28,6 +28,7 @@ export {
 } from "./core/agent-session.ts";
 export * from "./core/artifact-store.ts";
 export { readStoredCredential } from "./core/auth-storage.ts";
+export * from "./core/code-graph.ts";
 export { CodingAgentHarnessRuntime } from "./core/coding-agent-harness-runtime.ts";
 // Compaction
 export {
@@ -148,6 +149,7 @@ export type {
 	SlashCommandSource,
 	SourceInfo,
 	TerminalInputHandler,
+	ToolAttemptOutcome,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolDefinition,
@@ -206,6 +208,7 @@ export type {
 } from "./core/package-manager.ts";
 export { DefaultPackageManager } from "./core/package-manager.ts";
 export * from "./core/process-session.ts";
+export * from "./core/process-session-verifier.ts";
 export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.ts";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
 // SDK for programmatic usage
@@ -274,6 +277,7 @@ export {
 	SettingsManager,
 	type SettingsManagerCreateOptions,
 } from "./core/settings-manager.ts";
+export * from "./core/shadow-runs.ts";
 // Skills
 export {
 	formatSkillsForPrompt,
@@ -320,6 +324,8 @@ export {
 	type FindToolOptions,
 	formatSize,
 	type GrepOperations,
+	type GrepSearchMatch,
+	type GrepSearchRequest,
 	type GrepToolDetails,
 	type GrepToolInput,
 	type GrepToolOptions,
@@ -350,6 +356,8 @@ export {
 	type ProjectTrustStoreEntry,
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
+export * from "./core/workspace-change-discipline-verifier.ts";
+export * from "./core/workspace-overlay.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
 // Run modes for programmatic SDK usage

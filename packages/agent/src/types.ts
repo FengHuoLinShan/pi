@@ -126,6 +126,28 @@ export type AgentRunTermination =
 export type AgentToolCall = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 
 /**
+ * Low-sensitivity terminal provenance for one tool attempt.
+ *
+ * This describes which control-flow path finalized the attempt. It contains no
+ * arguments, result content, error messages, block reasons, or other dynamic data.
+ * `body_success` and `body_error` describe the tool body's promise before any
+ * `afterToolCall` override; `after_hook_error` takes precedence when that hook throws.
+ */
+export type ToolAttemptOutcome =
+	| "not_executed_missing_tool"
+	| "not_executed_preparation_error"
+	| "not_executed_before_hook_error"
+	| "not_executed_blocked"
+	| "not_executed_aborted_before_body"
+	| "not_executed_truncated"
+	| "not_executed_budget"
+	| "not_executed_deadline"
+	| "not_executed_loop"
+	| "body_success"
+	| "body_error"
+	| "after_hook_error";
+
+/**
  * Result returned from `beforeToolCall`.
  *
  * Returning `{ block: true }` prevents the tool from executing. The loop emits an error tool result instead.
@@ -508,4 +530,12 @@ export type AgentEvent =
 	// Tool execution lifecycle
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
-	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };
+	| {
+			type: "tool_execution_end";
+			toolCallId: string;
+			toolName: string;
+			result: any;
+			isError: boolean;
+			/** Present on AgentLoop-produced events. Optional for legacy producers and stored events. */
+			attemptOutcome?: ToolAttemptOutcome;
+	  };

@@ -2,6 +2,8 @@
 export * from "./agent.ts";
 // Loop functions
 export * from "./agent-loop.ts";
+// Explicit completion contracts and verifiers
+export * from "./completion/index.ts";
 // Context compilation and evidence
 export * from "./context/index.ts";
 export * from "./harness/agent-harness.ts";
@@ -27,6 +29,7 @@ export {
 	serializeConversation,
 	shouldCompact,
 } from "./harness/compaction/compaction.ts";
+export * from "./harness/discipline-audit.ts";
 export * from "./harness/hooks.ts";
 export * from "./harness/messages.ts";
 export * from "./harness/observability/index.ts";
@@ -47,7 +50,11 @@ export * from "./harness/utils/shell-output.ts";
 export * from "./harness/utils/truncate.ts";
 // Proxy utilities
 export * from "./proxy.ts";
+// Explicit model routing and one-step recovery plans
+export * from "./routing/index.ts";
 // Tool policy and approvals
 export * from "./tool-policy.ts";
 // Types
 export * from "./types.ts";
+// Explicit one-turn execution with completion evidence
+export * from "./verified-run/index.ts";

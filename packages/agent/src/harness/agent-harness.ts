@@ -246,6 +246,8 @@ export class AgentHarness<
 	private runAbortController?: AbortController;
 	private runPromise?: Promise<void>;
 	private pendingSessionWrites: DurablePendingWrite[] = [];
+	private pendingSessionWriteBarrier: Promise<void> = Promise.resolve();
+	private sessionWritesSealed = false;
 	private model: Model<any>;
 	private thinkingLevel: ThinkingLevel;
 	private systemPrompt: AgentHarnessOptions<TSkill, TPromptTemplate, TTool>["systemPrompt"];
@@ -483,12 +485,18 @@ export class AgentHarness<
 	}
 
 	private startRunPromise(): () => void {
+		this.runAbortController = new AbortController();
+		this.acceptsTurnInput = false;
+		this.sessionWritesSealed = false;
 		let finish = () => {};
 		this.runPromise = new Promise<void>((resolve) => {
 			finish = resolve;
 		});
 		return () => {
 			this.runPromise = undefined;
+			this.runAbortController = undefined;
+			this.acceptsTurnInput = false;
+			this.sessionWritesSealed = false;
 			finish();
 		};
 	}
@@ -667,7 +675,13 @@ export class AgentHarness<
 				};
 			},
 			getSteeringMessages: async () => this.drainQueuedMessages(this.steerQueue, this.steeringQueueMode),
-			getFollowUpMessages: async () => this.drainQueuedMessages(this.followUpQueue, this.followUpQueueMode),
+			getFollowUpMessages: async () => {
+				if (this.followUpQueue.length === 0) {
+					this.acceptsTurnInput = false;
+					return [];
+				}
+				return await this.drainQueuedMessages(this.followUpQueue, this.followUpQueueMode);
+			},
 		};
 	}
 
@@ -684,6 +698,7 @@ export class AgentHarness<
 	}
 
 	private async flushPendingSessionWrites(): Promise<void> {
+		await this.pendingSessionWriteBarrier;
 		while (this.pendingSessionWrites.length > 0) {
 			const pending = this.pendingSessionWrites[0]!;
 			await this.applyPendingSessionWrite(pending);
@@ -763,19 +778,30 @@ export class AgentHarness<
 	}
 
 	private async queuePendingSessionWrite(write: PendingSessionWrite): Promise<void> {
-		if (!this.runtimeEvents) {
-			this.pendingSessionWrites.push({ write });
-			return;
+		if (this.sessionWritesSealed) {
+			throw new AgentHarnessError("invalid_state", "Session writes are sealed for terminal run cleanup");
 		}
-		const pendingWriteId = uuidv7();
-		const targetEntryId = await this.session.getStorage().createEntryId();
-		await this.runtimeEvents.append({
-			type: "pending_write_enqueued",
-			pendingWriteId,
-			targetEntryId,
-			write,
-		});
-		this.pendingSessionWrites.push({ write, pendingWriteId, targetEntryId });
+		const enqueue = async () => {
+			if (!this.runtimeEvents) {
+				this.pendingSessionWrites.push({ write });
+				return;
+			}
+			const pendingWriteId = uuidv7();
+			const targetEntryId = await this.session.getStorage().createEntryId();
+			await this.runtimeEvents.append({
+				type: "pending_write_enqueued",
+				pendingWriteId,
+				targetEntryId,
+				write,
+			});
+			this.pendingSessionWrites.push({ write, pendingWriteId, targetEntryId });
+		};
+		const operation = this.pendingSessionWriteBarrier.then(enqueue, enqueue);
+		this.pendingSessionWriteBarrier = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		await operation;
 	}
 
 	private async applyPendingSessionWrite(pending: DurablePendingWrite): Promise<void> {
@@ -893,39 +919,32 @@ export class AgentHarness<
 		if (event.type === "agent_end") {
 			this.acceptsTurnInput = false;
 			this.runAbortController = undefined;
-			const errors: Error[] = [];
-			try {
-				await this.flushPendingSessionWrites();
-			} catch (error) {
-				errors.push(toError(error));
-			}
-			try {
-				await this.finishRuntimeOperation();
-			} catch (error) {
-				errors.push(toError(error));
-			}
-			try {
-				await this.emitAny(event, signal);
-			} catch (error) {
-				errors.push(toError(error));
-			}
-			try {
-				await this.emitOwn({ type: "settled", nextTurnCount: this.nextTurnQueue.length }, signal);
-			} catch (error) {
-				errors.push(toError(error));
-			}
-			try {
-				await this.flushPendingSessionWrites();
-			} catch (error) {
-				errors.push(toError(error));
-			}
-			if (errors.length > 0) {
-				const cause = errors.length === 1 ? errors[0]! : new AggregateError(errors, "Agent run settlement failed");
-				throw normalizeHarnessError(cause, "hook");
-			}
+			await this.flushPendingSessionWrites();
+			await this.emitAny(event, signal);
 			return;
 		}
 		await this.emitAny(event, signal);
+	}
+
+	private async settleRun(signal: AbortSignal): Promise<void> {
+		await this.flushPendingSessionWrites();
+		await this.finishRuntimeOperation();
+		const errors: Error[] = [];
+		try {
+			await this.emitOwn({ type: "settled", nextTurnCount: this.nextTurnQueue.length }, signal);
+		} catch (error) {
+			errors.push(toError(error));
+		}
+		this.sessionWritesSealed = true;
+		try {
+			await this.flushPendingSessionWrites();
+		} catch (error) {
+			errors.push(toError(error));
+		}
+		if (errors.length > 0) {
+			const cause = errors.length === 1 ? errors[0]! : new AggregateError(errors, "Agent run settlement failed");
+			throw normalizeHarnessError(cause, "hook");
+		}
 	}
 
 	private async emitRunFailure(
@@ -962,12 +981,14 @@ export class AgentHarness<
 	): Promise<AssistantMessage> {
 		let activeTurnState = turnState;
 		let terminalSettlementStarted = false;
-		const abortController = new AbortController();
+		const abortController = this.runAbortController;
+		if (!abortController) {
+			throw new AgentHarnessError("invalid_state", "AgentHarness run abort barrier is unavailable");
+		}
 		const getTurnState = () => activeTurnState;
 		const setTurnState = (nextTurnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>) => {
 			activeTurnState = nextTurnState;
 		};
-		this.runAbortController = abortController;
 		this.acceptsTurnInput = true;
 		const runResultPromise = (async () => {
 			try {
@@ -1013,13 +1034,19 @@ export class AgentHarness<
 		})();
 		try {
 			const newMessages = await runResultPromise;
+			let assistantMessage: AssistantMessage | undefined;
 			for (let i = newMessages.length - 1; i >= 0; i--) {
 				const message = newMessages[i]!;
 				if (message.role === "assistant") {
-					return message;
+					assistantMessage = message;
+					break;
 				}
 			}
-			throw new AgentHarnessError("invalid_state", "AgentHarness prompt completed without an assistant message");
+			if (!assistantMessage) {
+				throw new AgentHarnessError("invalid_state", "AgentHarness prompt completed without an assistant message");
+			}
+			await this.settleRun(abortController.signal);
+			return assistantMessage;
 		} finally {
 			try {
 				await this.flushPendingSessionWrites();
@@ -1635,6 +1662,7 @@ export class AgentHarness<
 
 	async abort(): Promise<AbortResult> {
 		const activeRun = this.runAbortController;
+		const activeRunPromise = activeRun ? this.runPromise : undefined;
 		this.requestAbort();
 		const errors: Error[] = [];
 		const clearedSteer = await this.discardQueuedMessages(this.steerQueue, "abort", errors);
@@ -1644,9 +1672,9 @@ export class AgentHarness<
 		} catch (error) {
 			errors.push(toError(error));
 		}
-		if (activeRun) {
+		if (activeRunPromise) {
 			try {
-				await this.waitForIdle();
+				await activeRunPromise;
 			} catch (error) {
 				errors.push(toError(error));
 			}

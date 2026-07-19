@@ -103,6 +103,14 @@
           "path": "artifacts-and-processes.md"
         },
         {
+          "title": "SDK Orchestration Primitives",
+          "path": "sdk-orchestration-primitives.md"
+        },
+        {
+          "title": "Workspace Change Discipline",
+          "path": "workspace-change-discipline.md"
+        },
+        {
           "title": "RPC Mode",
           "path": "rpc.md"
         },

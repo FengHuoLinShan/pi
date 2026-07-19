@@ -129,6 +129,9 @@ import {
 const adapter = createToolPolicyAdapter({
   policy,
   specs: [updateRecordSpec],
+  observeAuthorization: (observation) => {
+    authorizationMetrics.record(observation);
+  },
   resolveInvocation: (context) => ({
     sessionId: activeSessionId,
     resources: [{
@@ -155,6 +158,12 @@ const config = {
 
 If no approval callback is configured, `require_approval` produces a blocked tool call. Use `adapter.authorize()` when the caller needs the structured decision and `ApprovalRequest`; use `adapter.beforeToolCall()` when only the existing block hook is needed.
 
+`observeAuthorization` is an opt-in, passive outcome hook. It receives the policy and tool revisions, matched rule id, resolved-call hash, decision, allow/block outcome, and whether approval was unnecessary, granted, or not granted. It never receives tool arguments, resolved resources or locators, session identity, policy reasons, or approval grant ids. Observer throws and rejected promises are isolated and cannot change the authorization result. The observer receives a detached, flat observation object; mutating or retaining it cannot change the authorization result or grant state.
+
+The resolved-call hash is a deterministic integrity binding and correlatable pseudonym, not anonymization. Low-entropy argument or resource combinations may be recoverable by dictionary testing. Tool names and application-provided tool-call ids are also visible. Do not encode secrets in identifiers, and do not export observations outside the trust boundary unless the receiving system's threat model accepts these fields. Applications that require unlinkable external telemetry should omit the hash at their own projection boundary or replace it with an application-owned keyed binding before export.
+
+An authorization observation proves only what this adapter decided for a resolved invocation. It does not prove that the tool executed, that execution matched the declaration, or that another execution path did not bypass the adapter. Correlate it with trusted runtime events when execution evidence is required, and use a sandbox for process-level enforcement.
+
 `AgentHarness` accepts the adapter directly:
 
 ```ts
@@ -169,6 +178,54 @@ Harness `tool_call` hooks run first so argument transformations are included in 
 `adapter.getSpec(name)` returns a validated defensive copy for runtime metadata and inspection. Resolver-backed specs are snapshotted on first lookup so runtime retry metadata and authorization use the same declaration; recreate the adapter to install a new spec revision. `adapter.authorizeInvocation()` remains available for hosts that integrate an invocation shape other than the low-level loop or `AgentHarness`.
 
 The adapter fails closed for missing specs, declined approvals, expired grants, stale policy or tool revisions, broader scopes, reused one-shot grants, and session-scoped rules without a session id.
+
+## Opt-in Harness discipline audit
+
+`createHarnessDisciplineAudit()` correlates policy outcomes with one Harness run without changing authorization or execution. Create a fresh audit for every `prompt()` call, pass its bound observer properties directly to the policy adapter and Harness, then evaluate it with an explicit completion verifier:
+
+```ts
+import {
+  createHarnessDisciplineAudit,
+  createHarnessDisciplineCompletionVerifier,
+} from "@earendil-works/pi-agent-core";
+
+const audit = createHarnessDisciplineAudit();
+const adapter = createToolPolicyAdapter({
+  policy,
+  specs,
+  observeAuthorization: audit.observeAuthorization,
+});
+const harness = new AgentHarness({
+  // Other AgentHarnessOptions fields...
+  toolPolicy: adapter,
+});
+const unsubscribe = harness.subscribe(audit.observeHarnessEvent);
+
+await harness.prompt("perform the task");
+
+const verifier = createHarnessDisciplineCompletionVerifier({
+  id: "harness-discipline",
+  getAudit: (context: { audit: typeof audit }) => context.audit,
+  expectedPolicyRevision: policy.revision,
+  requireEveryExecutionAuthorized: true,
+  deniedAttempts: "fail",
+  minAuthorizationDecisions: 1,
+  requireEveryAttemptOutcome: true,
+  allowedAttemptOutcomes: ["body_success"],
+  requireSettled: true,
+  maxNextTurnCount: 0,
+});
+
+unsubscribe();
+```
+
+The Harness emits `tool_execution_start` before argument validation, tool-call hooks, and policy authorization. The audit therefore records an execution attempt first and expects the authorization observation afterward. Its matching `tool_execution_end.attemptOutcome` is a closed, content-free terminal classification that distinguishes non-execution, tool-body, and after-hook paths without retaining the error or block reason. An authorization or outcome observed before its matching start, duplicate starts, decisions, or outcomes, mismatched tool names, malformed relevant events, duplicate settlement, and relevant events after settlement are structural violations and always fail the verifier.
+
+`requireEveryExecutionAuthorized` separately controls whether starts with no matching allowed decision fail; this can include missing tools, invalid arguments, or calls blocked by an earlier Harness hook before policy runs. `requireEveryAttemptOutcome` controls whether legacy or external end events without a valid outcome fail. `allowedAttemptOutcomes` is a required, dense, duplicate-free allowlist over the closed outcome vocabulary; observed outcomes outside it fail independently of completeness. Both fields are snapshotted with the other verifier options at construction.
+
+All behavior-affecting verifier options are explicit; there are no implicit policy defaults. The verifier copies its id, audit resolver, and policy options at construction, so later mutation of the caller-owned options object cannot change an existing verifier. `deniedAttempts: "allow"` permits observed denials only when `requireEveryExecutionAuthorized` is also false. `expectedPolicyRevision` constrains observed decisions but does not imply that one must exist; set `minAuthorizationDecisions` to at least `1` when a decision is required. `maxNextTurnCount` requires `requireSettled: true`.
+
+The audit stores tool-call ids and tool names only inside the per-run correlator. Its version-2 public snapshot and completion evidence contain aggregate authorization, attempt-outcome, settlement, and anomaly counts only and never include ids, tool names, hashes, arguments, resources, paths, reasons, or locators. `attemptOutcomes.observed` and its per-outcome counts include only valid terminal outcomes that, when observed before settlement, matched an earlier start by both tool-call id and tool name; orphaned, mismatched, invalid, or late ends remain structural anomalies and do not affect behavioral outcome counts. The authorization observer is synchronously copied so later caller mutation cannot alter the audit. The audit ignores all Harness events except `tool_execution_start`, `tool_execution_end`, and `settled`; it does not modify the default Harness or CLI pipeline.
 
 ## Integration responsibilities
 

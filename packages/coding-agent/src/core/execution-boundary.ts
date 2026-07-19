@@ -305,12 +305,23 @@ function requireOperations(
 			);
 		}
 		if (
-			(toolName === "read" || toolName === "edit" || toolName === "write") &&
+			(toolName === "read" ||
+				toolName === "edit" ||
+				toolName === "write" ||
+				toolName === "grep" ||
+				toolName === "find" ||
+				toolName === "ls") &&
 			!("realpath" in toolOperations && typeof toolOperations.realpath === "function")
 		) {
 			throw new ExecutionBoundaryError(
 				"operation_missing",
 				`Boundary backend operations for ${toolName} must provide realpath for canonical root checks`,
+			);
+		}
+		if (toolName === "grep" && !("search" in toolOperations && typeof toolOperations.search === "function")) {
+			throw new ExecutionBoundaryError(
+				"operation_missing",
+				"Boundary backend operations for grep must provide search to avoid host-process execution",
 			);
 		}
 	}

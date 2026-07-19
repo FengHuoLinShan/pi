@@ -93,6 +93,21 @@ Passing `executionBoundary` changes construction to fail closed:
 
 This contract does not create isolation. The backend remains responsible for enforcing its attested container, VM, operating-system, or remote-sandbox policy. See [Security](security.md) and [Containerization](containerization.md).
 
+## Process-backed completion verification
+
+`createProcessSessionCompletionVerifier()` is an opt-in bridge from completion contracts to `ProcessSessionManager`. Calling the verifier starts one foreground process, waits for its terminal state, and maps expected exit codes to `pass` or `fail`. Interrupted or unavailable process backends produce `blocked`; backend execution failures produce `error`.
+
+```typescript
+const focusedTests = createProcessSessionCompletionVerifier({
+  id: "focused-tests",
+  manager,
+  command: process.execPath,
+  args: ["node_modules/vitest/dist/cli.js", "--run", "test/focused.test.ts"],
+});
+```
+
+Environment values and output content are never copied into completion evidence. Evidence contains process state, exit code, output byte counts, a `process-session:<id>` reference, and `sha256:<digest>` output references. Consumers can pass the verifier to `verifyCompletionContract()` or `executeVerifiedRun()` and resolve artifacts explicitly through their own `ArtifactStore` policy.
+
 ## Integration Status
 
-These modules are exported from the public SDK but remain intentionally separate from the current foreground `bash` implementation. Wiring them into the interactive tool surface requires an explicit product choice about foreground versus durable/background command behavior, output presentation, retention, and cleanup policy. Importing the modules does not change existing `bash` behavior or session JSONL format.
+These modules are exported from the public SDK but remain intentionally separate from the current foreground `bash` implementation. The completion verifier is invoked only by a caller's explicit verification flow; it does not add background bash. Wiring process sessions into the interactive tool surface would require an explicit product choice about foreground versus durable/background command behavior, output presentation, retention, and cleanup policy. Importing the modules does not change existing `bash` behavior or session JSONL format.

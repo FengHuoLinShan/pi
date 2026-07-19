@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	Agent,
@@ -43,6 +44,7 @@ import {
 	type ToolName,
 	withFileMutationQueue,
 } from "./tools/index.ts";
+import type { WorkspaceOverlay } from "./workspace-overlay.ts";
 
 export interface CreateAgentSessionOptions {
 	/** Working directory for project-local discovery. Default: process.cwd() */
@@ -85,6 +87,11 @@ export interface CreateAgentSessionOptions {
 	 * Default local behavior is unchanged when omitted.
 	 */
 	executionBoundary?: ExecutionBoundary;
+	/**
+	 * Explicit opt-in materialized workspace used by every built-in file/search/bash tool.
+	 * The host owns PatchSet review, application, and discard.
+	 */
+	workspaceOverlay?: WorkspaceOverlay;
 
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
@@ -200,6 +207,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+	if (options.workspaceOverlay && options.executionBoundary) {
+		throw new Error("workspaceOverlay cannot be combined with executionBoundary");
+	}
+	if (options.workspaceOverlay && (await realpath(cwd)) !== options.workspaceOverlay.getWorkspaceRoot()) {
+		throw new Error("workspaceOverlay must be created for the effective session cwd");
+	}
+	if (options.workspaceOverlay && options.workspaceOverlay.getState() !== "active") {
+		throw new Error(`workspaceOverlay must be active, found ${options.workspaceOverlay.getState()}`);
+	}
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
@@ -464,6 +480,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		resourceLoader,
 		customTools: options.customTools,
 		executionBoundary: options.executionBoundary,
+		workspaceOverlay: options.workspaceOverlay,
 		modelRuntime,
 		initialActiveToolNames,
 		allowedToolNames,

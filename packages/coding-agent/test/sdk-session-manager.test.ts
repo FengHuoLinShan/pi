@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createToolPolicyAdapter } from "@earendil-works/pi-agent-core";
@@ -9,6 +9,7 @@ import { CodingAgentHarnessRuntime } from "../src/core/coding-agent-harness-runt
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { WorkspaceOverlay } from "../src/core/workspace-overlay.ts";
 
 describe("createAgentSession session manager defaults", () => {
 	let tempDir: string;
@@ -165,6 +166,56 @@ describe("createAgentSession session manager defaults", () => {
 		expect(session.sessionManager.isPersisted()).toBe(false);
 
 		session.dispose();
+	});
+
+	it("routes built-in file tools and session bash through an explicit workspace overlay", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeTruthy();
+		writeFileSync(join(cwd, "example.txt"), "base\n", "utf8");
+		const { overlay } = await WorkspaceOverlay.open({
+			workspaceRoot: cwd,
+			overlayRoot: join(tempDir, "overlay"),
+		});
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			model: model!,
+			sessionManager: SessionManager.inMemory(cwd),
+			workspaceOverlay: overlay,
+		});
+		try {
+			const writeTool = session.agent.state.tools.find((tool) => tool.name === "write");
+			expect(writeTool).toBeTruthy();
+			await writeTool!.execute("overlay-write", { path: "example.txt", content: "staged\n" });
+			const result = await session.executeBash("pwd && cat example.txt", undefined, { excludeFromContext: true });
+
+			expect(session.workspaceOverlay).toBe(overlay);
+			expect(result.output).toContain(realpathSync(overlay.getWorkingDirectory()));
+			expect(result.output).toContain("staged");
+			expect(readFileSync(join(cwd, "example.txt"), "utf8")).toBe("base\n");
+			expect((await overlay.createPatchSet()).entries).toHaveLength(1);
+			await expect(
+				session.executeBash("host bypass", undefined, {
+					operations: { exec: async () => ({ exitCode: 0 }) },
+				}),
+			).rejects.toThrow("Cannot override bash operations when a workspace overlay is configured");
+			await overlay.applyPatchSet(await overlay.createPatchSet());
+			await expect(session.executeBash("pwd")).rejects.toThrow(
+				"Cannot execute bash with a applied workspace overlay",
+			);
+			await expect(
+				createAgentSession({
+					cwd,
+					agentDir,
+					model: model!,
+					sessionManager: SessionManager.inMemory(cwd),
+					workspaceOverlay: overlay,
+				}),
+			).rejects.toThrow("workspaceOverlay must be active, found applied");
+		} finally {
+			session.dispose();
+			await overlay.discard();
+		}
 	});
 
 	it("derives cwd from an explicit sessionManager when cwd is omitted", async () => {

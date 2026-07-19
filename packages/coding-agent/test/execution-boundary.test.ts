@@ -188,6 +188,45 @@ describe("bounded tool factories", () => {
 			}),
 		).toThrow(/Cannot override bash.operations/);
 	});
+
+	it("applies readable mount roots to boundary-owned search operations", async () => {
+		const find = createTool("find", "/host/project", {
+			boundary: createBoundary({
+				find: {
+					realpath: async (path) => path,
+					exists: async () => true,
+					glob: async () => ["/sandbox/outside/secret.txt"],
+				},
+			}),
+		});
+
+		await expect(find.execute("find", { pattern: "**/*" })).rejects.toThrow("outside the allowed roots");
+	});
+
+	it("requires canonical path and delegated search support for bounded search tools", () => {
+		expect(() =>
+			createTool("ls", "/host/project", {
+				boundary: createBoundary({
+					ls: {
+						exists: async () => true,
+						stat: async () => ({ isDirectory: () => true }),
+						readdir: async () => [],
+					},
+				}),
+			}),
+		).toThrow("must provide realpath");
+		expect(() =>
+			createTool("grep", "/host/project", {
+				boundary: createBoundary({
+					grep: {
+						realpath: async (path) => path,
+						isDirectory: async () => true,
+						readFile: async () => "",
+					},
+				}),
+			}),
+		).toThrow("must provide search");
+	});
 });
 
 describe("boundary environment filtering", () => {
@@ -231,14 +270,18 @@ describe("SDK execution boundary", () => {
 				mkdir: async () => {},
 			},
 			grep: {
+				realpath: async (path) => path,
 				isDirectory: async () => true,
 				readFile: async () => "content",
+				search: async () => [],
 			},
 			find: {
+				realpath: async (path) => path,
 				exists: async () => true,
 				glob: async () => [],
 			},
 			ls: {
+				realpath: async (path) => path,
 				exists: async () => true,
 				stat: async () => ({ isDirectory: () => true }),
 				readdir: async () => [],

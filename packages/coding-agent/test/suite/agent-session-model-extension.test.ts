@@ -2,7 +2,7 @@ import type { AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import type { BuildSystemPromptOptions, ExtensionAPI } from "../../src/index.ts";
+import type { BuildSystemPromptOptions, ExtensionAPI, ToolAttemptOutcome } from "../../src/index.ts";
 import { createHarness, getAssistantTexts, type Harness } from "./harness.ts";
 
 describe("AgentSession model and extension characterization", () => {
@@ -199,6 +199,39 @@ describe("AgentSession model and extension characterization", () => {
 		expect(
 			harness.session.messages.find((message) => message.role === "toolResult" && message.details?.patched === true),
 		).toBeDefined();
+	});
+
+	it("forwards tool attempt outcomes to extension lifecycle events", async () => {
+		const outcomes: Array<ToolAttemptOutcome | undefined> = [];
+		const echoTool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo text back",
+			parameters: Type.Object({ text: Type.String() }),
+			execute: async (_toolCallId, params) => {
+				const text = typeof params === "object" && params !== null && "text" in params ? String(params.text) : "";
+				return { content: [{ type: "text", text }], details: {} };
+			},
+		};
+		const harness = await createHarness({
+			tools: [echoTool],
+			extensionFactories: [
+				(pi) => {
+					pi.on("tool_execution_end", async (event) => {
+						outcomes.push(event.attemptOutcome);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("echo", { text: "hello" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+
+		await harness.session.prompt("hi");
+
+		expect(outcomes).toEqual(["body_success"]);
 	});
 
 	it("allows extension context handlers to modify messages before the LLM call", async () => {

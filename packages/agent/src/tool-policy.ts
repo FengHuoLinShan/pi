@@ -251,6 +251,24 @@ export interface ToolPolicyAuthorization {
 	approvalGrantId?: string;
 }
 
+export const TOOL_POLICY_AUTHORIZATION_OBSERVATION_VERSION = 1 as const;
+
+export type ToolPolicyApprovalObservation = "not_required" | "granted" | "not_granted";
+
+/** Content-minimized, passive observation of a completed authorization decision. */
+export interface ToolPolicyAuthorizationObservation {
+	readonly version: typeof TOOL_POLICY_AUTHORIZATION_OBSERVATION_VERSION;
+	readonly toolCallId: string;
+	readonly toolName: string;
+	readonly resolvedCallHash: string;
+	readonly policyRevision: string;
+	readonly toolSpecRevision?: string;
+	readonly ruleId?: string;
+	readonly decision: ToolPolicyEffect;
+	readonly allowed: boolean;
+	readonly approval: ToolPolicyApprovalObservation;
+}
+
 export type ToolSpecResolver = (toolName: string) => ToolSpec | undefined;
 
 export interface ToolPolicyAdapterInvocationContext {
@@ -271,6 +289,12 @@ export interface ToolPolicyAdapterOptions {
 	 * declines the request. The returned grant is validated before use.
 	 */
 	requestApproval?: (request: ApprovalRequest, signal?: AbortSignal) => Promise<ApprovalGrant | undefined>;
+	/**
+	 * Passive, content-minimized authorization observer. Exceptions and rejections are isolated.
+	 * Raw arguments, resources, locators, session identity, reasons, and approval ids are never exposed.
+	 * The resolved-call hash is a deterministic integrity binding, not anonymization.
+	 */
+	observeAuthorization?: (observation: ToolPolicyAuthorizationObservation) => void | Promise<void>;
 	now?: () => number;
 	createRequestId?: (decision: ToolPolicyDecision, invocation: ToolPolicyInvocation) => string;
 }
@@ -517,6 +541,38 @@ export function createToolPolicyAdapter(options: ToolPolicyAdapterOptions): Tool
 		options.createRequestId ??
 		((decision: ToolPolicyDecision, invocation: ToolPolicyInvocation) =>
 			`${invocation.toolCallId}:${decision.policyRevision}:${decision.ruleId ?? "default"}:${invocation.resolvedCallHash ?? "unresolved"}`);
+	const authorizationObserver = options.observeAuthorization;
+	const finishAuthorization = (
+		invocation: ToolPolicyInvocation & { resolvedCallHash: string },
+		authorization: ToolPolicyAuthorization,
+	): ToolPolicyAuthorization => {
+		if (!authorizationObserver) return authorization;
+		const decision = authorization.decision;
+		const observation: ToolPolicyAuthorizationObservation = {
+			version: TOOL_POLICY_AUTHORIZATION_OBSERVATION_VERSION,
+			toolCallId: invocation.toolCallId,
+			toolName: invocation.toolName,
+			resolvedCallHash: invocation.resolvedCallHash,
+			policyRevision: decision.policyRevision,
+			...(decision.toolSpecRevision === undefined ? {} : { toolSpecRevision: decision.toolSpecRevision }),
+			...(decision.ruleId === undefined ? {} : { ruleId: decision.ruleId }),
+			decision: decision.decision,
+			allowed: authorization.allowed,
+			approval:
+				decision.decision !== "require_approval"
+					? "not_required"
+					: authorization.allowed
+						? "granted"
+						: "not_granted",
+		};
+		try {
+			const result = authorizationObserver(observation);
+			if (result) void Promise.resolve(result).catch(() => undefined);
+		} catch {
+			// Authorization observation is passive and must never affect the decision.
+		}
+		return authorization;
+	};
 
 	const authorizeInvocation = async (
 		invocation: ToolPolicyInvocation,
@@ -524,14 +580,20 @@ export function createToolPolicyAdapter(options: ToolPolicyAdapterOptions): Tool
 	): Promise<ToolPolicyAuthorization> => {
 		const resolvedInvocation = { ...invocation, resolvedCallHash: await hashToolPolicyInvocation(invocation) };
 		const decision = evaluateToolPolicy(options.policy, getSpec(resolvedInvocation.toolName), resolvedInvocation);
-		if (decision.decision === "allow") return { allowed: true, decision };
-		if (decision.decision === "deny") return { allowed: false, decision, reason: decision.reason };
+		if (decision.decision === "allow") return finishAuthorization(resolvedInvocation, { allowed: true, decision });
+		if (decision.decision === "deny") {
+			return finishAuthorization(resolvedInvocation, { allowed: false, decision, reason: decision.reason });
+		}
 
 		const timestamp = now();
 		const existingGrant = findApplicableGrant(grantStore, decision, resolvedInvocation, timestamp);
 		if (existingGrant) {
 			if (existingGrant.oneShot) grantStore.consume(existingGrant.id);
-			return { allowed: true, decision, approvalGrantId: existingGrant.id };
+			return finishAuthorization(resolvedInvocation, {
+				allowed: true,
+				decision,
+				approvalGrantId: existingGrant.id,
+			});
 		}
 
 		let request: ApprovalRequest;
@@ -541,25 +603,47 @@ export function createToolPolicyAdapter(options: ToolPolicyAdapterOptions): Tool
 				now: timestamp,
 			});
 		} catch (error) {
-			return {
+			return finishAuthorization(resolvedInvocation, {
 				allowed: false,
 				decision,
 				reason: error instanceof Error ? error.message : String(error),
-			};
+			});
 		}
 		if (!options.requestApproval) {
-			return { allowed: false, decision, reason: decision.reason, approvalRequest: request };
+			return finishAuthorization(resolvedInvocation, {
+				allowed: false,
+				decision,
+				reason: decision.reason,
+				approvalRequest: request,
+			});
 		}
 
 		const grant = await options.requestApproval(request, signal);
 		if (signal?.aborted) {
-			return { allowed: false, decision, reason: "Approval request was aborted", approvalRequest: request };
+			return finishAuthorization(resolvedInvocation, {
+				allowed: false,
+				decision,
+				reason: "Approval request was aborted",
+				approvalRequest: request,
+			});
 		}
-		if (!grant) return { allowed: false, decision, reason: "Approval was not granted", approvalRequest: request };
+		if (!grant) {
+			return finishAuthorization(resolvedInvocation, {
+				allowed: false,
+				decision,
+				reason: "Approval was not granted",
+				approvalRequest: request,
+			});
+		}
 		const validationTime = now();
 		const requestValidation = validateApprovalGrantForRequest(grant, request, validationTime);
 		if (!requestValidation.valid) {
-			return { allowed: false, decision, reason: requestValidation.reason, approvalRequest: request };
+			return finishAuthorization(resolvedInvocation, {
+				allowed: false,
+				decision,
+				reason: requestValidation.reason,
+				approvalRequest: request,
+			});
 		}
 		const invocationValidation = validateApprovalGrantForInvocation(
 			grant,
@@ -569,11 +653,21 @@ export function createToolPolicyAdapter(options: ToolPolicyAdapterOptions): Tool
 			grantStore.isConsumed(grant.id),
 		);
 		if (!invocationValidation.valid) {
-			return { allowed: false, decision, reason: invocationValidation.reason, approvalRequest: request };
+			return finishAuthorization(resolvedInvocation, {
+				allowed: false,
+				decision,
+				reason: invocationValidation.reason,
+				approvalRequest: request,
+			});
 		}
 		grantStore.add(grant);
 		if (grant.oneShot) grantStore.consume(grant.id);
-		return { allowed: true, decision, approvalRequest: request, approvalGrantId: grant.id };
+		return finishAuthorization(resolvedInvocation, {
+			allowed: true,
+			decision,
+			approvalRequest: request,
+			approvalGrantId: grant.id,
+		});
 	};
 	const authorize = async (
 		context: BeforeToolCallContext,
@@ -902,14 +996,38 @@ function canonicalJson(value: unknown): string {
 		if (ancestors.has(candidate)) throw new Error("Tool policy invocation contains a circular value");
 		ancestors.add(candidate);
 		try {
-			if (Array.isArray(candidate)) return candidate.map((item) => normalize(item));
+			if (Object.getOwnPropertySymbols(candidate).length > 0) {
+				throw new Error("Tool policy invocation contains symbol keys");
+			}
+			if (Array.isArray(candidate)) {
+				const propertyNames = Object.getOwnPropertyNames(candidate);
+				if (
+					propertyNames.some(
+						(name) => name !== "length" && (!/^(0|[1-9][0-9]*)$/.test(name) || Number(name) >= candidate.length),
+					)
+				) {
+					throw new Error("Tool policy invocation array contains named properties");
+				}
+				const normalized: unknown[] = [];
+				for (let index = 0; index < candidate.length; index++) {
+					const descriptor = Object.getOwnPropertyDescriptor(candidate, index);
+					if (!descriptor) throw new Error("Tool policy invocation contains a sparse array");
+					if (!("value" in descriptor)) throw new Error("Tool policy invocation contains accessor properties");
+					normalized.push(normalize(descriptor.value));
+				}
+				return normalized;
+			}
 			const prototype = Object.getPrototypeOf(candidate);
 			if (prototype !== Object.prototype && prototype !== null) {
 				throw new Error("Tool policy invocation contains a non-plain object");
 			}
-			const normalized: Record<string, unknown> = {};
-			for (const key of Object.keys(candidate).sort(compareStrings)) {
-				normalized[key] = normalize((candidate as Record<string, unknown>)[key]);
+			const normalized = Object.create(null) as Record<string, unknown>;
+			for (const key of Object.getOwnPropertyNames(candidate).sort(compareStrings)) {
+				const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+				if (!descriptor || !("value" in descriptor)) {
+					throw new Error("Tool policy invocation contains accessor properties");
+				}
+				normalized[key] = normalize(descriptor.value);
 			}
 			return normalized;
 		} finally {

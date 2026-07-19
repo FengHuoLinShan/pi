@@ -1,4 +1,4 @@
-import { readdir as fsReaddir, stat as fsStat } from "node:fs/promises";
+import { readdir as fsReaddir, realpath as fsRealpath, stat as fsStat } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
 import nodePath from "path";
@@ -6,6 +6,12 @@ import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import {
+	captureFilePathSnapshot,
+	type FilePathOperations,
+	type FilePathPolicy,
+	revalidateFilePathSnapshot,
+} from "./file-transaction.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, renderToolPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -29,7 +35,7 @@ export interface LsToolDetails {
  * Pluggable operations for the ls tool.
  * Override these to delegate directory listing to remote systems (for example SSH).
  */
-export interface LsOperations {
+export interface LsOperations extends FilePathOperations {
 	/** Check if path exists */
 	exists: (absolutePath: string) => Promise<boolean> | boolean;
 	/** Get file or directory stats. Throws if not found. */
@@ -42,9 +48,10 @@ const defaultLsOperations: LsOperations = {
 	exists: pathExists,
 	stat: fsStat,
 	readdir: fsReaddir,
+	realpath: fsRealpath,
 };
 
-export interface LsToolOptions {
+export interface LsToolOptions extends FilePathPolicy {
 	/** Custom operations for directory listing. Default: local filesystem */
 	operations?: LsOperations;
 }
@@ -97,6 +104,7 @@ export function createLsToolDefinition(
 	options?: LsToolOptions,
 ): ToolDefinition<typeof lsSchema, LsToolDetails | undefined> {
 	const ops = options?.operations ?? defaultLsOperations;
+	const allowedRoots = options?.allowedRoots?.map((root) => resolveToCwd(root, cwd));
 	return {
 		name: "ls",
 		label: "ls",
@@ -121,7 +129,15 @@ export function createLsToolDefinition(
 
 				(async () => {
 					try {
-						const dirPath = resolveToCwd(path || ".", cwd);
+						const requestedPath = resolveToCwd(path || ".", cwd);
+						const pathSnapshot = await captureFilePathSnapshot(
+							requestedPath,
+							path || ".",
+							allowedRoots,
+							ops.realpath,
+							true,
+						);
+						const dirPath = pathSnapshot.targetPath;
 						const effectiveLimit = limit ?? DEFAULT_LIMIT;
 
 						// Check if path exists.
@@ -136,6 +152,7 @@ export function createLsToolDefinition(
 							reject(new Error(`Not a directory: ${dirPath}`));
 							return;
 						}
+						await revalidateFilePathSnapshot(pathSnapshot, path || ".", allowedRoots, ops.realpath);
 
 						// Read directory entries.
 						let entries: string[];
@@ -158,12 +175,26 @@ export function createLsToolDefinition(
 								break;
 							}
 
-							const fullPath = nodePath.join(dirPath, entry);
+							const requestedEntryPath = nodePath.join(dirPath, entry);
 							let suffix = "";
 							try {
-								const entryStat = await ops.stat(fullPath);
+								const entrySnapshot = await captureFilePathSnapshot(
+									requestedEntryPath,
+									entry,
+									allowedRoots === undefined ? undefined : [dirPath],
+									ops.realpath,
+									true,
+								);
+								const entryStat = await ops.stat(entrySnapshot.targetPath);
+								await revalidateFilePathSnapshot(
+									entrySnapshot,
+									entry,
+									allowedRoots === undefined ? undefined : [dirPath],
+									ops.realpath,
+								);
 								if (entryStat.isDirectory()) suffix = "/";
-							} catch {
+							} catch (error) {
+								if (allowedRoots !== undefined) throw error;
 								// Skip entries we cannot stat.
 								continue;
 							}

@@ -143,6 +143,7 @@ export type {
 	SetModelHandler,
 	SetThinkingLevelHandler,
 	TerminalInputHandler,
+	ToolAttemptOutcome,
 	// Events - Tool
 	ToolCallEvent,
 	ToolCallEventResult,

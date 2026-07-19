@@ -10,13 +10,20 @@
 - Added an attested SDK execution-boundary contract for routing built-in tools and session bash through external OS, container, VM, or remote-sandbox backends, with fail-closed workspace, process, network, and environment policy validation.
 - Added local content-addressed artifact storage and recoverable process-session lifecycle primitives with artifact-backed output and execution-boundary binding.
 - Added a transport-independent, negotiated app protocol with strict JSON-RPC validation, typed Thread/Turn/Item events, reverse approval/input requests, and bounded cursor replay.
+- Added opt-in transactional workspace overlays with complete PatchSets, conflict preflight, durable apply journals, compensating rollback, and built-in tool/session routing.
+- Added a language-neutral incremental code graph with revision-atomic updates, deterministic snapshots, and bounded dependency/impact queries.
+- Added explicit Shadow Runs over comparable isolated overlays with completion-contract gates and caller-defined ranking.
+- Added an opt-in process-session completion verifier that keeps command output in ArtifactStore and exposes only structured status and opaque evidence references.
+- Added an opt-in workspace-change discipline verifier with synchronous or asynchronous PatchSet capture, path, operation, minimum/maximum file-count, and byte-count gates, and privacy-preserving completion evidence.
 
 ### Changed
 
 - Changed SDK-created coding sessions with a selected model to run through the durable AgentHarness runtime while preserving the public `Agent` facade and extension lifecycle, with direct run-budget, loop-detection, and tool-policy configuration.
+- Forwarded optional core tool-attempt outcomes through extension `tool_execution_end` events.
 
 ### Fixed
 
+- Fixed SDK execution-boundary search tools to enforce readable roots and delegate grep to the backend instead of starting host search binaries.
 - Fixed source-checkout extension loading to resolve workspace package source entrypoints when build artifacts are absent.
 - Fixed prompt-template defaults for all arguments (`${@:-default}` and `${ARGUMENTS:-default}`) ([#6695](https://github.com/earendil-works/pi/issues/6695)).
 - Fixed obsolete custom UI, custom tool, and custom editor examples in the extension documentation ([#6735](https://github.com/earendil-works/pi/issues/6735)).

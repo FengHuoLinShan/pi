@@ -38,6 +38,8 @@ export {
 	createGrepTool,
 	createGrepToolDefinition,
 	type GrepOperations,
+	type GrepSearchMatch,
+	type GrepSearchRequest,
 	type GrepToolDetails,
 	type GrepToolInput,
 	type GrepToolOptions,
@@ -80,6 +82,7 @@ export {
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type ExecutionBoundary, filterBoundaryEnvironment, resolveExecutionBoundary } from "../execution-boundary.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
+import type { WorkspaceOverlay } from "../workspace-overlay.ts";
 import { type BashToolOptions, createBashTool, createBashToolDefinition } from "./bash.ts";
 import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.ts";
 import { createFindTool, createFindToolDefinition, type FindToolOptions } from "./find.ts";
@@ -96,6 +99,8 @@ export const allToolNames: Set<ToolName> = new Set(["read", "bash", "edit", "wri
 export interface ToolsOptions {
 	/** Route built-in tool operations through an attested external execution boundary. */
 	boundary?: ExecutionBoundary;
+	/** Run built-in tools against an explicit materialized workspace overlay. */
+	overlay?: WorkspaceOverlay;
 	read?: ReadToolOptions;
 	bash?: BashToolOptions;
 	write?: WriteToolOptions;
@@ -105,6 +110,19 @@ export interface ToolsOptions {
 	ls?: LsToolOptions;
 }
 
+function assertOverlayOptionsAreNotOverridden(options: ToolsOptions, toolNames: readonly ToolName[]): void {
+	for (const toolName of toolNames) {
+		if (options[toolName]?.operations) {
+			throw new Error(`Cannot override ${toolName}.operations when a workspace overlay is configured`);
+		}
+	}
+	for (const toolName of ["read", "edit", "write", "grep", "find", "ls"] as const) {
+		if (toolNames.includes(toolName) && options[toolName]?.allowedRoots !== undefined) {
+			throw new Error(`Cannot override ${toolName}.allowedRoots when a workspace overlay is configured`);
+		}
+	}
+}
+
 function assertBoundaryOptionsAreNotOverridden(options: ToolsOptions, toolNames: readonly ToolName[]): void {
 	for (const toolName of toolNames) {
 		const toolOptions = options[toolName];
@@ -112,7 +130,7 @@ function assertBoundaryOptionsAreNotOverridden(options: ToolsOptions, toolNames:
 			throw new Error(`Cannot override ${toolName}.operations when an execution boundary is configured`);
 		}
 	}
-	for (const toolName of ["read", "edit", "write"] as const) {
+	for (const toolName of ["read", "edit", "write", "grep", "find", "ls"] as const) {
 		if (toolNames.includes(toolName) && options[toolName]?.allowedRoots !== undefined) {
 			throw new Error(`Cannot override ${toolName}.allowedRoots when an execution boundary is configured`);
 		}
@@ -127,6 +145,33 @@ function resolveToolsContext(
 	options: ToolsOptions | undefined,
 	toolNames: readonly ToolName[],
 ): { cwd: string; options: ToolsOptions | undefined } {
+	if (options?.boundary && options.overlay) {
+		throw new Error("executionBoundary and workspace overlay cannot be configured together");
+	}
+	if (options?.overlay) {
+		assertOverlayOptionsAreNotOverridden(options, toolNames);
+		const workingDirectory = options.overlay.getWorkingDirectory();
+		const resolved: ToolsOptions = { ...options, overlay: undefined };
+		if (toolNames.includes("read")) {
+			resolved.read = { ...options.read, allowedRoots: [workingDirectory] };
+		}
+		if (toolNames.includes("edit")) {
+			resolved.edit = { ...options.edit, allowedRoots: [workingDirectory] };
+		}
+		if (toolNames.includes("write")) {
+			resolved.write = { ...options.write, allowedRoots: [workingDirectory] };
+		}
+		if (toolNames.includes("grep")) {
+			resolved.grep = { ...options.grep, allowedRoots: [workingDirectory] };
+		}
+		if (toolNames.includes("find")) {
+			resolved.find = { ...options.find, allowedRoots: [workingDirectory] };
+		}
+		if (toolNames.includes("ls")) {
+			resolved.ls = { ...options.ls, allowedRoots: [workingDirectory] };
+		}
+		return { cwd: workingDirectory, options: resolved };
+	}
 	if (!options?.boundary) return { cwd, options };
 	assertBoundaryOptionsAreNotOverridden(options, toolNames);
 	const boundary = resolveExecutionBoundary(options.boundary, toolNames);
@@ -164,13 +209,25 @@ function resolveToolsContext(
 		};
 	}
 	if (toolNames.includes("grep")) {
-		resolved.grep = { ...options.grep, operations: boundary.operations.grep };
+		resolved.grep = {
+			...options.grep,
+			operations: boundary.operations.grep,
+			allowedRoots: [...boundary.readableRoots],
+		};
 	}
 	if (toolNames.includes("find")) {
-		resolved.find = { ...options.find, operations: boundary.operations.find };
+		resolved.find = {
+			...options.find,
+			operations: boundary.operations.find,
+			allowedRoots: [...boundary.readableRoots],
+		};
 	}
 	if (toolNames.includes("ls")) {
-		resolved.ls = { ...options.ls, operations: boundary.operations.ls };
+		resolved.ls = {
+			...options.ls,
+			operations: boundary.operations.ls,
+			allowedRoots: [...boundary.readableRoots],
+		};
 	}
 
 	return { cwd: boundary.cwd, options: resolved };

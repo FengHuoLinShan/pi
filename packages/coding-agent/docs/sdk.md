@@ -623,7 +623,8 @@ const bash = createTool("bash", process.cwd(), {
 
 Bounded sessions require adapters for all seven built-in tools so later activation cannot fall back to local execution. Pi also:
 
-- derives file-tool roots from declared mount targets and prevents callers from replacing those roots or operations
+- derives file/search-tool roots from declared mount targets and prevents callers from replacing those roots or operations
+- requires canonical `realpath` operations for bounded file/search tools and a delegated `grep.search` implementation, so bounded grep never starts host `rg`
 - filters the environment passed to tool processes to `profile.environment.allow`
 - rejects SDK `customTools`, extension-registered tools, and non-built-in names in `tools`
 - rejects custom bash operations passed to `AgentSession.executeBash()`

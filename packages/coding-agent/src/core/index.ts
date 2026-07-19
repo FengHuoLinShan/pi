@@ -26,6 +26,7 @@ export {
 	createAgentSessionServices,
 } from "./agent-session-services.ts";
 export { type BashExecutorOptions, type BashResult, executeBashWithOperations } from "./bash-executor.ts";
+export * from "./code-graph.ts";
 export type { CompactionResult } from "./compaction/index.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./event-bus.ts";
 export { areExperimentalFeaturesEnabled } from "./experimental.ts";
@@ -68,6 +69,7 @@ export {
 	type SessionShutdownEvent,
 	type SessionStartEvent,
 	type SessionTreeEvent,
+	type ToolAttemptOutcome,
 	type ToolCallEvent,
 	type ToolCallEventResult,
 	type ToolDefinition,
@@ -77,4 +79,8 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export * from "./process-session-verifier.ts";
+export * from "./shadow-runs.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";
+export * from "./workspace-change-discipline-verifier.ts";
+export * from "./workspace-overlay.ts";

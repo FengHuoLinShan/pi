@@ -330,6 +330,7 @@ describe("agentLoop with AgentMessage", () => {
 		expect(toolEnd).toBeDefined();
 		if (toolEnd?.type === "tool_execution_end") {
 			expect(toolEnd.isError).toBe(false);
+			expect(toolEnd.attemptOutcome).toBe("body_success");
 		}
 	});
 
@@ -396,6 +397,7 @@ describe("agentLoop with AgentMessage", () => {
 		expect(toolEnd).toBeDefined();
 		if (toolEnd?.type === "tool_execution_end") {
 			expect(toolEnd.isError).toBe(true);
+			expect(toolEnd.attemptOutcome).toBe("not_executed_truncated");
 			const text = toolEnd.result.content.find((c: { type: string }) => c.type === "text");
 			expect(text && "text" in text ? text.text : "").toContain("output token limit");
 		}
@@ -1438,9 +1440,9 @@ describe("agentLoop run limits", () => {
 			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
 		);
 		expect(executed).toEqual(["first"]);
-		expect(toolEnds.map((event) => [event.toolCallId, event.isError])).toEqual([
-			["call-1", false],
-			["call-2", true],
+		expect(toolEnds.map((event) => [event.toolCallId, event.attemptOutcome, event.isError])).toEqual([
+			["call-1", "body_success", false],
+			["call-2", "not_executed_budget", true],
 		]);
 		expect(events.find((event) => event.type === "agent_termination")).toMatchObject({
 			termination: { status: "budget_exhausted", reason: "max_tool_calls", limit: 1, observed: 1 },
@@ -1477,6 +1479,9 @@ describe("agentLoop run limits", () => {
 		for await (const event of stream) events.push(event);
 
 		expect(executed).toEqual([]);
+		expect(
+			events.find((event) => event.type === "tool_execution_end" && event.toolCallId === "call-1"),
+		).toMatchObject({ attemptOutcome: "not_executed_budget" });
 		const termination = events.find((event) => event.type === "agent_termination");
 		expect(termination).toMatchObject({
 			termination: { status: "budget_exhausted", reason: "max_model_tokens", limit: 1 },
@@ -1688,9 +1693,9 @@ describe("agentLoop run limits", () => {
 		const toolEnds = events.filter(
 			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
 		);
-		expect(toolEnds.map((event) => [event.toolCallId, event.isError])).toEqual([
-			["call-1", false],
-			["call-2", true],
+		expect(toolEnds.map((event) => [event.toolCallId, event.attemptOutcome, event.isError])).toEqual([
+			["call-1", "body_success", false],
+			["call-2", "not_executed_loop", true],
 		]);
 	});
 
