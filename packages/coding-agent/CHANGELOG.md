@@ -22,6 +22,7 @@
 - Added an opt-in process-session completion verifier that keeps command output in ArtifactStore and exposes only structured status and opaque evidence references.
 - Added enforceable per-process durable output limits and bounded artifact-backed output tail reads.
 - Added opt-in, human-controlled managed background jobs with direct argv execution, workspace-scoped journals, artifact-backed output, active-job and output limits, recovery warnings, and clean shutdown.
+- Added explicit `/job send` context attachment with bounded sanitized output, untrusted-data framing, and no automatic model turn.
 - Added an opt-in workspace-change discipline verifier with synchronous or asynchronous PatchSet capture, path, operation, minimum/maximum file-count, and byte-count gates, and privacy-preserving completion evidence.
 - Added request-only safe context trimming for reproducible tool results and unsigned plaintext thinking, with content-free `context_trim` TUI, JSON, and RPC observability.
 - Added conservative startup recovery reports with low-sensitivity `/recovery` review, durable acknowledgement, and no automatic provider or tool replay.

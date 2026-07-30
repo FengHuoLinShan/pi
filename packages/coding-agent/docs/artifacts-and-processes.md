@@ -96,6 +96,7 @@ Start pi with `--managed-jobs` to enable a user-controlled background process su
 /job list
 /job status <id>
 /job output <id> [stdout|stderr|all]
+/job send <id> [stdout|stderr|all]
 /job stop <id>
 ```
 
@@ -106,6 +107,8 @@ The built-in policy permits at most four active jobs per workspace, retains at m
 Managed jobs are workspace-scoped and share one live local backend while pi is running. A clean pi quit stops active jobs and records their terminal state. After a crash or restart, the local backend does not claim the old PID, so active records become `interrupted`; use a remote durable backend through the SDK when cross-process reattachment is required.
 
 This first interactive surface is human-controlled. It does not register an LLM tool or let the coding agent start a background process without the user's `/job start` command.
+
+`/job send` is the explicit bridge into model context. It copies the selected bounded, sanitized output tail into a displayed `managed-job-output-v1` custom message without starting or steering a model turn. When idle, the message is stored immediately; during streaming, it is queued for the next turn and persisted when delivered. The message uses JSON framing, labels the output as untrusted data, and adds a system-prompt rule that it must never be treated as instructions. The copied tail enters the session JSONL and later model context, so inspect it for credentials or other sensitive data before sending. `/job output` only displays the tail locally and does not copy it into model context.
 
 ## Execution Boundary
 
