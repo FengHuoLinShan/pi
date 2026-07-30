@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { COMPLETION_CONTRACT_VERSION, type CompletionVerifier } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	applyShadowRunCandidate,
 	discardShadowRunOverlays,
 	rankShadowRuns,
 	runShadowCandidates,
@@ -140,6 +141,140 @@ describe("shadow runs", () => {
 			const roots = report.runs.map((run) => run.overlay.getRoot());
 			await discardShadowRunOverlays(report);
 			expect(roots.every((root) => !existsSync(root))).toBe(true);
+		}
+	});
+
+	it("applies only an explicitly selected completed candidate and discards every overlay", async () => {
+		const workspace = createTempDir();
+		writeFileSync(join(workspace, "answer.txt"), "base");
+		const report = await runShadowCandidates({
+			workspaceRoot: workspace,
+			candidates: [
+				{ id: "a", config: { content: "candidate-a", quality: 1 } },
+				{ id: "b", config: { content: "candidate-b", quality: 2 } },
+			],
+			run: async ({ candidate, overlay }) => {
+				writeFileSync(join(overlay.getWorkingDirectory(), "answer.txt"), candidate.config.content);
+				return candidate.config.quality;
+			},
+		});
+		const roots = report.runs.map((run) => run.overlay.getRoot());
+
+		const result = await applyShadowRunCandidate(report, "b");
+
+		expect(result).toMatchObject({
+			candidateId: "b",
+			apply: { appliedPaths: ["answer.txt"], state: "applied" },
+			cleanupFailures: [],
+		});
+		expect(readFileSync(join(workspace, "answer.txt"), "utf8")).toBe("candidate-b");
+		expect(roots.every((root) => !existsSync(root))).toBe(true);
+	});
+
+	it("rejects a candidate that did not pass completion without changing or discarding anything", async () => {
+		const workspace = createTempDir();
+		writeFileSync(join(workspace, "answer.txt"), "base");
+		const verifier: CompletionVerifier<ShadowRunVerificationContext<CandidateConfig, number>> = {
+			id: "reject",
+			verify: () => ({ status: "fail", summary: "Rejected" }),
+		};
+		const report = await runShadowCandidates({
+			workspaceRoot: workspace,
+			candidates: [{ id: "rejected", config: { content: "candidate", quality: 0 } }],
+			run: async ({ candidate, overlay }) => {
+				writeFileSync(join(overlay.getWorkingDirectory(), "answer.txt"), candidate.config.content);
+				return candidate.config.quality;
+			},
+			completion: {
+				contract: {
+					version: COMPLETION_CONTRACT_VERSION,
+					id: "reject",
+					objective: "Reject the candidate",
+					conditions: [{ id: "gate", description: "Reject", verifierIds: ["reject"] }],
+				},
+				verifiers: [verifier],
+			},
+		});
+
+		try {
+			await expect(applyShadowRunCandidate(report, "rejected")).rejects.toMatchObject({
+				code: "selection_rejected",
+			});
+			expect(readFileSync(join(workspace, "answer.txt"), "utf8")).toBe("base");
+			expect(report.runs[0]?.overlay.getState()).toBe("active");
+		} finally {
+			await discardShadowRunOverlays(report);
+		}
+	});
+
+	it("leaves every candidate available when selected apply detects an external conflict", async () => {
+		const workspace = createTempDir();
+		writeFileSync(join(workspace, "answer.txt"), "base");
+		const report = await runShadowCandidates({
+			workspaceRoot: workspace,
+			candidates: [
+				{ id: "a", config: { content: "candidate-a", quality: 1 } },
+				{ id: "b", config: { content: "candidate-b", quality: 2 } },
+			],
+			run: async ({ candidate, overlay }) => {
+				writeFileSync(join(overlay.getWorkingDirectory(), "answer.txt"), candidate.config.content);
+			},
+		});
+		writeFileSync(join(workspace, "answer.txt"), "external");
+
+		try {
+			await expect(applyShadowRunCandidate(report, "a")).rejects.toMatchObject({ code: "workspace_conflict" });
+			expect(readFileSync(join(workspace, "answer.txt"), "utf8")).toBe("external");
+			expect(report.runs.every((run) => run.overlay.getState() === "active")).toBe(true);
+		} finally {
+			await discardShadowRunOverlays(report);
+		}
+	});
+
+	it("fails a candidate when completion verification mutates its workspace", async () => {
+		const workspace = createTempDir();
+		writeFileSync(join(workspace, "answer.txt"), "base");
+		const verifier: CompletionVerifier<ShadowRunVerificationContext<CandidateConfig, number>> = {
+			id: "mutating",
+			verify: ({ context }) => {
+				writeFileSync(join(context.overlay.getWorkingDirectory(), "verification-output.txt"), "changed");
+				return { status: "pass", summary: "Changed the workspace" };
+			},
+		};
+		const report = await runShadowCandidates({
+			workspaceRoot: workspace,
+			candidates: [{ id: "mutated", config: { content: "candidate", quality: 1 } }],
+			run: async ({ candidate, overlay }) => {
+				writeFileSync(join(overlay.getWorkingDirectory(), "answer.txt"), candidate.config.content);
+				return candidate.config.quality;
+			},
+			completion: {
+				contract: {
+					version: COMPLETION_CONTRACT_VERSION,
+					id: "mutation",
+					objective: "Detect verifier mutation",
+					conditions: [{ id: "gate", description: "Mutating verifier", verifierIds: ["mutating"] }],
+				},
+				verifiers: [verifier],
+			},
+		});
+
+		try {
+			expect(report.status).toBe("partial");
+			expect(report.runs[0]).toMatchObject({
+				status: "failed",
+				error: {
+					name: "ShadowRunError",
+					message: "Completion verification changed the workspace for shadow run candidate mutated",
+				},
+			});
+			expect(report.runs[0]?.patchSet?.entries.map((entry) => entry.path)).toEqual([
+				"answer.txt",
+				"verification-output.txt",
+			]);
+			expect(readFileSync(join(workspace, "answer.txt"), "utf8")).toBe("base");
+		} finally {
+			await discardShadowRunOverlays(report);
 		}
 	});
 

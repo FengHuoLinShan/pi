@@ -6,7 +6,12 @@ import {
 	type CompletionVerifier,
 	verifyCompletionContract,
 } from "@earendil-works/pi-agent-core";
-import { WorkspaceOverlay, type WorkspacePatchSet } from "./workspace-overlay.ts";
+import {
+	WorkspaceOverlay,
+	type WorkspaceOverlayApplyResult,
+	type WorkspacePatchSet,
+	type WorkspacePatchSetEntry,
+} from "./workspace-overlay.ts";
 
 export type ShadowRunExecutionMode = "sequential" | "parallel";
 export type ShadowRunErrorMode = "isolate" | "throw";
@@ -97,7 +102,24 @@ export interface ShadowRunRanking {
 	excluded: Array<{ candidateId: string; reason: "run_not_completed" | "completion_not_passed" }>;
 }
 
-export type ShadowRunErrorCode = "invalid_options" | "workspace_changed" | "run_failed" | "aborted";
+export interface ShadowRunCleanupFailure {
+	candidateId: string;
+	error: ShadowRunErrorDetails;
+}
+
+export interface ShadowRunApplyResult {
+	candidateId: string;
+	apply: WorkspaceOverlayApplyResult;
+	/** Cleanup runs only after the selected PatchSet commits successfully. */
+	cleanupFailures: ShadowRunCleanupFailure[];
+}
+
+export type ShadowRunErrorCode =
+	| "invalid_options"
+	| "workspace_changed"
+	| "run_failed"
+	| "aborted"
+	| "selection_rejected";
 
 export class ShadowRunError extends Error {
 	public code: ShadowRunErrorCode;
@@ -158,6 +180,32 @@ async function assertUnusedCandidateRoot(root: string, candidateId: string): Pro
 
 function cloneCandidate<TConfig>(candidate: ShadowRunCandidate<TConfig>): ShadowRunCandidate<TConfig> {
 	return { ...candidate };
+}
+
+function patchEntriesEqual(left: WorkspacePatchSetEntry, right: WorkspacePatchSetEntry): boolean {
+	return (
+		left.kind === right.kind &&
+		left.path === right.path &&
+		left.beforeRevision === right.beforeRevision &&
+		left.afterRevision === right.afterRevision &&
+		left.beforeByteLength === right.beforeByteLength &&
+		left.afterByteLength === right.afterByteLength &&
+		left.beforeMode === right.beforeMode &&
+		left.afterMode === right.afterMode &&
+		left.patch === right.patch &&
+		(left.afterContent === undefined
+			? right.afterContent === undefined
+			: right.afterContent !== undefined && left.afterContent.equals(right.afterContent))
+	);
+}
+
+function patchSetsEqual(left: WorkspacePatchSet, right: WorkspacePatchSet): boolean {
+	return (
+		left.overlayId === right.overlayId &&
+		left.baseSnapshotId === right.baseSnapshotId &&
+		left.entries.length === right.entries.length &&
+		left.entries.every((entry, index) => patchEntriesEqual(entry, right.entries[index]!))
+	);
 }
 
 function validateCandidates<TConfig>(candidates: readonly ShadowRunCandidate<TConfig>[]): void {
@@ -231,6 +279,15 @@ async function executeCandidate<TConfig, TOutput>(
 					signal,
 				})
 			: undefined;
+		if (completion) {
+			const postVerificationPatchSet = await overlay.createPatchSet();
+			if (!patchSetsEqual(patchSet, postVerificationPatchSet)) {
+				throw new ShadowRunError(
+					"workspace_changed",
+					`Completion verification changed the workspace for shadow run candidate ${candidate.id}`,
+				);
+			}
+		}
 		return {
 			candidate: cloneCandidate(candidate),
 			overlay,
@@ -408,4 +465,60 @@ export async function discardShadowRunOverlays<TConfig, TOutput>(
 	report: ShadowRunReport<TConfig, TOutput>,
 ): Promise<void> {
 	await discardOverlays(report.runs.map((run) => run.overlay));
+}
+
+/**
+ * Explicitly apply one completed, completion-approved candidate and then
+ * discard every retained candidate overlay. Apply failures leave all overlays
+ * intact. Cleanup failures after a successful commit are returned separately
+ * so callers cannot misreport an applied change as an all-or-nothing failure.
+ */
+export async function applyShadowRunCandidate<TConfig, TOutput>(
+	report: ShadowRunReport<TConfig, TOutput>,
+	candidateId: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<ShadowRunApplyResult> {
+	if (typeof candidateId !== "string" || candidateId.trim() === "") {
+		throw new ShadowRunError("selection_rejected", "Shadow run candidate selection must not be empty");
+	}
+	const selected = report.runs.find((run) => run.candidate.id === candidateId);
+	if (!selected) {
+		throw new ShadowRunError("selection_rejected", `Unknown shadow run candidate: ${candidateId}`);
+	}
+	if (selected.status !== "completed") {
+		throw new ShadowRunError(
+			"selection_rejected",
+			`Shadow run candidate ${candidateId} is ${selected.status}, not completed`,
+		);
+	}
+	if (selected.completion && selected.completion.status !== "pass") {
+		throw new ShadowRunError(
+			"selection_rejected",
+			`Shadow run candidate ${candidateId} completion status is ${selected.completion.status}`,
+		);
+	}
+	if (!selected.patchSet || selected.patchSet.entries.length === 0) {
+		throw new ShadowRunError("selection_rejected", `Shadow run candidate ${candidateId} has no changes to apply`);
+	}
+	if (selected.overlay.getState() !== "active") {
+		throw new ShadowRunError(
+			"selection_rejected",
+			`Shadow run candidate ${candidateId} overlay is ${selected.overlay.getState()}`,
+		);
+	}
+
+	const apply = await selected.overlay.applyPatchSet(selected.patchSet, { signal: options.signal });
+	const cleanupFailures: ShadowRunCleanupFailure[] = [];
+	for (const run of report.runs) {
+		try {
+			await run.overlay.discard();
+		} catch (error) {
+			const details = errorFromUnknown(error);
+			cleanupFailures.push({
+				candidateId: run.candidate.id,
+				error: { name: details.name, message: details.message },
+			});
+		}
+	}
+	return { candidateId, apply, cleanupFailures };
 }
