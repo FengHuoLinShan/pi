@@ -4,7 +4,9 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { type AgentRuntimeFieldErrors, isThinkingLevel } from "./runtime-config.ts";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -12,7 +14,11 @@ export interface AgentConfig {
 	name: string;
 	description: string;
 	tools?: string[];
+	provider?: string;
 	model?: string;
+	thinking?: ThinkingLevel;
+	configError?: string;
+	runtimeErrors?: AgentRuntimeFieldErrors;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -49,22 +55,52 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+		const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
 
-		if (!frontmatter.name || !frontmatter.description) {
+		if (
+			typeof frontmatter.name !== "string" ||
+			frontmatter.name.trim().length === 0 ||
+			typeof frontmatter.description !== "string" ||
+			frontmatter.description.trim().length === 0
+		) {
 			continue;
 		}
 
-		const tools = frontmatter.tools
-			?.split(",")
-			.map((t: string) => t.trim())
-			.filter(Boolean);
-
+		const name = frontmatter.name.trim();
+		const description = frontmatter.description.trim();
+		const toolsValue = frontmatter.tools;
+		const tools =
+			typeof toolsValue === "string"
+				? toolsValue
+						.split(",")
+						.map((tool) => tool.trim())
+						.filter(Boolean)
+				: undefined;
+		const configError =
+			toolsValue !== undefined && typeof toolsValue !== "string" ? `Agent "${name}" has invalid tools` : undefined;
+		const runtimeErrors: AgentConfig["runtimeErrors"] = {};
+		const provider = typeof frontmatter.provider === "string" ? frontmatter.provider.trim() || undefined : undefined;
+		if (frontmatter.provider !== undefined && typeof frontmatter.provider !== "string") {
+			runtimeErrors.provider = `Agent "${name}" has invalid provider`;
+		}
+		const model = typeof frontmatter.model === "string" ? frontmatter.model.trim() || undefined : undefined;
+		if (frontmatter.model !== undefined && typeof frontmatter.model !== "string") {
+			runtimeErrors.model = `Agent "${name}" has invalid model`;
+		}
+		const thinkingValue = typeof frontmatter.thinking === "string" ? frontmatter.thinking.trim() : undefined;
+		const thinking = isThinkingLevel(thinkingValue) ? thinkingValue : undefined;
+		if (frontmatter.thinking !== undefined && !isThinkingLevel(thinkingValue)) {
+			runtimeErrors.thinking = `Agent "${name}" has invalid thinking level "${String(frontmatter.thinking)}"`;
+		}
 		agents.push({
-			name: frontmatter.name,
-			description: frontmatter.description,
+			name,
+			description,
 			tools: tools && tools.length > 0 ? tools : undefined,
-			model: frontmatter.model,
+			provider,
+			model,
+			thinking,
+			configError,
+			runtimeErrors: Object.keys(runtimeErrors).length > 0 ? runtimeErrors : undefined,
 			systemPrompt: body,
 			source,
 			filePath,

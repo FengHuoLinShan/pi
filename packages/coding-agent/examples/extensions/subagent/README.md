@@ -10,6 +10,8 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Abort support**: Ctrl+C propagates to kill subagent processes
+- **Per-task runtimes**: Select provider, model, and reasoning effort per agent or task
+- **Task control**: Extensions can observe live task state and cancel one parallel task without stopping siblings
 
 ## Structure
 
@@ -18,6 +20,8 @@ subagent/
 ├── README.md            # This file
 ├── index.ts             # The extension (entry point)
 ├── agents.ts            # Agent discovery logic
+├── runtime-config.ts    # Runtime override parsing and validation
+├── task-control.ts      # Per-task cancellation and process cleanup
 ├── agents/              # Sample agent definitions
 │   ├── scout.md         # Fast recon, returns compressed context
 │   ├── planner.md       # Creates implementation plans
@@ -38,6 +42,8 @@ From the repository root, symlink the files:
 mkdir -p ~/.pi/agent/extensions/subagent
 ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/index.ts" ~/.pi/agent/extensions/subagent/index.ts
 ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/agents.ts" ~/.pi/agent/extensions/subagent/agents.ts
+ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/runtime-config.ts" ~/.pi/agent/extensions/subagent/runtime-config.ts
+ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/task-control.ts" ~/.pi/agent/extensions/subagent/task-control.ts
 
 # Symlink agents
 mkdir -p ~/.pi/agent/agents
@@ -96,6 +102,15 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 | Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
 
+Every single, parallel, or chain item accepts optional `provider`, `model`, and `thinking` overrides. Runtime selection uses this precedence:
+
+1. Task override
+2. `~/.pi/agent/agent-runtimes.json`
+3. Agent frontmatter
+4. Pi defaults
+
+Run `/agent-config` to edit personal runtime overrides without changing agent Markdown files.
+
 ## Output Display
 
 **Collapsed view** (default):
@@ -131,7 +146,9 @@ Agents are markdown files with YAML frontmatter:
 name: my-agent
 description: What this agent does
 tools: read, grep, find, ls
+provider: anthropic
 model: claude-haiku-4-5
+thinking: low
 ---
 
 System prompt for the agent goes here.
@@ -142,6 +159,21 @@ System prompt for the agent goes here.
 - `.pi/agents/*.md` - Project-level (only with `agentScope: "project"` or `"both"`)
 
 Project agents override user agents with the same name when `agentScope: "both"`.
+
+Personal runtime overrides are stored separately with private file permissions:
+
+```json
+{
+  "version": 1,
+  "agents": {
+    "scout": {
+      "provider": "openai-codex",
+      "model": "gpt-5.6-codex",
+      "thinking": "low"
+    }
+  }
+}
+```
 
 ## Sample Agents
 
