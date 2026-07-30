@@ -15,6 +15,7 @@
 - Added local content-addressed artifact storage and recoverable process-session lifecycle primitives with artifact-backed output and execution-boundary binding.
 - Added a transport-independent, negotiated app protocol with strict JSON-RPC validation, typed Thread/Turn/Item events, reverse approval/input requests, and bounded cursor replay.
 - Added opt-in transactional workspace overlays with complete PatchSets, conflict preflight, durable apply journals, compensating rollback, and built-in tool/session routing.
+- Added an opt-in interactive CLI for persistent transactional workspace overlays, with independent Git metadata, scrollable PatchSet review, explicit apply/discard, conflict handling, and session-switch guards.
 - Added a language-neutral incremental code graph with revision-atomic updates, deterministic snapshots, and bounded dependency/impact queries.
 - Added explicit Shadow Runs over comparable isolated overlays with completion-contract gates and caller-defined ranking.
 - Added an opt-in process-session completion verifier that keeps command output in ArtifactStore and exposes only structured status and opaque evidence references.

@@ -41,7 +41,9 @@ import { assertValidSessionId, SessionManager } from "./core/session-manager.ts"
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
+import type { WorkspaceOverlay } from "./core/workspace-overlay.ts";
 import { builtInExtensions } from "./extensions/index.ts";
+import { openCliWorkspaceOverlay, WORKSPACE_OVERLAY_FLAG } from "./extensions/workspace-overlay/index.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
@@ -685,6 +687,7 @@ export async function main(args: string[], options?: MainOptions) {
 				message: `Failed to load extension "${path}": ${error}`,
 			})),
 		];
+		let workspaceOverlay: WorkspaceOverlay | undefined;
 
 		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
 		const scopedModels =
@@ -714,6 +717,63 @@ export async function main(args: string[], options?: MainOptions) {
 			}
 		}
 
+		const workspaceOverlayRequested =
+			resourceLoader.getExtensions().runtime.flagValues.get(WORKSPACE_OVERLAY_FLAG) === true;
+		if (
+			workspaceOverlayRequested &&
+			!parsed.help &&
+			parsed.listModels === undefined &&
+			!diagnostics.some((diagnostic) => diagnostic.type === "error")
+		) {
+			const incompatibleFlags = ["task-contract", "verify-loop"].filter(
+				(flag) => resourceLoader.getExtensions().runtime.flagValues.get(flag) === true,
+			);
+			if (incompatibleFlags.length > 0) {
+				diagnostics.push({
+					type: "error",
+					message: `--${WORKSPACE_OVERLAY_FLAG} cannot be combined with ${incompatibleFlags
+						.map((flag) => `--${flag}`)
+						.join(", ")} because those extensions verify the original workspace`,
+				});
+			} else if (appMode !== "interactive") {
+				diagnostics.push({
+					type: "error",
+					message: `--${WORKSPACE_OVERLAY_FLAG} is only supported in interactive mode`,
+				});
+			} else if (!sessionManager.isPersisted()) {
+				diagnostics.push({
+					type: "error",
+					message: `--${WORKSPACE_OVERLAY_FLAG} requires a persisted session`,
+				});
+			} else {
+				try {
+					const opened = await openCliWorkspaceOverlay({
+						workspaceRoot: cwd,
+						agentDir,
+						sessionId: sessionManager.getSessionId(),
+					});
+					workspaceOverlay = opened.overlay;
+					if (opened.recovery.action !== "none") {
+						diagnostics.push({
+							type: "warning",
+							message: `Workspace overlay recovery ${opened.recovery.action} ${opened.recovery.paths.length} path(s)`,
+						});
+					}
+					if (opened.gitWarning) {
+						diagnostics.push({
+							type: "warning",
+							message: `Workspace overlay Git baseline unavailable: ${opened.gitWarning}`,
+						});
+					}
+				} catch (error) {
+					diagnostics.push({
+						type: "error",
+						message: `Failed to open workspace overlay: ${error instanceof Error ? error.message : String(error)}`,
+					});
+				}
+			}
+		}
+
 		const created = await createAgentSessionFromServices({
 			services,
 			sessionManager,
@@ -725,6 +785,7 @@ export async function main(args: string[], options?: MainOptions) {
 			excludeTools: sessionOptions.excludeTools,
 			noTools: sessionOptions.noTools,
 			customTools: sessionOptions.customTools,
+			workspaceOverlay,
 		});
 		const cliThinkingOverride = parsed.thinking !== undefined || cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {

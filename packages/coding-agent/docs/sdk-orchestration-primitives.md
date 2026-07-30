@@ -1,6 +1,6 @@
 # SDK orchestration primitives
 
-The coding-agent package exposes optional workspace and orchestration primitives for SDK hosts. They are not enabled by the CLI or by `createAgentSession()` unless passed explicitly.
+The coding-agent package exposes optional workspace and orchestration primitives for SDK hosts. `createAgentSession()` only enables them when passed explicitly. The interactive CLI can opt into a persistent `WorkspaceOverlay` with `--workspace-overlay`.
 
 ## Transactional workspace overlays
 
@@ -23,6 +23,8 @@ await overlay.applyPatchSet(patchSet);
 ```
 
 PatchSets include creates, updates, deletes, modes, content revisions, and text patches where available. Application preflight verifies every base revision before mutation. Application uses same-directory staging, backups, a durable journal, post-write verification, and compensating rollback. Reopening an overlay rolls back a prepared journal or finalizes a committed journal. `discard()` is explicit.
+
+In interactive CLI mode, built-in tools run in the overlay and `/overlay review`, `/overlay status`, `/overlay apply`, and `/overlay discard` manage the transaction. Applying or discarding exits the process so a later run starts from a fresh base snapshot. The CLI requires a persisted session and stores overlay state by session id under the agent directory. It also initializes independent Git metadata inside the overlay for local `git status` and `git diff`; that metadata is excluded from the PatchSet.
 
 An overlay cannot be combined with `executionBoundary`, custom built-in operation overrides, or arbitrary allowed roots. `.git` is excluded by default, escaping symlinks are rejected, and worktree-style `.git` files cannot be copied.
 

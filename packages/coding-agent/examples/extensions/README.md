@@ -22,7 +22,10 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `project-trust.ts` | Demonstrates the `project_trust` event for user/global and CLI extensions |
 | `protected-paths.ts` | Blocks writes to protected paths (.env, .git/, node_modules/) |
 | `confirm-destructive.ts` | Confirms before destructive session actions (clear, switch, fork) |
-| `dirty-repo-guard.ts` | Prevents session changes with uncommitted git changes |
+| `dirty-repo-guard.ts` | Gates built-in edits to pre-existing Git changes and prevents dirty session switches |
+| `scoped-instructions.ts` | Requires complete reads of nested AGENTS.md or CLAUDE.md files before built-in edits |
+| `verification-loop.ts` | With `--verify-loop`, runs a trusted project check after mutation-capable built-in tools and requests bounded repairs |
+| `task-contract.ts` | With `--task-contract`, enforces a clean-baseline path scope, change budget, checks, and durable completion evidence |
 | `sandbox/` | OS-level sandboxing using `@anthropic-ai/sandbox-runtime` with per-project config |
 | `gondolin/` | Route built-in tools and `!` commands into a Gondolin micro-VM |
 
@@ -84,7 +87,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 
 | Extension | Description |
 |-----------|-------------|
-| `git-checkpoint.ts` | Creates git stash checkpoints at each turn for code restoration on fork |
+| `git-checkpoint.ts` | Persists tracked worktree/index checkpoints for reviewed restoration on fork |
 | `auto-commit-on-exit.ts` | Auto-commits on exit using last assistant message for commit message |
 
 ### System Prompt & Compaction

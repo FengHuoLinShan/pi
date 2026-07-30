@@ -14,6 +14,7 @@ import {
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.ts";
 import type { SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
+import type { WorkspaceOverlay } from "./workspace-overlay.ts";
 
 /**
  * Non-fatal issues collected while creating services or sessions.
@@ -61,6 +62,7 @@ export interface CreateAgentSessionFromServicesOptions {
 	excludeTools?: CreateAgentSessionOptions["excludeTools"];
 	noTools?: CreateAgentSessionOptions["noTools"];
 	customTools?: ToolDefinition[];
+	workspaceOverlay?: WorkspaceOverlay;
 }
 
 /**
@@ -214,6 +216,7 @@ export async function createAgentSessionFromServices(
 		excludeTools: options.excludeTools,
 		noTools: options.noTools,
 		customTools: options.customTools,
+		workspaceOverlay: options.workspaceOverlay,
 		sessionStartEvent: options.sessionStartEvent,
 	});
 }
