@@ -1,10 +1,15 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { discoverAgents } from "../examples/extensions/subagent/agents.ts";
-import { createSubagentStateEvent, summarizeTaskForStatus } from "../examples/extensions/subagent/index.ts";
+import {
+	createSubagentStateEvent,
+	getPiInvocation,
+	summarizeTaskForStatus,
+} from "../examples/extensions/subagent/index.ts";
 import {
 	type AgentRuntimeOverridesFile,
 	buildRuntimeArgs,
@@ -111,6 +116,37 @@ describe("subagent runtime config", () => {
 			["--provider", "anthropic", "--model", "claude", "--thinking", "low"],
 			["--provider", "google", "--model", "gemini", "--thinking", "high"],
 		]);
+	});
+
+	it("preserves the tsx loader when restarting a TypeScript source CLI", () => {
+		const currentScript = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+		const invocation = getPiInvocation(["--mode", "json"], {
+			currentScript,
+			execPath: "/usr/local/bin/node",
+			execArgv: [
+				"--inspect",
+				"--require",
+				"/repo/node_modules/tsx/dist/preflight.cjs",
+				"--import",
+				"file:///repo/node_modules/tsx/dist/loader.mjs",
+			],
+			cwd: "/repo",
+			environment: { TSX_TSCONFIG_PATH: "tsconfig.json" },
+		});
+
+		expect(invocation).toEqual({
+			command: "/usr/local/bin/node",
+			args: [
+				"--require",
+				"/repo/node_modules/tsx/dist/preflight.cjs",
+				"--import",
+				"file:///repo/node_modules/tsx/dist/loader.mjs",
+				currentScript,
+				"--mode",
+				"json",
+			],
+			env: { TSX_TSCONFIG_PATH: "/repo/tsconfig.json" },
+		});
 	});
 
 	it("writes versioned overrides atomically with private permissions", () => {

@@ -27,9 +27,10 @@ import {
 	getMarkdownTheme,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Markdown, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { SubagentProgressDisplay, type SubagentProgressEvent, type SubagentProgressMode } from "./progress-display.ts";
 import {
 	type AgentRuntimeConfig,
 	buildRuntimeArgs,
@@ -208,7 +209,7 @@ function getStatusActivity(messages: Message[]): string | undefined {
 	return last.type === "toolCall" ? last.name : "responding";
 }
 
-export function createSubagentStateEvent(details: SubagentDetails) {
+export function createSubagentStateEvent(details: SubagentDetails): SubagentProgressEvent {
 	return {
 		toolCallId: details.toolCallId,
 		mode: details.mode,
@@ -357,17 +358,71 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 	return { dir: tmpDir, filePath };
 }
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
+export interface PiInvocationRuntime {
+	currentScript: string | undefined;
+	execPath: string;
+	execArgv: string[];
+	cwd: string;
+	environment: NodeJS.ProcessEnv;
+}
+
+export interface PiInvocation {
+	command: string;
+	args: string[];
+	env?: NodeJS.ProcessEnv;
+}
+
+function getTsxExecArgs(execArgv: string[]): string[] {
+	const result: string[] = [];
+	for (let index = 0; index < execArgv.length; index++) {
+		const argument = execArgv[index];
+		if (argument === "--require" || argument === "--import" || argument === "--loader") {
+			const value = execArgv[index + 1];
+			if (value && /(?:^|[/\\])tsx[/\\]dist[/\\]/.test(value)) {
+				result.push(argument, value);
+				index++;
+			}
+			continue;
+		}
+		if (
+			(argument.startsWith("--require=") || argument.startsWith("--import=") || argument.startsWith("--loader=")) &&
+			/(?:^|[/\\])tsx[/\\]dist[/\\]/.test(argument)
+		) {
+			result.push(argument);
+		}
+	}
+	return result;
+}
+
+export function getPiInvocation(
+	args: string[],
+	runtime: PiInvocationRuntime = {
+		currentScript: process.argv[1],
+		execPath: process.execPath,
+		execArgv: process.execArgv,
+		cwd: process.cwd(),
+		environment: process.env,
+	},
+): PiInvocation {
+	const { currentScript, execPath } = runtime;
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
 	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
+		const tsxExecArgs = /\.(?:cts|mts|ts|tsx)$/.test(currentScript) ? getTsxExecArgs(runtime.execArgv) : [];
+		if (tsxExecArgs.length > 0) {
+			const tsconfigPath = runtime.environment.TSX_TSCONFIG_PATH;
+			const env =
+				tsconfigPath && !path.isAbsolute(tsconfigPath)
+					? { ...runtime.environment, TSX_TSCONFIG_PATH: path.resolve(runtime.cwd, tsconfigPath) }
+					: undefined;
+			return { command: execPath, args: [...tsxExecArgs, currentScript, ...args], env };
+		}
+		return { command: execPath, args: [currentScript, ...args] };
 	}
 
-	const execName = path.basename(process.execPath).toLowerCase();
+	const execName = path.basename(execPath).toLowerCase();
 	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
 	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
+		return { command: execPath, args };
 	}
 
 	return { command: "pi", args };
@@ -484,6 +539,7 @@ async function runSingleAgent(
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				detached: process.platform !== "win32",
+				env: invocation.env,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
@@ -693,12 +749,49 @@ async function showAgentConfig(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 
 export default function (pi: ExtensionAPI) {
 	const activeTasks = new TaskControllerRegistry();
+	const progressDisplay = new SubagentProgressDisplay();
 	let currentCtx: ExtensionContext | undefined;
+
+	const updateProgressUi = () => {
+		if (!currentCtx) return;
+		currentCtx.ui.setStatus("subagent-progress", progressDisplay.getStatusText());
+		const lines = progressDisplay.getLines();
+		if (!lines) {
+			currentCtx.ui.setWidget("subagent-progress", undefined);
+			return;
+		}
+		currentCtx.ui.setWidget("subagent-progress", (_tui, theme) => ({
+			render: (width: number) =>
+				lines.map((line, index) =>
+					truncateToWidth(index === 0 ? theme.fg("accent", line) : line, Math.max(1, width), "…", true),
+				),
+			invalidate: () => {},
+		}));
+	};
+	const trackProgress = async <T>(
+		toolCallId: string,
+		mode: SubagentProgressMode,
+		expectedTasks: number,
+		run: () => Promise<T>,
+	): Promise<T> => {
+		progressDisplay.begin(toolCallId, mode, expectedTasks);
+		updateProgressUi();
+		try {
+			return await run();
+		} finally {
+			progressDisplay.finish(toolCallId);
+			updateProgressUi();
+		}
+	};
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentCtx = ctx;
+		progressDisplay.clear();
+		updateProgressUi();
 	});
 	pi.on("session_shutdown", async () => {
+		progressDisplay.clear();
+		updateProgressUi();
 		currentCtx = undefined;
 		activeTasks.cancelAll();
 		disposeCancelListener();
@@ -768,7 +861,10 @@ export default function (pi: ExtensionAPI) {
 						projectAgentsDir: discovery.projectAgentsDir,
 						results,
 					};
-					pi.events.emit("pi:subagent-state", createSubagentStateEvent(details));
+					const stateEvent = createSubagentStateEvent(details);
+					progressDisplay.update(stateEvent);
+					updateProgressUi();
+					pi.events.emit("pi:subagent-state", stateEvent);
 					return details;
 				};
 
@@ -887,238 +983,246 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
+				const chain = params.chain;
+				return await trackProgress(toolCallId, "chain", chain.length, async () => {
+					const results: SingleResult[] = [];
+					let previousOutput = "";
 
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-					const taskSummary = step.task.replace(/\{previous\}/g, "[previous output]");
-					const taskId = `${toolCallId}:${i}`;
-					const resolved = getRuntime(step.agent, {
-						provider: step.provider,
-						model: step.model,
-						thinking: step.thinking,
-					});
+					for (let i = 0; i < chain.length; i++) {
+						const step = chain[i];
+						const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+						const taskSummary = step.task.replace(/\{previous\}/g, "[previous output]");
+						const taskId = `${toolCallId}:${i}`;
+						const resolved = getRuntime(step.agent, {
+							provider: step.provider,
+							model: step.model,
+							thinking: step.thinking,
+						});
 
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
+						// Create update callback that includes all previous results
+						const chainUpdate: OnUpdateCallback | undefined = onUpdate
+							? (partial) => {
+									// Combine completed results with current streaming result
+									const currentResult = partial.details?.results[0];
+									if (currentResult) {
+										const allResults = [...results, currentResult];
+										onUpdate({
+											content: partial.content,
+											details: makeDetails("chain")(allResults),
+										});
+									}
 								}
-							}
-						: undefined;
+							: undefined;
 
-					const result = resolved.runtime
-						? await runTrackedAgent(
-								taskId,
-								step.agent,
-								taskWithContext,
-								taskSummary,
-								resolved.runtime,
-								step.cwd,
-								i + 1,
-								chainUpdate,
-								makeDetails("chain"),
-							)
-						: createRuntimeFailure(
-								taskId,
-								step.agent,
-								taskWithContext,
-								taskSummary,
-								resolved.error ?? "Invalid runtime",
-								i + 1,
-							);
-					results.push(result);
+						const result = resolved.runtime
+							? await runTrackedAgent(
+									taskId,
+									step.agent,
+									taskWithContext,
+									taskSummary,
+									resolved.runtime,
+									step.cwd,
+									i + 1,
+									chainUpdate,
+									makeDetails("chain"),
+								)
+							: createRuntimeFailure(
+									taskId,
+									step.agent,
+									taskWithContext,
+									taskSummary,
+									resolved.error ?? "Invalid runtime",
+									i + 1,
+								);
+						results.push(result);
 
-					const isError = isFailedResult(result);
-					if (isError) {
-						const errorMsg = getResultOutput(result);
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
+						const isError = isFailedResult(result);
+						if (isError) {
+							const errorMsg = getResultOutput(result);
+							return {
+								content: [
+									{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` },
+								],
+								details: makeDetails("chain")(results),
+								isError: true,
+							};
+						}
+						previousOutput = getFinalOutput(result.messages);
 					}
-					previousOutput = getFinalOutput(result.messages);
-				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-					details: makeDetails("chain")(results),
-				};
+					return {
+						content: [
+							{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" },
+						],
+						details: makeDetails("chain")(results),
+					};
+				});
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
+				const tasks = params.tasks;
+				if (tasks.length > MAX_PARALLEL_TASKS)
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+								text: `Too many parallel tasks (${tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
 							},
 						],
 						details: makeDetails("parallel")([]),
 					};
 
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
-				const resolvedRuntimes = params.tasks.map((task) =>
-					getRuntime(task.agent, { provider: task.provider, model: task.model, thinking: task.thinking }),
-				);
-				const taskControllers = resolvedRuntimes.map((runtime, index) =>
-					runtime.runtime ? activeTasks.start(`${toolCallId}:${index}`) : undefined,
-				);
+				return await trackProgress(toolCallId, "parallel", tasks.length, async () => {
+					// Track all results for streaming updates
+					const allResults: SingleResult[] = new Array(tasks.length);
+					const resolvedRuntimes = tasks.map((task) =>
+						getRuntime(task.agent, { provider: task.provider, model: task.model, thinking: task.thinking }),
+					);
+					const taskControllers = resolvedRuntimes.map((runtime, index) =>
+						runtime.runtime ? activeTasks.start(`${toolCallId}:${index}`) : undefined,
+					);
 
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					const runtime = resolvedRuntimes[i];
-					allResults[i] = runtime.runtime
-						? {
-								taskId: `${toolCallId}:${i}`,
-								agent: params.tasks[i].agent,
-								agentSource: "unknown",
-								task: params.tasks[i].task,
-								taskSummary: summarizeTaskForStatus(params.tasks[i].task),
-								exitCode: -1,
-								status: "queued",
-								messages: [],
-								stderr: "",
-								usage: {
-									input: 0,
-									output: 0,
-									cacheRead: 0,
-									cacheWrite: 0,
-									cost: 0,
-									contextTokens: 0,
-									turns: 0,
-								},
-								provider: runtime.runtime.provider,
-								model: runtime.runtime.model,
-								thinking: runtime.runtime.thinking,
-							}
-						: createRuntimeFailure(
-								`${toolCallId}:${i}`,
-								params.tasks[i].agent,
-								params.tasks[i].task,
-								params.tasks[i].task,
-								runtime.error ?? "Invalid runtime",
-							);
-				}
-
-				const emitParallelUpdate = () => {
-					const details = makeDetails("parallel")([...allResults]);
-					if (onUpdate) {
-						const queued = allResults.filter((result) => result.status === "queued").length;
-						const running = allResults.filter((result) => result.status === "running").length;
-						const done = allResults.length - queued - running;
-						onUpdate({
-							content: [
-								{
-									type: "text",
-									text: `Parallel: ${done}/${allResults.length} done, ${running} running, ${queued} queued...`,
-								},
-							],
-							details,
-						});
+					// Initialize placeholder results
+					for (let i = 0; i < tasks.length; i++) {
+						const runtime = resolvedRuntimes[i];
+						allResults[i] = runtime.runtime
+							? {
+									taskId: `${toolCallId}:${i}`,
+									agent: tasks[i].agent,
+									agentSource: "unknown",
+									task: tasks[i].task,
+									taskSummary: summarizeTaskForStatus(tasks[i].task),
+									exitCode: -1,
+									status: "queued",
+									messages: [],
+									stderr: "",
+									usage: {
+										input: 0,
+										output: 0,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0,
+										contextTokens: 0,
+										turns: 0,
+									},
+									provider: runtime.runtime.provider,
+									model: runtime.runtime.model,
+									thinking: runtime.runtime.thinking,
+								}
+							: createRuntimeFailure(
+									`${toolCallId}:${i}`,
+									tasks[i].agent,
+									tasks[i].task,
+									tasks[i].task,
+									runtime.error ?? "Invalid runtime",
+								);
 					}
-				};
-				emitParallelUpdate();
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const taskId = `${toolCallId}:${index}`;
-					const resolved = resolvedRuntimes[index];
-					const result = resolved.runtime
-						? await runTrackedAgent(
-								taskId,
-								t.agent,
-								t.task,
-								t.task,
-								resolved.runtime,
-								t.cwd,
-								undefined,
-								(partial) => {
-									if (partial.details?.results[0]) {
-										allResults[index] = partial.details.results[0];
-										emitParallelUpdate();
-									}
-								},
-								makeDetails("parallel"),
-								taskControllers[index],
-							)
-						: allResults[index];
-					allResults[index] = result;
+					const emitParallelUpdate = () => {
+						const details = makeDetails("parallel")([...allResults]);
+						if (onUpdate) {
+							const queued = allResults.filter((result) => result.status === "queued").length;
+							const running = allResults.filter((result) => result.status === "running").length;
+							const done = allResults.length - queued - running;
+							onUpdate({
+								content: [
+									{
+										type: "text",
+										text: `Parallel: ${done}/${allResults.length} done, ${running} running, ${queued} queued...`,
+									},
+								],
+								details,
+							});
+						}
+					};
 					emitParallelUpdate();
-					return result;
-				});
 
-				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const summaries = results.map((r) => {
-					const output = truncateParallelOutput(getResultOutput(r));
-					const status =
-						r.status === "cancelled"
-							? "cancelled"
-							: isFailedResult(r)
-								? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
-								: "completed";
-					return `### [${r.agent}] ${status}\n\n${output}`;
+					const results = await mapWithConcurrencyLimit(tasks, MAX_CONCURRENCY, async (t, index) => {
+						const taskId = `${toolCallId}:${index}`;
+						const resolved = resolvedRuntimes[index];
+						const result = resolved.runtime
+							? await runTrackedAgent(
+									taskId,
+									t.agent,
+									t.task,
+									t.task,
+									resolved.runtime,
+									t.cwd,
+									undefined,
+									(partial) => {
+										if (partial.details?.results[0]) {
+											allResults[index] = partial.details.results[0];
+											emitParallelUpdate();
+										}
+									},
+									makeDetails("parallel"),
+									taskControllers[index],
+								)
+							: allResults[index];
+						allResults[index] = result;
+						emitParallelUpdate();
+						return result;
+					});
+
+					const successCount = results.filter((r) => !isFailedResult(r)).length;
+					const summaries = results.map((r) => {
+						const output = truncateParallelOutput(getResultOutput(r));
+						const status =
+							r.status === "cancelled"
+								? "cancelled"
+								: isFailedResult(r)
+									? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
+									: "completed";
+						return `### [${r.agent}] ${status}\n\n${output}`;
+					});
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
+							},
+						],
+						details: makeDetails("parallel")(results),
+					};
 				});
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
-						},
-					],
-					details: makeDetails("parallel")(results),
-				};
 			}
 
 			if (params.agent && params.task) {
-				const taskId = `${toolCallId}:0`;
-				const resolved = getRuntime(params.agent, {
-					provider: params.provider,
-					model: params.model,
-					thinking: params.thinking,
-				});
-				const result = resolved.runtime
-					? await runTrackedAgent(
-							taskId,
-							params.agent,
-							params.task,
-							params.task,
-							resolved.runtime,
-							params.cwd,
-							undefined,
-							onUpdate,
-							makeDetails("single"),
-						)
-					: createRuntimeFailure(
-							taskId,
-							params.agent,
-							params.task,
-							params.task,
-							resolved.error ?? "Invalid runtime",
-						);
-				const isError = isFailedResult(result);
-				if (isError) {
-					const errorMsg = getResultOutput(result);
+				const agentName = params.agent;
+				const task = params.task;
+				return await trackProgress(toolCallId, "single", 1, async () => {
+					const taskId = `${toolCallId}:0`;
+					const resolved = getRuntime(agentName, {
+						provider: params.provider,
+						model: params.model,
+						thinking: params.thinking,
+					});
+					const result = resolved.runtime
+						? await runTrackedAgent(
+								taskId,
+								agentName,
+								task,
+								task,
+								resolved.runtime,
+								params.cwd,
+								undefined,
+								onUpdate,
+								makeDetails("single"),
+							)
+						: createRuntimeFailure(taskId, agentName, task, task, resolved.error ?? "Invalid runtime");
+					const isError = isFailedResult(result);
+					if (isError) {
+						const errorMsg = getResultOutput(result);
+						return {
+							content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+							details: makeDetails("single")([result]),
+							isError: true,
+						};
+					}
 					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+						content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
 						details: makeDetails("single")([result]),
-						isError: true,
 					};
-				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-					details: makeDetails("single")([result]),
-				};
+				});
 			}
 
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";

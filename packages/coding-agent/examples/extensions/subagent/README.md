@@ -7,6 +7,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Isolated context**: Each subagent runs in a separate `pi` process
 - **Streaming output**: See tool calls and progress as they happen
 - **Parallel streaming**: All parallel tasks stream updates simultaneously
+- **Global progress panel**: See active tasks from multiple simultaneous subagent tool calls in one Pi widget
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Abort support**: Ctrl+C propagates to kill subagent processes
@@ -20,6 +21,7 @@ subagent/
 ├── README.md            # This file
 ├── index.ts             # The extension (entry point)
 ├── agents.ts            # Agent discovery logic
+├── progress-display.ts  # Aggregated multi-call progress state and formatting
 ├── runtime-config.ts    # Runtime override parsing and validation
 ├── task-control.ts      # Per-task cancellation and process cleanup
 ├── agents/              # Sample agent definitions
@@ -42,6 +44,7 @@ From the repository root, symlink the files:
 mkdir -p ~/.pi/agent/extensions/subagent
 ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/index.ts" ~/.pi/agent/extensions/subagent/index.ts
 ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/agents.ts" ~/.pi/agent/extensions/subagent/agents.ts
+ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/progress-display.ts" ~/.pi/agent/extensions/subagent/progress-display.ts
 ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/runtime-config.ts" ~/.pi/agent/extensions/subagent/runtime-config.ts
 ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/task-control.ts" ~/.pi/agent/extensions/subagent/task-control.ts
 
@@ -112,6 +115,13 @@ Every single, parallel, or chain item accepts optional `provider`, `model`, and 
 Run `/agent-config` to edit personal runtime overrides without changing agent Markdown files.
 
 ## Output Display
+
+**Global live panel**:
+- Aggregates every active `subagent` tool call instead of showing only one call's current tool row
+- Groups single, parallel, and chain calls while showing queued, running, completed, failed, and cancelled siblings together
+- Shows the latest activity, redacted task summary, runtime, turns, tokens, and cost for each task
+- Disappears after all active calls finish; completed tool results remain in the transcript
+- Displays up to 12 task rows at once and reports the number of additional tasks
 
 **Collapsed view** (default):
 - Status icon (✓/✗/⏳) and agent name
@@ -205,3 +215,4 @@ Personal runtime overrides are stored separately with private file permissions:
 - Parallel model-visible output is capped at 50 KB per task; full results remain in tool details
 - Agents discovered fresh on each invocation (allows editing mid-session)
 - Parallel mode limited to 8 tasks, 4 concurrent
+- Global progress panel displays at most 12 task rows at once
