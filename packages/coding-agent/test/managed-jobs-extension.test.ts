@@ -514,8 +514,9 @@ describe("managed jobs built-in extension", () => {
 			"warning",
 		);
 		const prompt = await extension.beforeAgentStart();
-		expect(prompt?.systemPrompt).toContain("managed_job_control can start only the fixed trusted-project recipes");
-		expect(prompt?.systemPrompt).toContain("can wait on or stop only jobs it started");
+		expect(prompt?.systemPrompt).toContain("start only the fixed trusted-project recipes");
+		expect(prompt?.systemPrompt).toContain("inspect its frozen recipe budgets and active ownership");
+		expect(prompt?.systemPrompt).toContain("and wait on or stop only jobs it started");
 		expect(prompt?.systemPrompt).not.toContain("You cannot control managed jobs directly");
 		await writeFile(
 			join(cwd, MANAGED_JOBS_CONFIG_PATH),

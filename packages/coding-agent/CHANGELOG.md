@@ -38,6 +38,7 @@
 - Added optional 1-second to 24-hour runtime limits that automatically terminate agent- or human-started fixed recipe jobs.
 - Added optional per-start local approval gates for sensitive agent-controlled recipes, with bounded command review and headless fail-closed behavior.
 - Added bounded single-line recipe descriptions for agent intent discovery and local recipe review without exposing commands to the model.
+- Added structured control-tool recipe state for recovering start budgets and active ownership without exposing commands, arguments, or environment names.
 - Added an opt-in workspace-change discipline verifier with synchronous or asynchronous PatchSet capture, path, operation, minimum/maximum file-count, and byte-count gates, and privacy-preserving completion evidence.
 - Added request-only safe context trimming for reproducible tool results and unsigned plaintext thinking, with content-free `context_trim` TUI, JSON, and RPC observability.
 - Added conservative startup recovery reports with low-sensitivity `/recovery` review, durable acknowledgement, and no automatic provider or tool replay.

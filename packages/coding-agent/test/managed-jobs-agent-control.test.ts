@@ -125,6 +125,22 @@ describe("managed job agent control", () => {
 		expect(created.environmentNames).not.toContain("PI_MANAGED_JOBS_BLOCKED");
 		expect(created.environmentNames.some((name) => name.toLowerCase() === "path")).toBe(true);
 		expect(JSON.stringify(started)).not.toContain(process.execPath);
+		const catalog = await tool.execute("recipes-call", { action: "recipes" }, undefined, undefined, ctx);
+		expect(catalog.details).toMatchObject({
+			action: "recipes",
+			recipeIds: ["api"],
+			activeJobIds: [startDetails.jobId],
+		});
+		expect(catalog.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining('"startsRemaining": 0'),
+		});
+		expect(catalog.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining(`"activeJobId": "${startDetails.jobId}"`),
+		});
+		expect(JSON.stringify(catalog)).not.toContain(process.execPath);
+		expect(JSON.stringify(catalog)).not.toContain("PI_MANAGED_JOBS_ALLOWED");
 		await expect(
 			tool.execute("duplicate-call", { action: "start", recipe: "api" }, undefined, undefined, ctx),
 		).rejects.toThrow("already has an active tool-controlled run");
@@ -161,6 +177,14 @@ describe("managed job agent control", () => {
 		);
 		expect(stopped.details).toMatchObject({ action: "stop", recipeId: "api", state: "terminated" });
 		expect(runtime.manager.status(startDetails.jobId).state).toBe("terminated");
+		const stoppedCatalog = await tool.execute(
+			"stopped-recipes-call",
+			{ action: "recipes" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(stoppedCatalog.details).toMatchObject({ activeJobIds: [] });
 		await expect(
 			tool.execute("budget-call", { action: "start", recipe: "api" }, undefined, undefined, ctx),
 		).rejects.toThrow("reached its agent start budget: api (1/1)");

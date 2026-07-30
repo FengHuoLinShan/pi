@@ -457,7 +457,7 @@ export default function managedJobsExtension(pi: ExtensionAPI, options: ManagedJ
 			return;
 		}
 		const controlRule = agentControlToolRegistered
-			? "managed_job_control can start only the fixed trusted-project recipes in its tool description and can wait on or stop only jobs it started. It cannot accept arbitrary commands, arguments, working directories, or environment overrides. Ask the user to use /job for any other state change."
+			? "managed_job_control can inspect its frozen recipe budgets and active ownership, start only the fixed trusted-project recipes in its tool description, and wait on or stop only jobs it started. It cannot accept arbitrary commands, arguments, working directories, or environment overrides. Ask the user to use /job for any other state change."
 			: "You cannot control managed jobs directly; ask the user to use /job when another action is needed.";
 		return {
 			systemPrompt: `${event.systemPrompt}
