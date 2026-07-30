@@ -10,6 +10,7 @@ import {
 	MANAGED_JOBS_CONFIG_PATH,
 	type ManagedJobRecipeConfig,
 } from "./config.ts";
+import { runManagedJobRecipe } from "./recipe-runner.ts";
 import {
 	isActiveManagedJobState,
 	MANAGED_JOBS_MAX_ACTIVE,
@@ -474,7 +475,7 @@ The user may attach bounded process output through custom messages of type manag
 	});
 
 	pi.registerCommand("job", {
-		description: "Start, list, inspect, read, stop, prune, or review bounded background jobs and recipes",
+		description: "Start, list, inspect, read, stop, prune, review, or run bounded background jobs and recipes",
 		handler: async (rawArgs, ctx) => {
 			const opened = await requireRuntime(ctx);
 			if (!opened) return;
@@ -511,6 +512,54 @@ The user may attach bounded process output through custom messages of type manag
 						`${heading}\n${loaded.config.recipes.map(formatRecipe).join("\n")}\nSource: ${MANAGED_JOBS_CONFIG_PATH}; review the file directly if a displayed command is truncated.`,
 						"info",
 					);
+					return;
+				}
+				if (action === "run") {
+					if (args.length !== 1 || !args[0]) {
+						ctx.ui.notify("Usage: /job run <recipe>", "warning");
+						return;
+					}
+					if (!ctx.isProjectTrusted()) {
+						ctx.ui.notify(
+							`Running ${MANAGED_JOBS_CONFIG_PATH} recipes requires a trusted project because the file controls host commands`,
+							"error",
+						);
+						return;
+					}
+					const loaded = agentControlConfig ?? (await loadManagedJobsConfig(ctx.cwd));
+					const recipe = loaded.config.recipes.find((candidate) => candidate.id === args[0]);
+					if (!recipe) {
+						ctx.ui.notify(`Managed job recipe not found: ${displayText(args[0])}`, "error");
+						return;
+					}
+					const active = opened.manager.list().filter((record) => isActiveManagedJobState(record.state));
+					if (active.length >= MANAGED_JOBS_MAX_ACTIVE) {
+						ctx.ui.notify(`Managed job limit reached (${MANAGED_JOBS_MAX_ACTIVE} active)`, "error");
+						return;
+					}
+					const result = await runManagedJobRecipe({
+						runtime: opened,
+						recipe,
+						cwd: ctx.cwd,
+						signal: ctx.signal,
+					});
+					setJobsStatus(ctx, opened);
+					const source = agentControlConfig ? "frozen agent-control" : "current";
+					const prefix = `Ran recipe ${displayText(recipe.id)} as job ${displayJobId(result.record)} from ${source} revision ${loaded.revision.slice(0, 12)}`;
+					if (result.readinessStatus === "not_configured") {
+						ctx.ui.notify(prefix, "info");
+					} else if (result.readinessStatus === "matched") {
+						ctx.ui.notify(`${prefix}; readiness matched`, "info");
+					} else if (result.readinessStatus === "terminal") {
+						ctx.ui.notify(`${prefix}; job became ${result.record.state} before readiness matched`, "warning");
+					} else if (result.readinessStatus === "timeout") {
+						ctx.ui.notify(`${prefix}; readiness timed out while job remained ${result.record.state}`, "warning");
+					} else {
+						ctx.ui.notify(
+							`${prefix}; readiness wait was cancelled while job remained ${result.record.state}`,
+							"warning",
+						);
+					}
 					return;
 				}
 				if (action === "start") {
@@ -754,7 +803,7 @@ The user may attach bounded process output through custom messages of type manag
 			}
 
 			ctx.ui.notify(
-				"Usage: /job [list|recipes|start [--name <name>] <command> [args...]|status <id>|output <id>|send <id>|wait <id> --contains <text>|stop <id>|prune <id>|prune --all]",
+				"Usage: /job [list|recipes|run <recipe>|start [--name <name>] <command> [args...]|status <id>|output <id>|send <id>|wait <id> --contains <text>|stop <id>|prune <id>|prune --all]",
 				"warning",
 			);
 		},

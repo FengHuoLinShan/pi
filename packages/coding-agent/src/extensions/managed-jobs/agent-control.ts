@@ -2,15 +2,9 @@ import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import { defineTool } from "../../core/extensions/index.ts";
 import type { ProcessSessionRecord } from "../../core/process-session.ts";
-import { getShellEnv } from "../../utils/shell.ts";
 import type { LoadedManagedJobsConfig, ManagedJobRecipeConfig } from "./config.ts";
-import {
-	isActiveManagedJobState,
-	MANAGED_JOBS_MAX_ACTIVE,
-	type ManagedJobsRuntime,
-	type WaitForManagedJobOutputResult,
-	waitForManagedJobOutput,
-} from "./runtime.ts";
+import { ManagedJobRecipeRunError, runManagedJobRecipe } from "./recipe-runner.ts";
+import { isActiveManagedJobState, MANAGED_JOBS_MAX_ACTIVE, type ManagedJobsRuntime } from "./runtime.ts";
 
 export const MANAGED_JOBS_AGENT_CONTROL_TOOL = "managed_job_control";
 const MANAGED_JOB_CONTROL_WAIT_MAX_SECONDS = 30;
@@ -189,57 +183,38 @@ export function createManagedJobControlTool(options: ManagedJobControlToolOption
 				do {
 					id = `agent-${recipe.id.slice(0, 40)}-${randomUUID().slice(0, 8)}`;
 				} while (options.runtime.manager.get(id));
-				let started: ProcessSessionRecord;
+				let started: Awaited<ReturnType<typeof runManagedJobRecipe>>;
 				try {
-					started = await options.runtime.manager.start({
-						id,
-						command: recipe.command,
-						args: recipe.args,
+					started = await runManagedJobRecipe({
+						runtime: options.runtime,
+						recipe,
 						cwd: options.cwd,
-						env: getShellEnv(),
-					});
-				} catch {
-					throw operationError("start", recipe.id, id);
-				}
-				controlledJobs.set(started.id, recipe);
-				if (!recipe.readiness) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: resultContent("start", recipe, started, options.loaded.revision, "not_configured"),
-							},
-						],
-						details: {
-							version: 1,
-							action: "start",
-							configRevision: options.loaded.revision,
-							recipeId: recipe.id,
-							jobId: started.id,
-							state: started.state,
-							readinessStatus: "not_configured",
-						},
-					};
-				}
-				let readiness: WaitForManagedJobOutputResult;
-				try {
-					readiness = await waitForManagedJobOutput(options.runtime, started.id, {
-						contains: recipe.readiness.contains,
-						stream:
-							recipe.readiness.stream === "stdout" || recipe.readiness.stream === "stderr"
-								? recipe.readiness.stream
-								: undefined,
-						timeoutMs: recipe.readiness.timeoutSeconds * 1000,
+						id,
 						signal,
 					});
-				} catch {
-					throw operationError("readiness check", recipe.id, started.id);
+				} catch (error) {
+					if (error instanceof ManagedJobRecipeRunError && error.stage === "readiness check" && error.jobId) {
+						controlledJobs.set(error.jobId, recipe);
+					}
+					const stage = error instanceof ManagedJobRecipeRunError ? error.stage : "start";
+					throw operationError(
+						stage,
+						recipe.id,
+						error instanceof ManagedJobRecipeRunError ? (error.jobId ?? id) : id,
+					);
 				}
+				controlledJobs.set(started.record.id, recipe);
 				return {
 					content: [
 						{
 							type: "text",
-							text: resultContent("start", recipe, readiness.record, options.loaded.revision, readiness.status),
+							text: resultContent(
+								"start",
+								recipe,
+								started.record,
+								options.loaded.revision,
+								started.readinessStatus,
+							),
 						},
 					],
 					details: {
@@ -247,9 +222,9 @@ export function createManagedJobControlTool(options: ManagedJobControlToolOption
 						action: "start",
 						configRevision: options.loaded.revision,
 						recipeId: recipe.id,
-						jobId: readiness.record.id,
-						state: readiness.record.state,
-						readinessStatus: readiness.status,
+						jobId: started.record.id,
+						state: started.record.state,
+						readinessStatus: started.readinessStatus,
 					},
 				};
 			}

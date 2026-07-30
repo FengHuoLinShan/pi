@@ -97,6 +97,7 @@ Start pi with `--managed-jobs` to enable a user-controlled background process su
 /job start --name dev npm run dev
 /job list
 /job recipes
+/job run <recipe>
 /job status <id>
 /job output <id> [stdout|stderr|all]
 /job send <id> [stdout|stderr|all]
@@ -144,7 +145,7 @@ Add `--managed-jobs-agent-control` to let the coding agent use `managed_job_cont
 
 The file accepts 1-16 fixed recipes. Recipe IDs are portable 1-64 character identifiers. Each recipe uses direct argv execution in the workspace root; it cannot define a different working directory or environment override. Optional readiness is a literal match over bounded artifact-backed output with a maximum 30-second wait. A timeout or cancelled tool call leaves the job running.
 
-The extension loads and hashes the config once per extension instance. Later file edits do not change the in-memory recipes or the revision reported in tool results. `/job recipes` displays that frozen revision and bounded local command summaries when agent control is active; otherwise it previews the current file without enabling control. `managed_job_control` accepts only `start` with an exact loaded recipe ID, or `wait`/`stop` with an exact job ID that the same tool instance started. Completion waits are cancellable, bounded to 30 seconds, and return only lifecycle state and exit status, not process output. The tool rejects duplicate active runs of one recipe, cannot wait on or stop user-started jobs, and inherits the four-active-job and 10 MiB output limits. Successful tool results omit commands, arguments, and stored process errors; operational tool failures also replace host error details with a local `/job status <id>` pointer. `--managed-jobs-agent-read` remains a separate permission for inspecting output.
+The extension loads and hashes the config once per extension instance. Later file edits do not change the in-memory recipes or the revision reported in tool results. `/job recipes` displays that frozen revision and bounded local command summaries when agent control is active; otherwise it previews the current file without enabling control. `/job run <recipe>` requires a trusted project and lets a person run the same frozen recipe, or the current validated config when agent control is inactive, including its bounded readiness wait. Human-run jobs remain outside the control tool's ownership. `managed_job_control` accepts only `start` with an exact loaded recipe ID, or `wait`/`stop` with an exact job ID that the same tool instance started. Completion waits are cancellable, bounded to 30 seconds, and return only lifecycle state and exit status, not process output. The tool rejects duplicate active runs of one recipe, cannot wait on or stop user-started jobs, and inherits the four-active-job and 10 MiB output limits. Successful tool results omit commands, arguments, and stored process errors; operational tool failures also replace host error details with a local `/job status <id>` pointer. `--managed-jobs-agent-read` remains a separate permission for inspecting output.
 
 These recipes execute on the host with pi's shell environment and normal host network access. A trusted recipe can run arbitrary code or expose environment secrets through its output. Review the config before enabling the flag; use an SDK execution boundary instead when host execution is not acceptable.
 

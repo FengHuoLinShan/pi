@@ -532,6 +532,12 @@ describe("managed jobs built-in extension", () => {
 		);
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining(process.execPath), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.not.stringContaining("replacement-command"), "info");
+		await extension.command("run api", extension.ctx);
+		expect(extension.notify).toHaveBeenLastCalledWith(
+			expect.stringContaining("from frozen agent-control revision"),
+			"info",
+		);
+		expect(latestRecord(runtime).command).toBe(process.execPath);
 		await tool.execute("start-call", { action: "start", recipe: "api" }, undefined, undefined, extension.ctx);
 	});
 
@@ -565,6 +571,39 @@ describe("managed jobs built-in extension", () => {
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining('readiness=stdout:"ready"/5s'), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.not.stringContaining("x".repeat(1_100)), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("..."), "info");
+	});
+
+	it("runs a current fixed recipe only from a trusted project", async () => {
+		const runtime = await createRuntime();
+		const cwd = temporaryDirectories.at(-1)!;
+		await mkdir(join(cwd, ".pi"));
+		await writeFile(
+			join(cwd, MANAGED_JOBS_CONFIG_PATH),
+			JSON.stringify({
+				version: 1,
+				recipes: [
+					{
+						id: "service",
+						command: process.execPath,
+						args: ["-e", "setTimeout(() => process.stdout.write('ready'), 20)"],
+						readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 1 },
+					},
+				],
+			}),
+			"utf8",
+		);
+		const untrusted = setupExtension(runtime, true, true, true, false, false, false, false);
+		await untrusted.sessionStart();
+		await untrusted.command("run service", untrusted.ctx);
+		expect(runtime.manager.list()).toHaveLength(0);
+		expect(untrusted.notify).toHaveBeenLastCalledWith(expect.stringContaining("requires a trusted project"), "error");
+
+		const trusted = setupExtension(runtime);
+		await trusted.sessionStart();
+		await trusted.command("run service", trusted.ctx);
+		expect(latestRecord(runtime)).toMatchObject({ command: process.execPath, state: "running" });
+		expect(trusted.notify).toHaveBeenLastCalledWith(expect.stringContaining("readiness matched"), "info");
+		expect(trusted.notify).toHaveBeenLastCalledWith(expect.stringContaining("from current revision"), "info");
 	});
 
 	it("rejects agent control for untrusted or execution-bounded projects", async () => {
