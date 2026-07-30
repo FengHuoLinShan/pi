@@ -4,7 +4,12 @@ import type { ProcessOutputStream, ProcessSessionRecord, ProcessSessionState } f
 import { stripAnsi } from "../../utils/ansi.ts";
 import { getShellEnv, sanitizeBinaryOutput } from "../../utils/shell.ts";
 import { createManagedJobControlTool, MANAGED_JOBS_AGENT_CONTROL_TOOL } from "./agent-control.ts";
-import { loadManagedJobsConfig, MANAGED_JOBS_CONFIG_PATH } from "./config.ts";
+import {
+	type LoadedManagedJobsConfig,
+	loadManagedJobsConfig,
+	MANAGED_JOBS_CONFIG_PATH,
+	type ManagedJobRecipeConfig,
+} from "./config.ts";
 import {
 	isActiveManagedJobState,
 	MANAGED_JOBS_MAX_ACTIVE,
@@ -27,6 +32,7 @@ const MANAGED_JOB_WAIT_DEFAULT_SECONDS = 30;
 const MANAGED_JOB_WAIT_MAX_SECONDS = 120;
 const MANAGED_JOB_WAIT_MAX_TEXT_LENGTH = 512;
 const MANAGED_JOB_AGENT_WAIT_MAX_SECONDS = 30;
+const MANAGED_JOB_RECIPE_DISPLAY_MAX_CHARACTERS = 1_024;
 
 export interface ManagedJobsExtensionOptions {
 	openRuntime?: (cwd: string) => Promise<ManagedJobsRuntime>;
@@ -77,6 +83,22 @@ function displayJobId(record: ProcessSessionRecord): string {
 function formatRecord(record: ProcessSessionRecord): string {
 	const exit = record.exit ? ` exit=${record.exit.exitCode ?? record.exit.signal ?? "unknown"}` : "";
 	return `${displayJobId(record)} ${record.state}${exit} output=${outputBytes(record)}B ${displayText(commandDisplay(record))}`;
+}
+
+function formatRecipe(recipe: ManagedJobRecipeConfig): string {
+	const command = displayText(
+		[recipe.command, ...recipe.args]
+			.map((argument) => (/\s/.test(argument) ? JSON.stringify(argument) : argument))
+			.join(" "),
+	);
+	const boundedCommand =
+		command.length <= MANAGED_JOB_RECIPE_DISPLAY_MAX_CHARACTERS
+			? command
+			: `${command.slice(0, MANAGED_JOB_RECIPE_DISPLAY_MAX_CHARACTERS - 3)}...`;
+	const readiness = recipe.readiness
+		? ` readiness=${recipe.readiness.stream}:${JSON.stringify(displayText(recipe.readiness.contains))}/${recipe.readiness.timeoutSeconds}s`
+		: "";
+	return `${displayText(recipe.id)}${readiness}\n  ${boundedCommand}`;
 }
 
 function agentRecordSnapshot(record: ProcessSessionRecord) {
@@ -150,6 +172,7 @@ export default function managedJobsExtension(pi: ExtensionAPI, options: ManagedJ
 	let unsubscribe: (() => void) | undefined;
 	let agentReadToolRegistered = false;
 	let agentControlToolRegistered = false;
+	let agentControlConfig: LoadedManagedJobsConfig | undefined;
 
 	const requireRuntime = async (ctx: ExtensionContext): Promise<ManagedJobsRuntime | undefined> => {
 		if (pi.getFlag(MANAGED_JOBS_FLAG) !== true) {
@@ -374,6 +397,7 @@ export default function managedJobsExtension(pi: ExtensionAPI, options: ManagedJ
 					}),
 				);
 				agentControlToolRegistered = true;
+				agentControlConfig = loaded;
 				ctx.ui.notify(
 					`Agent managed-job control loaded ${loaded.config.recipes.length} fixed recipe(s) from ${MANAGED_JOBS_CONFIG_PATH} at revision ${loaded.revision.slice(0, 12)}; the file will not be re-read by this extension instance`,
 					"warning",
@@ -450,7 +474,7 @@ The user may attach bounded process output through custom messages of type manag
 	});
 
 	pi.registerCommand("job", {
-		description: "Start, list, inspect, read, stop, or prune bounded background jobs",
+		description: "Start, list, inspect, read, stop, prune, or review bounded background jobs and recipes",
 		handler: async (rawArgs, ctx) => {
 			const opened = await requireRuntime(ctx);
 			if (!opened) return;
@@ -472,6 +496,21 @@ The user may attach bounded process output through custom messages of type manag
 						lines.unshift(`${records.length - DISPLAY_JOB_LIMIT} older job(s) omitted`);
 					}
 					ctx.ui.notify(lines.length > 0 ? lines.join("\n") : "No managed jobs", "info");
+					return;
+				}
+				if (action === "recipes") {
+					if (args.length > 0) {
+						ctx.ui.notify("Usage: /job recipes", "warning");
+						return;
+					}
+					const loaded = agentControlConfig ?? (await loadManagedJobsConfig(ctx.cwd));
+					const heading = agentControlConfig
+						? `Agent-control recipe snapshot ${loaded.revision.slice(0, 12)} (loaded once; current file was not re-read):`
+						: `Managed-job recipe preview ${loaded.revision.slice(0, 12)} (agent control is not active):`;
+					ctx.ui.notify(
+						`${heading}\n${loaded.config.recipes.map(formatRecipe).join("\n")}\nSource: ${MANAGED_JOBS_CONFIG_PATH}; review the file directly if a displayed command is truncated.`,
+						"info",
+					);
 					return;
 				}
 				if (action === "start") {
@@ -715,7 +754,7 @@ The user may attach bounded process output through custom messages of type manag
 			}
 
 			ctx.ui.notify(
-				"Usage: /job [list|start [--name <name>] <command> [args...]|status <id>|output <id>|send <id>|wait <id> --contains <text>|stop <id>|prune <id>|prune --all]",
+				"Usage: /job [list|recipes|start [--name <name>] <command> [args...]|status <id>|output <id>|send <id>|wait <id> --contains <text>|stop <id>|prune <id>|prune --all]",
 				"warning",
 			);
 		},

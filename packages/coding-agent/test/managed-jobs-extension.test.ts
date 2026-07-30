@@ -517,7 +517,54 @@ describe("managed jobs built-in extension", () => {
 		expect(prompt?.systemPrompt).toContain("managed_job_control can start only the fixed trusted-project recipes");
 		expect(prompt?.systemPrompt).toContain("can wait on or stop only jobs it started");
 		expect(prompt?.systemPrompt).not.toContain("You cannot control managed jobs directly");
+		await writeFile(
+			join(cwd, MANAGED_JOBS_CONFIG_PATH),
+			JSON.stringify({
+				version: 1,
+				recipes: [{ id: "replacement", command: "replacement-command" }],
+			}),
+			"utf8",
+		);
+		await extension.command("recipes", extension.ctx);
+		expect(extension.notify).toHaveBeenLastCalledWith(
+			expect.stringContaining("Agent-control recipe snapshot"),
+			"info",
+		);
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining(process.execPath), "info");
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.not.stringContaining("replacement-command"), "info");
 		await tool.execute("start-call", { action: "start", recipe: "api" }, undefined, undefined, extension.ctx);
+	});
+
+	it("previews the current recipe config without enabling agent control", async () => {
+		const runtime = await createRuntime();
+		const cwd = temporaryDirectories.at(-1)!;
+		await mkdir(join(cwd, ".pi"));
+		await writeFile(
+			join(cwd, MANAGED_JOBS_CONFIG_PATH),
+			JSON.stringify({
+				version: 1,
+				recipes: [
+					{
+						id: "check",
+						command: "npm",
+						args: ["run", "check", "x".repeat(2_000)],
+						readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 5 },
+					},
+				],
+			}),
+			"utf8",
+		);
+		const extension = setupExtension(runtime);
+		await extension.sessionStart();
+
+		await extension.command("recipes", extension.ctx);
+
+		expect(extension.tool(MANAGED_JOBS_AGENT_CONTROL_TOOL)).toBeUndefined();
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("Managed-job recipe preview"), "info");
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("npm run check"), "info");
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining('readiness=stdout:"ready"/5s'), "info");
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.not.stringContaining("x".repeat(1_100)), "info");
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("..."), "info");
 	});
 
 	it("rejects agent control for untrusted or execution-bounded projects", async () => {

@@ -32,6 +32,7 @@
 - Added `ctx.hasExecutionBoundary` so extensions can fail closed before offering host-process capabilities.
 - Added trusted-project managed-job recipes and explicit `--managed-jobs-agent-control` for revision-pinned fixed starts and tool-owned stops.
 - Added bounded, cancellable completion waits for agent-controlled fixed recipe jobs without exposing process output.
+- Added `/job recipes` for bounded local review of the frozen agent-control recipe revision or a non-activating config preview.
 - Added an opt-in workspace-change discipline verifier with synchronous or asynchronous PatchSet capture, path, operation, minimum/maximum file-count, and byte-count gates, and privacy-preserving completion evidence.
 - Added request-only safe context trimming for reproducible tool results and unsigned plaintext thinking, with content-free `context_trim` TUI, JSON, and RPC observability.
 - Added conservative startup recovery reports with low-sensitivity `/recovery` review, durable acknowledgement, and no automatic provider or tool replay.
