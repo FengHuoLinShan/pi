@@ -92,7 +92,7 @@ Container, VM, or remote-sandbox integrations can implement `ProcessSessionBacke
 Start pi with `--managed-jobs` to enable a user-controlled background process surface:
 
 ```text
-/job start npm run dev
+/job start --name dev npm run dev
 /job list
 /job status <id>
 /job output <id> [stdout|stderr|all]
@@ -101,6 +101,8 @@ Start pi with `--managed-jobs` to enable a user-controlled background process su
 ```
 
 Commands use direct executable-and-argument spawning, not a shell. Quotes and escaped whitespace group arguments, but pipes, redirects, variable expansion, and other shell syntax are not interpreted. If shell behavior is intentionally required, invoke the shell executable explicitly.
+
+`--name` assigns a stable job ID for later commands such as `/job output dev`; names must be 1-64 characters, begin with an alphanumeric character, and otherwise contain only alphanumerics, `.`, `_`, or `-`. Names are unique and immutable within the workspace journal. Without `--name`, pi generates a UUID and accepts an unambiguous prefix of at least four characters.
 
 The built-in policy permits at most four active jobs per workspace, retains at most 10 MiB of artifact-backed output per job, and displays at most the newest 16 KiB. Reaching the output limit durably fails and terminates the job. Job IDs, commands, arguments, working directories, backend handles, environment variable names, lifecycle states, and artifact references are journaled; environment values and output bytes are not. Do not put credentials directly in command arguments.
 

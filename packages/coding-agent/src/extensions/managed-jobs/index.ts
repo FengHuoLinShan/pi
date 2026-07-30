@@ -14,6 +14,7 @@ import {
 export const MANAGED_JOBS_FLAG = "managed-jobs";
 const STATUS_KEY = "managed-jobs";
 const DISPLAY_JOB_LIMIT = 20;
+const MANAGED_JOB_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 export interface ManagedJobsExtensionOptions {
 	openRuntime?: (cwd: string) => Promise<ManagedJobsRuntime>;
@@ -33,15 +34,19 @@ function commandDisplay(record: ProcessSessionRecord): string {
 		.join(" ");
 }
 
+function displayJobId(record: ProcessSessionRecord): string {
+	return displayText(record.id.length <= 16 ? record.id : record.id.slice(0, 8));
+}
+
 function formatRecord(record: ProcessSessionRecord): string {
 	const exit = record.exit ? ` exit=${record.exit.exitCode ?? record.exit.signal ?? "unknown"}` : "";
-	return `${record.id.slice(0, 8)} ${record.state}${exit} output=${outputBytes(record)}B ${displayText(commandDisplay(record))}`;
+	return `${displayJobId(record)} ${record.state}${exit} output=${outputBytes(record)}B ${displayText(commandDisplay(record))}`;
 }
 
 function resolveRecord(runtime: ManagedJobsRuntime, idOrPrefix: string): ProcessSessionRecord {
-	if (idOrPrefix.length < 4) throw new Error("Managed job id prefix must contain at least 4 characters");
 	const exact = runtime.manager.get(idOrPrefix);
 	if (exact) return exact;
+	if (idOrPrefix.length < 4) throw new Error("Managed job id prefix must contain at least 4 characters");
 	const matches = runtime.manager.list().filter((record) => record.id.startsWith(idOrPrefix));
 	if (matches.length === 0) throw new Error(`Managed job not found: ${displayText(idOrPrefix)}`);
 	if (matches.length > 1) throw new Error(`Managed job id prefix is ambiguous: ${displayText(idOrPrefix)}`);
@@ -135,7 +140,7 @@ export default function managedJobsExtension(pi: ExtensionAPI, options: ManagedJ
 			}
 			const detail = record.error ? `: ${displayText(record.error)}` : "";
 			ctx.ui.notify(
-				`Managed job ${record.id.slice(0, 8)} is ${record.state}${detail}`,
+				`Managed job ${displayJobId(record)} is ${record.state}${detail}`,
 				terminalNotificationType(record.state, record.exit?.exitCode),
 			);
 		});
@@ -208,8 +213,21 @@ The user may attach bounded process output through custom messages of type manag
 					return;
 				}
 				if (action === "start") {
+					let id: string | undefined;
+					if (args[0] === "--name") {
+						args.shift();
+						id = args.shift();
+						if (!id || !MANAGED_JOB_NAME_PATTERN.test(id)) {
+							ctx.ui.notify(
+								"Managed job name must be 1-64 characters: alphanumeric first, then alphanumeric, '.', '_', or '-'",
+								"warning",
+							);
+							return;
+						}
+					}
+					if (args[0] === "--") args.shift();
 					if (args.length === 0 || !args[0]?.trim()) {
-						ctx.ui.notify("Usage: /job start <command> [args...]", "warning");
+						ctx.ui.notify("Usage: /job start [--name <name>] [--] <command> [args...]", "warning");
 						return;
 					}
 					const active = opened.manager.list().filter((record) => isActiveManagedJobState(record.state));
@@ -218,10 +236,10 @@ The user may attach bounded process output through custom messages of type manag
 						return;
 					}
 					const command = args.shift()!;
-					const started = await opened.manager.start({ command, args, cwd: ctx.cwd, env: getShellEnv() });
+					const started = await opened.manager.start({ id, command, args, cwd: ctx.cwd, env: getShellEnv() });
 					setJobsStatus(ctx, opened);
 					ctx.ui.notify(
-						`Started managed job ${started.id.slice(0, 8)}. Command and arguments are stored in the process journal.`,
+						`Started managed job ${displayJobId(started)}. Command and arguments are stored in the process journal.`,
 						"info",
 					);
 					return;
@@ -240,7 +258,7 @@ The user may attach bounded process output through custom messages of type manag
 					}
 					const { output } = await readJobOutput(opened, record, stream);
 					ctx.ui.notify(
-						output || `Managed job ${record.id.slice(0, 8)} has no retained ${stream ?? "combined"} output`,
+						output || `Managed job ${displayJobId(record)} has no retained ${stream ?? "combined"} output`,
 						"info",
 					);
 					return;
@@ -255,7 +273,7 @@ The user may attach bounded process output through custom messages of type manag
 					const { output, outputStream } = await readJobOutput(opened, record, stream);
 					if (!output) {
 						ctx.ui.notify(
-							`Managed job ${record.id.slice(0, 8)} has no retained ${stream ?? "combined"} output`,
+							`Managed job ${displayJobId(record)} has no retained ${stream ?? "combined"} output`,
 							"warning",
 						);
 						return;
@@ -288,7 +306,7 @@ The user may attach bounded process output through custom messages of type manag
 						ctx.isIdle() ? { triggerTurn: false } : { deliverAs: "nextTurn" },
 					);
 					ctx.ui.notify(
-						`Attached the bounded ${stream ?? "combined"} tail from managed job ${record.id.slice(0, 8)} to the next model context as untrusted data.`,
+						`Attached the bounded ${stream ?? "combined"} tail from managed job ${displayJobId(record)} to the next model context as untrusted data.`,
 						"warning",
 					);
 					return;
@@ -296,14 +314,14 @@ The user may attach bounded process output through custom messages of type manag
 				if (action === "stop") {
 					const record = resolveRecord(opened, args[0] ?? "");
 					if (!isActiveManagedJobState(record.state)) {
-						ctx.ui.notify(`Managed job ${record.id.slice(0, 8)} is already ${record.state}`, "warning");
+						ctx.ui.notify(`Managed job ${displayJobId(record)} is already ${record.state}`, "warning");
 						return;
 					}
 					await opened.manager.terminate(record.id);
 					const stopped = await opened.manager.waitForExit(record.id);
 					await opened.manager.flush();
 					setJobsStatus(ctx, opened);
-					ctx.ui.notify(`Managed job ${stopped.id.slice(0, 8)} is ${stopped.state}`, "info");
+					ctx.ui.notify(`Managed job ${displayJobId(stopped)} is ${stopped.state}`, "info");
 					return;
 				}
 			} catch (error) {
@@ -312,7 +330,7 @@ The user may attach bounded process output through custom messages of type manag
 			}
 
 			ctx.ui.notify(
-				"Usage: /job [list|start <command> [args...]|status <id>|output <id>|send <id>|stop <id>]",
+				"Usage: /job [list|start [--name <name>] <command> [args...]|status <id>|output <id>|send <id>|stop <id>]",
 				"warning",
 			);
 		},

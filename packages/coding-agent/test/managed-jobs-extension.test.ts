@@ -167,23 +167,32 @@ describe("managed jobs built-in extension", () => {
 		await extension.sessionStart();
 
 		await extension.command(
-			`start ${quoteArgument(process.execPath)} -e ${quoteArgument("setInterval(() => {}, 1000)")}`,
+			`start --name dev ${quoteArgument(process.execPath)} -e ${quoteArgument("setInterval(() => {}, 1000)")}`,
 			extension.ctx,
 		);
 		const started = latestRecord(runtime);
+		expect(started.id).toBe("dev");
 		expect(started.state).toBe("running");
-		expect(extension.notify).toHaveBeenCalledWith(
-			expect.stringContaining(`Started managed job ${started.id.slice(0, 8)}`),
-			"info",
-		);
+		expect(extension.notify).toHaveBeenCalledWith(expect.stringContaining("Started managed job dev"), "info");
 		expect(extension.setStatus).toHaveBeenLastCalledWith("managed-jobs", "jobs 1 active");
 
-		await extension.command(`status ${started.id.slice(0, 8)}`, extension.ctx);
+		await extension.command("status dev", extension.ctx);
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("running"), "info");
 
-		await extension.command(`stop ${started.id.slice(0, 8)}`, extension.ctx);
+		await extension.command("stop dev", extension.ctx);
 		expect(runtime.manager.status(started.id).state).toBe("terminated");
 		expect(extension.setStatus).toHaveBeenLastCalledWith("managed-jobs", undefined);
+	});
+
+	it("rejects unsafe or ambiguous managed job names before process creation", async () => {
+		const runtime = await createRuntime();
+		const extension = setupExtension(runtime);
+		await extension.sessionStart();
+
+		await extension.command(`start --name ../dev ${quoteArgument(process.execPath)} -e ""`, extension.ctx);
+
+		expect(runtime.manager.list()).toHaveLength(0);
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("Managed job name must be"), "warning");
 	});
 
 	it("shows a bounded ANSI-sanitized output tail", async () => {
