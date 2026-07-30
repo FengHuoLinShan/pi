@@ -85,6 +85,46 @@ const freshness = ledger.checkFreshness(currentSourceVersions);
 
 For reproducible builds and tests, callers should supply stable priorities, hashes, and observation timestamps. Persist `EvidenceLedgerSnapshot` and the compiled context result alongside application/session state when replay diagnostics need to explain why a fragment was present.
 
+## Revision-aware working set
+
+`RevisionAwareWorkingSet` is an append-only, versioned store for objectives, repository facts, decisions, failed attempts, and verification evidence. `prepare()` combines lexical task relevance, entry-kind weights, caller priority, and `compileContext()` to produce a bounded context. It does not require a vector database.
+
+Facts can reference workspace-relative sources and SHA-256 revisions. The caller supplies current source revisions for each preparation. Stale or missing facts are excluded, and a stale required entry changes the preparation status to `blocked` instead of silently using outdated context.
+
+```ts
+const sourceRevision = `sha256:${"a".repeat(64)}`;
+const workingSet = new RevisionAwareWorkingSet(createWorkingSet("task-1"));
+workingSet.append({
+  id: "worker-fact",
+  kind: "fact",
+  content: "runWorker delegates retries to scheduleRetry.",
+  priority: 20,
+  required: true,
+  tags: ["worker", "retry"],
+  sources: [{
+    path: "src/worker.ts",
+    revision: sourceRevision,
+    symbol: "runWorker",
+  }],
+  evidenceIds: ["worker-read"],
+  createdAt: new Date().toISOString(),
+});
+
+const prepared = workingSet.prepare({
+  task: "repair worker retry ordering",
+  workspaceRevision: "overlay-base:...",
+  currentSources: [{
+    path: "src/worker.ts",
+    revision: sourceRevision,
+  }],
+  tokenBudget: 2_000,
+});
+```
+
+`maxEntries` is a hard cap on selected entries. Preparation fails when fresh required entries alone exceed it, because required context is never silently omitted.
+
+The coding-agent package supplies a `WorkspaceView` source-hashing adapter and optimistic session persistence. Boundary-backed workspaces must provide their own source resolver; host extensions do not assume they can read paths inside a remote execution boundary.
+
 ## Trust labels and prompt-injection containment
 
 `protectContext()` is an explicit pre-compilation boundary for retrieved or application-supplied context. Each `LabeledContextFragment` declares:

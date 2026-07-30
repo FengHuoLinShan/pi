@@ -13,6 +13,8 @@
 - Added optional low-level agent run budgets, absolute deadlines, structured termination events, and configurable repeated-tool-call loop detection.
 - Added a session-backed canonical runtime event store with pure replay/checkpoint reduction, conservative interrupted-run recovery, and partial JSONL tail repair.
 - Added deterministic context compilation with budgeted source selection, repository maps, and freshness-aware evidence ledgers.
+- Added revision-aware working sets that retrieve objectives, facts, decisions, failed attempts, and evidence by task while excluding stale source-bound facts and blocking on stale required context.
+- Added opt-in trace-to-eval mining that extracts minimal critical replay suffixes from failed or costly runs, stores hash-only baselines, and evaluates adapter-backed branches without exposing result content.
 - Added explicit completion contracts with deterministic verifier reports, context trust labels with prompt-injection containment and provenance, capability-based model routing, and one-action structured recovery plans.
 - Added forkable trace replay with explicit event boundaries, model/tool overrides, branch integrity hashes, adapter-gated execution, and content-free outcome comparison.
 - Added explicit Verified Runs that compose one Harness turn with a completion contract, actual usage, structured status, and opaque artifact/evidence references.

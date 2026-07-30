@@ -80,3 +80,25 @@ npm --prefix packages/agent run eval:harness:update
 The updater refuses to create a baseline from a failing report. Review both the scenario and baseline diff; do not weaken thresholds to accept an unexplained change.
 
 Library consumers can import `runAgentHarnessEvalSuite`, `compareAgentHarnessEvalReport`, schemas, report types, and baseline helpers from `@earendil-works/pi-agent-core/evals`.
+
+## Mining replay regressions
+
+`mineReplayEval()` converts an exact trace suffix from a failed or explicitly costly run into a versioned replay fixture. It selects the first failed tool/provider/turn boundary, or a configured metric-threshold breach, and retains only the replay steps at or after that critical sequence.
+
+Mining is privacy-gated twice: the trace must already contain exact per-item captures, and the mining call must set `allowCapturedContent: true`. The fixture contains exact replay inputs, so it must follow the same secret scanning, access, retention, and deletion controls as its source bundle. Its baseline stores only result hashes and statuses.
+
+```ts
+const fixture = await mineReplayEval(bundle, {
+  id: "retry-regression",
+  allowCapturedContent: true,
+  adapterKinds: ["model"],
+  metricThresholds: { modelTokens: 20_000 },
+});
+
+const report = await runMinedReplayEval(fixture, {
+  invokeModel: (step, signal) => callCandidateModel(step, signal),
+  invokeTool: (step, signal) => callSandboxedTool(step, signal),
+});
+```
+
+The default expectation is hash equivalence with the recorded baseline. Fixtures can instead require a different complete outcome or only require complete execution. `verifyMinedReplayEvalFixture()` checks both fixture and replay-branch integrity. Reports contain hashes and comparison statuses, never adapter result bodies.

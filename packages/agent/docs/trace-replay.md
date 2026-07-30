@@ -137,6 +137,14 @@ const execution = await executeReplayBranch(branch, {
 
 Recorded and override responses never call adapters. Missing adapters produce a blocked execution instead of silently performing live work. `verifyReplayBranch()` detects plan mutation, and `compareReplayBranches()` compares result hashes without copying raw result content into the comparison.
 
+## Replay eval mining
+
+The eval subpath connects trace and replay primitives to regression fixtures. `mineReplayEval()` identifies failed tool calls, provider/turn failures, or caller-defined metric threshold breaches; forks at the corresponding invocation boundary; executes the recorded suffix as a hash-only baseline; and creates an adapter-backed candidate branch.
+
+Exact content mining requires an additional `allowCapturedContent` opt-in even when the source trace already captured the relevant values. Redacted or transformed inputs and incomplete recorded responses fail with `content_unavailable`. This prevents diagnostic metadata from silently becoming a content-bearing eval asset.
+
+`runMinedReplayEval()` invokes only the adapter kinds selected during mining and compares the candidate with the hash-only baseline. Its report omits result bodies. Current tool policy, approvals, isolation, and secret handling still apply to every adapter invocation.
+
 ## Operational rules
 
 - Verify the bundle checksum before import or replay.
