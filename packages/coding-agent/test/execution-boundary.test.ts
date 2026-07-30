@@ -1,6 +1,7 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import {
 	type BoundaryEnforcementCapabilities,
@@ -12,7 +13,7 @@ import {
 	resolveExecutionBoundary,
 } from "../src/core/execution-boundary.ts";
 import { createExtensionRuntime } from "../src/core/extensions/loader.ts";
-import type { ResourceLoader } from "../src/core/resource-loader.ts";
+import { DefaultResourceLoader, type ResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -61,6 +62,54 @@ function createBoundary(
 				profileDigest: overrides?.profileDigest ?? createBoundaryProfileDigest(requestedProfile),
 				capabilities: overrides?.capabilities ?? capabilities,
 			}),
+		},
+	};
+}
+
+function createCompleteBoundaryOperations(
+	onBashCwd?: (cwd: string) => void,
+): ExecutionBoundary["backend"]["operations"] {
+	return {
+		read: {
+			realpath: async (path) => path,
+			readFile: async () => Buffer.from("content"),
+			access: async () => {},
+		},
+		bash: {
+			exec: async (_command, cwd, options) => {
+				onBashCwd?.(cwd);
+				options.onData(Buffer.from("sdk-boundary"));
+				return { exitCode: 0 };
+			},
+		},
+		edit: {
+			realpath: async (path) => path,
+			readFile: async () => Buffer.from("content"),
+			writeFile: async () => {},
+			access: async () => {},
+		},
+		write: {
+			realpath: async (path) => path,
+			readFile: async () => Buffer.from("content"),
+			writeFile: async () => {},
+			mkdir: async () => {},
+		},
+		grep: {
+			realpath: async (path) => path,
+			isDirectory: async () => true,
+			readFile: async () => "content",
+			search: async () => [],
+		},
+		find: {
+			realpath: async (path) => path,
+			exists: async () => true,
+			glob: async () => [],
+		},
+		ls: {
+			realpath: async (path) => path,
+			exists: async () => true,
+			stat: async () => ({ isDirectory: () => true }),
+			readdir: async () => [],
 		},
 	};
 }
@@ -244,49 +293,9 @@ describe("boundary environment filtering", () => {
 describe("SDK execution boundary", () => {
 	it("uses one attested backend for the complete built-in tool surface and session bash", async () => {
 		let bashCwd: string | undefined;
-		const operations: ExecutionBoundary["backend"]["operations"] = {
-			read: {
-				realpath: async (path) => path,
-				readFile: async () => Buffer.from("content"),
-				access: async () => {},
-			},
-			bash: {
-				exec: async (_command, cwd, options) => {
-					bashCwd = cwd;
-					options.onData(Buffer.from("sdk-boundary"));
-					return { exitCode: 0 };
-				},
-			},
-			edit: {
-				realpath: async (path) => path,
-				readFile: async () => Buffer.from("content"),
-				writeFile: async () => {},
-				access: async () => {},
-			},
-			write: {
-				realpath: async (path) => path,
-				readFile: async () => Buffer.from("content"),
-				writeFile: async () => {},
-				mkdir: async () => {},
-			},
-			grep: {
-				realpath: async (path) => path,
-				isDirectory: async () => true,
-				readFile: async () => "content",
-				search: async () => [],
-			},
-			find: {
-				realpath: async (path) => path,
-				exists: async () => true,
-				glob: async () => [],
-			},
-			ls: {
-				realpath: async (path) => path,
-				exists: async () => true,
-				stat: async () => ({ isDirectory: () => true }),
-				readdir: async () => [],
-			},
-		};
+		const operations = createCompleteBoundaryOperations((cwd) => {
+			bashCwd = cwd;
+		});
 		const resourceLoader: ResourceLoader = {
 			getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
 			getSkills: () => ({ skills: [], diagnostics: [] }),
@@ -315,6 +324,65 @@ describe("SDK execution boundary", () => {
 				const result = await session.executeBash("pwd");
 				expect(result.output).toBe("sdk-boundary");
 				expect(bashCwd).toBe("/sandbox/workspace");
+			} finally {
+				session.dispose();
+			}
+		} finally {
+			rmSync(tempAgentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects and rolls back tools registered dynamically after boundary initialization", async () => {
+		const tempAgentDir = mkdtempSync(join(tmpdir(), "pi-boundary-dynamic-tool-"));
+		const workspace = join(tempAgentDir, "workspace");
+		mkdirSync(workspace);
+		const settingsManager = SettingsManager.inMemory();
+		const resourceLoader = new DefaultResourceLoader({
+			cwd: workspace,
+			agentDir: tempAgentDir,
+			settingsManager,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", () => {
+						pi.registerTool({
+							name: "late_host_tool",
+							label: "Late Host Tool",
+							description: "Must not cross the execution boundary",
+							parameters: Type.Object({}),
+							execute: async () => ({
+								content: [{ type: "text", text: "host" }],
+								details: {},
+							}),
+						});
+					});
+				},
+			],
+		});
+		await resourceLoader.reload();
+
+		try {
+			const { session } = await createAgentSession({
+				cwd: workspace,
+				agentDir: tempAgentDir,
+				executionBoundary: createBoundary(createCompleteBoundaryOperations()),
+				resourceLoader,
+				sessionManager: SessionManager.inMemory(workspace),
+				settingsManager,
+			});
+			const errors: string[] = [];
+			try {
+				await session.bindExtensions({
+					onError: (error) => errors.push(error.error),
+				});
+
+				expect(session.getAllTools().map((tool) => tool.name)).not.toContain("late_host_tool");
+				expect(session.getActiveToolNames()).not.toContain("late_host_tool");
+				expect(errors).toContainEqual(
+					expect.stringContaining("Extension tool late_host_tool cannot be enabled with executionBoundary"),
+				);
+				expect(
+					resourceLoader.getExtensions().extensions.flatMap((extension) => [...extension.tools.keys()]),
+				).not.toContain("late_host_tool");
 			} finally {
 				session.dispose();
 			}

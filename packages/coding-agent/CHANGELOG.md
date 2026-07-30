@@ -41,6 +41,7 @@
 
 ### Fixed
 
+- Fixed dynamically registered extension tools bypassing the execution-boundary host-process prohibition, with rejected registrations rolled back atomically.
 - Fixed SDK execution-boundary search tools to enforce readable roots and delegate grep to the backend instead of starting host search binaries.
 - Fixed source-checkout extension loading to resolve workspace package source entrypoints when build artifacts are absent.
 - Fixed prompt-template defaults for all arguments (`${@:-default}` and `${ARGUMENTS:-default}`) ([#6695](https://github.com/earendil-works/pi/issues/6695)).

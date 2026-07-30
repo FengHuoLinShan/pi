@@ -2958,6 +2958,7 @@ export class AgentSession {
 			(!allowedToolNames || allowedToolNames.has(name)) && !excludedToolNames?.has(name);
 
 		const registeredTools = this._extensionRunner.getAllRegisteredTools();
+		this._assertExtensionToolAllowed(registeredTools[0]?.definition.name);
 		const allCustomTools = [
 			...registeredTools,
 			...this._customTools.map((definition) => ({
@@ -3042,6 +3043,14 @@ export class AgentSession {
 		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
 	}
 
+	private _assertExtensionToolAllowed(toolName: string | undefined): void {
+		if (this._executionBoundary && toolName) {
+			throw new Error(
+				`Extension tool ${toolName} cannot be enabled with executionBoundary because it executes in the host process`,
+			);
+		}
+	}
+
 	private _buildRuntime(options: {
 		activeToolNames?: string[];
 		flagValues?: Map<string, boolean | string>;
@@ -3082,14 +3091,8 @@ export class AgentSession {
 		}
 
 		const extensionsResult = this._resourceLoader.getExtensions();
-		if (this._executionBoundary) {
-			const extensionTool = extensionsResult.extensions.flatMap((extension) => [...extension.tools.keys()])[0];
-			if (extensionTool) {
-				throw new Error(
-					`Extension tool ${extensionTool} cannot be enabled with executionBoundary because it executes in the host process`,
-				);
-			}
-		}
+		const extensionTool = extensionsResult.extensions.flatMap((extension) => [...extension.tools.keys()])[0];
+		this._assertExtensionToolAllowed(extensionTool);
 		if (options.flagValues) {
 			for (const [name, value] of options.flagValues) {
 				extensionsResult.runtime.flagValues.set(name, value);

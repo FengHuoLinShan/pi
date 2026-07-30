@@ -290,11 +290,18 @@ function createExtensionAPI(
 
 		registerTool(tool: ToolDefinition): void {
 			runtime.assertActive();
+			const previous = extension.tools.get(tool.name);
 			extension.tools.set(tool.name, {
 				definition: tool,
 				sourceInfo: extension.sourceInfo,
 			});
-			runtime.refreshTools();
+			try {
+				runtime.refreshTools();
+			} catch (error) {
+				if (previous) extension.tools.set(tool.name, previous);
+				else extension.tools.delete(tool.name);
+				throw error;
+			}
 		},
 
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
