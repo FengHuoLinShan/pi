@@ -68,7 +68,14 @@ function quoteArgument(value: string): string {
 	return JSON.stringify(value);
 }
 
-function setupExtension(runtime: ManagedJobsRuntime, enabled = true, idle = true, hasUI = true, agentRead = false) {
+function setupExtension(
+	runtime: ManagedJobsRuntime,
+	enabled = true,
+	idle = true,
+	hasUI = true,
+	agentRead = false,
+	hasExecutionBoundary = false,
+) {
 	const commands = new Map<string, CommandHandler>();
 	const tools = new Map<string, ToolDefinition>();
 	let sessionStart: SessionStartHandler | undefined;
@@ -100,6 +107,7 @@ function setupExtension(runtime: ManagedJobsRuntime, enabled = true, idle = true
 	const confirm = vi.fn(async () => true);
 	const ctx = {
 		cwd: runtime.manager.list()[0]?.cwd ?? temporaryDirectories.at(-1)!,
+		hasExecutionBoundary,
 		hasUI,
 		isIdle: () => idle,
 		ui: { confirm, notify, setStatus },
@@ -441,6 +449,19 @@ describe("managed jobs built-in extension", () => {
 
 		expect(extension.tool(MANAGED_JOBS_AGENT_READ_TOOL)).toBeUndefined();
 		expect(extension.notify).toHaveBeenLastCalledWith("--managed-jobs-agent-read requires --managed-jobs", "error");
+	});
+
+	it("does not register the agent read tool across an execution boundary", async () => {
+		const runtime = await createRuntime();
+		const extension = setupExtension(runtime, true, true, true, true, true);
+
+		await extension.sessionStart();
+
+		expect(extension.tool(MANAGED_JOBS_AGENT_READ_TOOL)).toBeUndefined();
+		expect(extension.notify).toHaveBeenCalledWith(
+			"--managed-jobs-agent-read cannot be enabled with an execution boundary",
+			"error",
+		);
 	});
 
 	it("terminates active jobs during a clean application quit", async () => {

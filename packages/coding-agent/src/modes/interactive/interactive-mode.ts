@@ -1802,6 +1802,7 @@ export class InteractiveMode {
 			ui: this.createExtensionUIContext(),
 			mode: "tui",
 			hasUI: true,
+			hasExecutionBoundary: this.session.hasExecutionBoundary,
 			cwd: this.sessionManager.getCwd(),
 			sessionManager: this.sessionManager,
 			modelRegistry: extensionRunner.getModelRegistry(),

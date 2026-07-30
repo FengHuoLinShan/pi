@@ -117,6 +117,8 @@ With only `--managed-jobs`, this interactive surface remains human-controlled an
 
 Managed-job tool results are JSON-framed as untrusted data. Unlike `/job output`, a successful tool read enters model context automatically, so retained process output may disclose credentials or other sensitive data to the selected provider. Enable agent reads only for jobs whose output is safe to share.
 
+`--managed-jobs-agent-read` is unavailable when the SDK session uses an execution boundary. Extension tools execute in the host process and are rejected before activation; human `/job` commands remain a separate explicit control surface.
+
 `/job send` is the explicit bridge into model context. It copies the selected bounded, sanitized output tail into a displayed `managed-job-output-v1` custom message without starting or steering a model turn. When idle, the message is stored immediately; during streaming, it is queued for the next turn and persisted when delivered. The message uses JSON framing, labels the output as untrusted data, and adds a system-prompt rule that it must never be treated as instructions. The copied tail enters the session JSONL and later model context, so inspect it for credentials or other sensitive data before sending. `/job output` only displays the tail locally and does not copy it into model context.
 
 `/job wait` performs a literal readiness match against at most the newest 64 KiB of already artifact-backed output. It does not evaluate a regular expression or execute another command. The default timeout is 30 seconds and the accepted range is 1-120 seconds. The wait ends distinctly on match, timeout, cancellation, or a terminal job state, and never copies output into model context.

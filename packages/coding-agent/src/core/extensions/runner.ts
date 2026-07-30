@@ -279,6 +279,7 @@ export class ExtensionRunner {
 	private getModel: () => Model<any> | undefined = () => undefined;
 	private isIdleFn: () => boolean = () => true;
 	private isProjectTrustedFn: () => boolean = () => true;
+	private hasExecutionBoundaryFn: () => boolean = () => false;
 	private getSignalFn: () => AbortSignal | undefined = () => undefined;
 	private waitForIdleFn: () => Promise<void> = async () => {};
 	private abortFn: () => void = () => {};
@@ -341,6 +342,7 @@ export class ExtensionRunner {
 		this.getModel = contextActions.getModel;
 		this.isIdleFn = contextActions.isIdle;
 		this.isProjectTrustedFn = contextActions.isProjectTrusted;
+		this.hasExecutionBoundaryFn = contextActions.hasExecutionBoundary ?? (() => false);
 		this.getSignalFn = contextActions.getSignal;
 		this.abortFn = contextActions.abort;
 		this.hasPendingMessagesFn = contextActions.hasPendingMessages;
@@ -726,6 +728,10 @@ export class ExtensionRunner {
 			get hasUI() {
 				runner.assertActive();
 				return runner.hasUI();
+			},
+			get hasExecutionBoundary() {
+				runner.assertActive();
+				return runner.hasExecutionBoundaryFn();
 			},
 			get cwd() {
 				runner.assertActive();

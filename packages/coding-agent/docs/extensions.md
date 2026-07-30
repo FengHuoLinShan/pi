@@ -938,6 +938,10 @@ Current run mode: `"tui"`, `"rpc"`, `"json"`, or `"print"`. Use `ctx.mode === "t
 
 `true` in TUI and RPC modes. `false` in print mode (`-p`) and JSON mode. Use this to guard dialog methods (`select`, `confirm`, `input`, `editor`) and fire-and-forget methods (`notify`, `setStatus`, `setWidget`, `setTitle`, `setEditorText`) that work in both TUI and RPC modes. In RPC mode, some TUI-specific methods are no-ops or return defaults (see [rpc.md](rpc.md#extension-ui-protocol)).
 
+### ctx.hasExecutionBoundary
+
+`true` when built-in tools are routed through an attested execution boundary. Extension tools run in the host process and cannot be enabled in this mode, including tools registered dynamically after `session_start`. Extensions without tools can use this signal to avoid offering host-process capabilities and provide a targeted explanation instead.
+
 ### ctx.cwd
 
 Current working directory.

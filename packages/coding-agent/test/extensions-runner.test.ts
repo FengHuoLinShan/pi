@@ -510,6 +510,7 @@ describe("ExtensionRunner", () => {
 			const ctx = runner.createContext();
 			expect(ctx.mode).toBe("print");
 			expect(ctx.hasUI).toBe(false);
+			expect(ctx.hasExecutionBoundary).toBe(false);
 		});
 
 		it("exposes project trust state on ExtensionContext", async () => {
@@ -522,6 +523,17 @@ describe("ExtensionRunner", () => {
 
 			const ctx = runner.createContext();
 			expect(ctx.isProjectTrusted()).toBe(false);
+		});
+
+		it("exposes execution-boundary state on ExtensionContext", async () => {
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, {
+				...extensionContextActions,
+				hasExecutionBoundary: () => true,
+			});
+
+			expect(runner.createContext().hasExecutionBoundary).toBe(true);
 		});
 
 		it("exposes rpc mode with hasUI true when an RPC UI context is provided", async () => {

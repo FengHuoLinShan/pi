@@ -460,6 +460,10 @@ export class AgentSession {
 		return this._workspaceOverlay;
 	}
 
+	get hasExecutionBoundary(): boolean {
+		return this._executionBoundary !== undefined;
+	}
+
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
@@ -2905,6 +2909,7 @@ export class AgentSession {
 				getModel: () => this.model,
 				isIdle: () => this.isIdle,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
+				hasExecutionBoundary: () => this.hasExecutionBoundary,
 				getSignal: () => this.agent.signal,
 				abort: () => {
 					if (this._extensionAbortHandler) {

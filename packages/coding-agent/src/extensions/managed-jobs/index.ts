@@ -186,7 +186,9 @@ export default function managedJobsExtension(pi: ExtensionAPI, options: ManagedJ
 		}
 		const opened = await requireRuntime(ctx);
 		if (!opened) return;
-		if (pi.getFlag(MANAGED_JOBS_AGENT_READ_FLAG) === true && !agentReadToolRegistered) {
+		if (pi.getFlag(MANAGED_JOBS_AGENT_READ_FLAG) === true && ctx.hasExecutionBoundary && !agentReadToolRegistered) {
+			ctx.ui.notify(`--${MANAGED_JOBS_AGENT_READ_FLAG} cannot be enabled with an execution boundary`, "error");
+		} else if (pi.getFlag(MANAGED_JOBS_AGENT_READ_FLAG) === true && !agentReadToolRegistered) {
 			pi.registerTool(
 				defineTool<typeof MANAGED_JOB_READ_PARAMETERS, ManagedJobReadDetails>({
 					name: MANAGED_JOBS_AGENT_READ_TOOL,

@@ -322,6 +322,8 @@ export interface ExtensionContext {
 	mode: ExtensionMode;
 	/** Whether dialog-capable UI is available (true in TUI and RPC modes) */
 	hasUI: boolean;
+	/** Whether built-in tools are routed through an attested execution boundary. */
+	hasExecutionBoundary: boolean;
 	/** Current working directory */
 	cwd: string;
 	/** Session manager (read-only) */
@@ -1628,6 +1630,7 @@ export interface ExtensionContextActions {
 	getModel: () => Model<any> | undefined;
 	isIdle: () => boolean;
 	isProjectTrusted: () => boolean;
+	hasExecutionBoundary?: () => boolean;
 	getSignal: () => AbortSignal | undefined;
 	abort: () => void;
 	hasPendingMessages: () => boolean;
