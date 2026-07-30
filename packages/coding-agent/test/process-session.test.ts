@@ -224,6 +224,74 @@ describe("ProcessSessionManager", () => {
 		]);
 	});
 
+	it("prunes terminal sessions, preserves shared output, and retains unknown journal lines", async () => {
+		const directory = await createTempDirectory();
+		const artifactStore = await createArtifactStore(directory);
+		const root = join(directory, "processes");
+		const backend = new FakeProcessBackend();
+		const first = await ProcessSessionManager.open({ root, artifactStore, backend });
+		const pruned = await first.manager.start({
+			id: "job-pruned",
+			command: "fake",
+			args: ["private-argument"],
+		});
+		const retained = await first.manager.start({ id: "job-retained", command: "fake" });
+		if (!pruned.backendHandle || !retained.backendHandle) throw new Error("Expected fake backend handles");
+		backend.emit(pruned.backendHandle, "stdout", "shared output");
+		backend.emit(retained.backendHandle, "stdout", "shared output");
+		await first.manager.flush();
+		await first.manager.terminate(pruned.id);
+		await first.manager.terminate(retained.id);
+		await Promise.all([first.manager.waitForExit(pruned.id), first.manager.waitForExit(retained.id)]);
+		await first.manager.flush();
+		await appendFile(join(root, "process-sessions.jsonl"), '{"version":2,"future":true}\n', "utf8");
+
+		const second = await ProcessSessionManager.open({ root, artifactStore, backend });
+		expect(second.recovery.invalidLines).toHaveLength(1);
+		expect(await second.manager.pruneTerminalSessions([pruned.id, pruned.id])).toEqual({
+			processSessionIds: [pruned.id],
+			artifacts: {
+				processSessionIds: [pruned.id],
+				metadataRecordsRemoved: 1,
+				artifactsRemoved: 0,
+			},
+			artifactCleanupError: undefined,
+		});
+		expect(second.manager.get(pruned.id)).toBeUndefined();
+		expect((await second.manager.readOutput(retained.id)).toString()).toBe("shared output");
+
+		const eventLog = await readFile(join(root, "process-sessions.jsonl"), "utf8");
+		expect(eventLog).not.toContain(pruned.id);
+		expect(eventLog).not.toContain("private-argument");
+		expect(eventLog).toContain(retained.id);
+		expect(eventLog).toContain('{"version":2,"future":true}\n');
+
+		const reopened = await ProcessSessionManager.open({ root, artifactStore, backend });
+		expect(reopened.recovery).toMatchObject({ sessions: 1, invalidLines: [6] });
+		expect(reopened.manager.get(pruned.id)).toBeUndefined();
+		expect(reopened.manager.status(retained.id).state).toBe("terminated");
+	});
+
+	it("rejects pruning active sessions without changing their journal", async () => {
+		const directory = await createTempDirectory();
+		const artifactStore = await createArtifactStore(directory);
+		const root = join(directory, "processes");
+		const backend = new FakeProcessBackend();
+		const { manager } = await ProcessSessionManager.open({ root, artifactStore, backend });
+		const started = await manager.start({ id: "job-active", command: "fake" });
+		const before = await readFile(join(root, "process-sessions.jsonl"), "utf8");
+
+		await expect(manager.pruneTerminalSessions([started.id])).rejects.toThrow(
+			"Process session must be terminal before pruning: job-active (running)",
+		);
+		expect(await readFile(join(root, "process-sessions.jsonl"), "utf8")).toBe(before);
+		expect(manager.status(started.id).state).toBe("running");
+
+		await manager.terminate(started.id);
+		await manager.waitForExit(started.id);
+		await manager.flush();
+	});
+
 	it("rejects invalid process output limits", async () => {
 		const directory = await createTempDirectory();
 		const artifactStore = await createArtifactStore(directory);

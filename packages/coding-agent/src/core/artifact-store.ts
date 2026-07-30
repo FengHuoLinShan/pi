@@ -53,6 +53,12 @@ export interface ArtifactStoreOptions {
 	allowedRoots?: string[];
 }
 
+export interface ArtifactStorePruneReport {
+	processSessionIds: string[];
+	metadataRecordsRemoved: number;
+	artifactsRemoved: number;
+}
+
 interface ArtifactMetadataRecord extends StoredArtifactMetadata {
 	version: 1;
 	ref: ArtifactRef;
@@ -60,6 +66,7 @@ interface ArtifactMetadataRecord extends StoredArtifactMetadata {
 }
 
 const ARTIFACT_HEX_PATTERN = /^[0-9a-f]{64}$/;
+const ARTIFACT_METADATA_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function isArtifactAttributes(value: unknown): value is Record<string, ArtifactAttributeValue> {
 	return (
@@ -95,6 +102,7 @@ function isArtifactMetadataRecord(value: unknown): value is ArtifactMetadataReco
 	return (
 		record.version === 1 &&
 		typeof record.id === "string" &&
+		ARTIFACT_METADATA_ID_PATTERN.test(record.id) &&
 		typeof record.createdAt === "string" &&
 		typeof record.ref === "string" &&
 		/^sha256:[0-9a-f]{64}$/.test(record.ref) &&
@@ -277,6 +285,65 @@ export class ArtifactStore {
 		return content;
 	}
 
+	async pruneProcessSessions(processSessionIds: readonly string[]): Promise<ArtifactStorePruneReport> {
+		const targets = new Set(processSessionIds.filter(Boolean));
+		let metadataRecordsRemoved = 0;
+		let artifactsRemoved = 0;
+		for (const [ref, descriptor] of [...this.descriptors]) {
+			const removed = descriptor.provenance.filter((metadata) => {
+				const processSessionId = metadata.provenance.processSessionId;
+				return processSessionId !== undefined && targets.has(processSessionId);
+			});
+			if (removed.length === 0) continue;
+
+			const digest = parseArtifactRef(ref);
+			for (const metadata of removed) {
+				const path = join(this.metadataDirectory(digest), `${metadata.id}.json`);
+				const snapshot = await this.assertStorePath(path);
+				await revalidateFilePathSnapshot(snapshot, path, this.allowedRoots, realpath);
+				await rm(path, { force: true });
+				metadataRecordsRemoved++;
+			}
+
+			const retained = descriptor.provenance.filter((metadata) => !removed.includes(metadata));
+			if (retained.length > 0) {
+				descriptor.provenance = retained;
+				const latest = retained.at(-1)!;
+				descriptor.mediaType = latest.mediaType;
+				descriptor.name = latest.name;
+				continue;
+			}
+
+			const metadataDirectory = this.metadataDirectory(digest);
+			const remainingMetadata = await readdir(metadataDirectory).catch((error: unknown) => {
+				if (isMissingPathError(error)) return [];
+				throw error;
+			});
+			if (remainingMetadata.length > 0) {
+				descriptor.provenance = [];
+				descriptor.mediaType = undefined;
+				descriptor.name = undefined;
+				descriptor.recovered = true;
+				continue;
+			}
+
+			const objectPath = this.objectPath(digest);
+			const objectSnapshot = await this.assertStorePath(objectPath);
+			await revalidateFilePathSnapshot(objectSnapshot, objectPath, this.allowedRoots, realpath);
+			await rm(objectPath, { force: true });
+			const metadataSnapshot = await this.assertStorePath(metadataDirectory);
+			await revalidateFilePathSnapshot(metadataSnapshot, metadataDirectory, this.allowedRoots, realpath);
+			await rm(metadataDirectory, { recursive: true, force: true });
+			this.descriptors.delete(ref);
+			artifactsRemoved++;
+		}
+		return {
+			processSessionIds: [...targets].sort(),
+			metadataRecordsRemoved,
+			artifactsRemoved,
+		};
+	}
+
 	async rebuildIndex(): Promise<ArtifactStoreRecoveryReport> {
 		this.descriptors.clear();
 		const invalidObjects: string[] = [];
@@ -305,6 +372,7 @@ export class ArtifactStore {
 				const record = JSON.parse(await readFile(path, "utf8")) as unknown;
 				if (!isArtifactMetadataRecord(record)) throw new Error("invalid metadata record");
 				const digest = parseArtifactRef(record.ref);
+				if (basename(path) !== `${record.id}.json`) throw new Error("metadata path does not match record id");
 				if (basename(dirname(path)) !== digest) throw new Error("metadata path does not match artifact");
 				const descriptor = this.descriptors.get(record.ref);
 				if (!descriptor || descriptor.byteLength !== record.byteLength) throw new Error("missing object");

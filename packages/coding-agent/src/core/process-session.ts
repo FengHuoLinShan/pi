@@ -1,10 +1,10 @@
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, realpath, truncate } from "node:fs/promises";
+import { mkdir, open, readFile, realpath, rename, rm, truncate } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { spawnProcess, waitForChildProcess } from "../utils/child-process.ts";
 import { killProcessTree, trackDetachedChildPid, untrackDetachedChildPid } from "../utils/shell.ts";
-import type { ArtifactRef, ArtifactStore } from "./artifact-store.ts";
+import type { ArtifactRef, ArtifactStore, ArtifactStorePruneReport } from "./artifact-store.ts";
 import {
 	createBoundaryProfileDigest,
 	type ExecutionBoundary,
@@ -118,6 +118,17 @@ export interface ProcessSessionManagerOptions {
 export interface ReadProcessOutputTailOptions {
 	stream?: ProcessOutputStream;
 	maxBytes?: number;
+}
+
+export interface ProcessSessionPruneResult {
+	processSessionIds: string[];
+	artifacts?: ArtifactStorePruneReport;
+	artifactCleanupError?: string;
+}
+
+interface ProcessEventLogLine {
+	serialized: string;
+	event?: ProcessSessionEvent;
 }
 
 interface ProcessEventBase {
@@ -370,6 +381,7 @@ export class ProcessSessionManager {
 	private readonly records = new Map<string, ProcessSessionRecord>();
 	private readonly eventsBySession = new Map<string, ProcessSessionEvent[]>();
 	private readonly listeners = new Set<ProcessSessionListener>();
+	private eventLogLines: ProcessEventLogLine[] = [];
 	private writeQueue: Promise<void> = Promise.resolve();
 	private backgroundError: Error | undefined;
 
@@ -449,12 +461,17 @@ export class ProcessSessionManager {
 		const completeLineCount = lines.length - 1;
 		for (let index = 0; index < completeLineCount; index++) {
 			const line = lines[index];
-			if (!line?.trim()) continue;
+			if (!line?.trim()) {
+				this.eventLogLines.push({ serialized: line ?? "" });
+				continue;
+			}
 			try {
 				const event = JSON.parse(line) as unknown;
 				if (!isProcessSessionEvent(event) || !this.canApplyEvent(event)) throw new Error("invalid event");
 				this.applyEvent(event);
+				this.eventLogLines.push({ serialized: line, event });
 			} catch {
+				this.eventLogLines.push({ serialized: line });
 				invalidLines.push(index + 1);
 			}
 		}
@@ -678,6 +695,42 @@ export class ProcessSessionManager {
 		});
 	}
 
+	async pruneTerminalSessions(processSessionIds: readonly string[]): Promise<ProcessSessionPruneResult> {
+		const ids = [...new Set(processSessionIds.filter(Boolean))].sort();
+		if (ids.length === 0) return { processSessionIds: [] };
+		let artifacts: ArtifactStorePruneReport | undefined;
+		let artifactCleanupError: string | undefined;
+		await this.runForeground(async () => {
+			for (const id of ids) {
+				const record = this.records.get(id);
+				if (!record) throw new Error(`Process session not found: ${id}`);
+				if (!isTerminalState(record.state)) {
+					throw new Error(`Process session must be terminal before pruning: ${id} (${record.state})`);
+				}
+			}
+			const targets = new Set(ids);
+			const retainedLines = this.eventLogLines.filter(
+				(line) => !line.event || !targets.has(line.event.processSessionId),
+			);
+			await this.replaceEventLog(retainedLines.map((line) => line.serialized));
+			this.eventLogLines = retainedLines;
+			for (const id of ids) {
+				this.records.delete(id);
+				this.eventsBySession.delete(id);
+			}
+			try {
+				artifacts = await this.artifactStore.pruneProcessSessions(ids);
+			} catch (error) {
+				artifactCleanupError = error instanceof Error ? error.message : String(error);
+			}
+		});
+		return {
+			processSessionIds: ids,
+			artifacts,
+			artifactCleanupError,
+		};
+	}
+
 	async flush(): Promise<void> {
 		await this.writeQueue;
 		if (this.backgroundError) {
@@ -718,19 +771,53 @@ export class ProcessSessionManager {
 	}
 
 	private enqueueBackground(operation: () => Promise<void>): void {
-		void this.queueOperation(operation);
+		void this.queueOperation(operation, true);
 	}
 
 	private async runForeground(operation: () => Promise<void>): Promise<void> {
-		await this.queueOperation(operation);
+		await this.queueOperation(operation, false);
 	}
 
-	private queueOperation(operation: () => Promise<void>): Promise<void> {
+	private queueOperation(operation: () => Promise<void>, captureBackgroundError: boolean): Promise<void> {
 		const result = this.writeQueue.then(operation);
 		this.writeQueue = result.catch((error: unknown) => {
-			this.backgroundError = error instanceof Error ? error : new Error(String(error));
+			if (captureBackgroundError) {
+				this.backgroundError = error instanceof Error ? error : new Error(String(error));
+			}
 		});
 		return result;
+	}
+
+	private async replaceEventLog(lines: readonly string[]): Promise<void> {
+		const snapshot = await captureFilePathSnapshot(
+			this.eventLogPath,
+			this.eventLogPath,
+			this.allowedRoots,
+			realpath,
+			true,
+		);
+		const stagingPath = join(this.root, `.process-sessions.pi-stage-${process.pid}-${randomUUID()}`);
+		const stagingSnapshot = await captureFilePathSnapshot(
+			stagingPath,
+			stagingPath,
+			this.allowedRoots,
+			realpath,
+			true,
+		);
+		try {
+			await revalidateFilePathSnapshot(stagingSnapshot, stagingPath, this.allowedRoots, realpath);
+			const file = await open(stagingPath, "wx");
+			try {
+				await file.writeFile(lines.join("\n") + (lines.length ? "\n" : ""), "utf8");
+				await file.sync();
+			} finally {
+				await file.close();
+			}
+			await revalidateFilePathSnapshot(snapshot, this.eventLogPath, this.allowedRoots, realpath);
+			await rename(stagingPath, this.eventLogPath);
+		} finally {
+			await rm(stagingPath, { force: true });
+		}
 	}
 
 	private async appendOutput(id: string, stream: ProcessOutputStream, chunk: Buffer): Promise<void> {
@@ -828,6 +915,7 @@ export class ProcessSessionManager {
 
 	private async appendAndApply(event: ProcessSessionEvent): Promise<void> {
 		if (!this.canApplyEvent(event)) throw new Error(`Invalid process event sequence for ${event.processSessionId}`);
+		const serialized = JSON.stringify(event);
 		const snapshot = await captureFilePathSnapshot(
 			this.eventLogPath,
 			this.eventLogPath,
@@ -838,12 +926,13 @@ export class ProcessSessionManager {
 		await revalidateFilePathSnapshot(snapshot, this.eventLogPath, this.allowedRoots, realpath);
 		const file = await open(this.eventLogPath, "a");
 		try {
-			await file.appendFile(`${JSON.stringify(event)}\n`, "utf8");
+			await file.appendFile(`${serialized}\n`, "utf8");
 			await file.sync();
 		} finally {
 			await file.close();
 		}
 		this.applyEvent(event);
+		this.eventLogLines.push({ serialized, event });
 	}
 
 	private applyEvent(event: ProcessSessionEvent): void {

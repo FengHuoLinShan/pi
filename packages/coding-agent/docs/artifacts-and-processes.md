@@ -75,6 +75,8 @@ The event log is `<root>/process-sessions.jsonl`. Appends are flushed before sta
 
 `maxOutputBytesPerSession` is optional for SDK compatibility. When configured, the manager persists at most that many output bytes, records a durable `process_failed` event at the limit, and terminates the backend handle. `readOutputTail()` bounds returned output and reads only the newest artifact records needed for the requested tail; `readOutput()` remains available when a caller explicitly needs the complete retained output.
 
+`pruneTerminalSessions(ids)` irreversibly removes the selected terminal sessions from the process journal, then removes their artifact provenance sidecars. It rejects active and unknown session IDs before changing the journal. Content objects referenced by another provenance record are retained; an object is deleted only when no known or unknown sidecar remains. Invalid or newer-version journal lines are preserved byte-for-byte during the atomic journal rewrite. Artifact cleanup runs after the process journal becomes authoritative and reports a separate `artifactCleanupError` if physical cleanup cannot finish.
+
 ## Recovery and Attach Semantics
 
 A backend decides whether a durable handle can be reattached. During recovery:

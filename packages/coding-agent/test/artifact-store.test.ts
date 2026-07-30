@@ -55,6 +55,61 @@ describe("ArtifactStore", () => {
 		).toEqual(["process", "read-tool"]);
 	});
 
+	it("prunes process provenance while retaining shared content", async () => {
+		const directory = await createTempDirectory();
+		const root = join(directory, "artifacts");
+		const { store } = await ArtifactStore.open({ root, allowedRoots: [directory] });
+		const first = await store.put("shared output", {
+			provenance: { producer: "process", processSessionId: "process-1" },
+		});
+		await store.put("shared output", {
+			provenance: { producer: "process", processSessionId: "process-2" },
+		});
+
+		expect(await store.pruneProcessSessions(["process-1", "process-1"])).toEqual({
+			processSessionIds: ["process-1"],
+			metadataRecordsRemoved: 1,
+			artifactsRemoved: 0,
+		});
+		expect(store.get(first.ref)?.provenance.map((entry) => entry.provenance.processSessionId)).toEqual(["process-2"]);
+		expect(await store.read(first.ref)).toEqual(Buffer.from("shared output"));
+
+		expect(await store.pruneProcessSessions(["process-2"])).toEqual({
+			processSessionIds: ["process-2"],
+			metadataRecordsRemoved: 1,
+			artifactsRemoved: 1,
+		});
+		expect(store.get(first.ref)).toBeUndefined();
+		await expect(store.read(first.ref)).rejects.toMatchObject({ code: "ENOENT" });
+
+		const reopened = await ArtifactStore.open({ root, allowedRoots: [directory] });
+		expect(reopened.recovery).toMatchObject({ artifacts: 0, metadataRecords: 0, recoveredObjects: 0 });
+	});
+
+	it("preserves objects when unknown metadata remains after process provenance is pruned", async () => {
+		const directory = await createTempDirectory();
+		const root = join(directory, "artifacts");
+		const { store } = await ArtifactStore.open({ root, allowedRoots: [directory] });
+		const descriptor = await store.put("recoverable output", {
+			provenance: { producer: "process", processSessionId: "process-1" },
+		});
+		const digest = descriptor.ref.slice(7);
+		const metadataDirectory = join(root, "metadata", "sha256", digest.slice(0, 2), digest);
+		await writeFile(join(metadataDirectory, "unknown.json"), '{"version":2,"future":true}\n', "utf8");
+
+		expect(await store.pruneProcessSessions(["process-1"])).toEqual({
+			processSessionIds: ["process-1"],
+			metadataRecordsRemoved: 1,
+			artifactsRemoved: 0,
+		});
+		expect(store.get(descriptor.ref)).toMatchObject({ recovered: true, provenance: [] });
+		expect(await store.read(descriptor.ref)).toEqual(Buffer.from("recoverable output"));
+
+		const reopened = await ArtifactStore.open({ root, allowedRoots: [directory] });
+		expect(reopened.recovery).toMatchObject({ artifacts: 1, metadataRecords: 0, recoveredObjects: 1 });
+		expect(reopened.recovery.invalidMetadata).toEqual([join(metadataDirectory, "unknown.json")]);
+	});
+
 	it("rebuilds an index for orphaned objects and reports corrupt content and metadata", async () => {
 		const directory = await createTempDirectory();
 		const root = join(directory, "artifacts");
