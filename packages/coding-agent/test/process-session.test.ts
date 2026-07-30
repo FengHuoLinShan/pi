@@ -197,6 +197,33 @@ describe("ProcessSessionManager", () => {
 		expect(await backend.status(started.backendHandle)).toEqual({ state: "unavailable" });
 	});
 
+	it("serializes termination after already queued output events", async () => {
+		const directory = await createTempDirectory();
+		const artifactStore = await createArtifactStore(directory);
+		const backend = new FakeProcessBackend();
+		const { manager } = await ProcessSessionManager.open({
+			root: join(directory, "processes"),
+			artifactStore,
+			backend,
+		});
+		const started = await manager.start({ command: "fake" });
+		if (!started.backendHandle) throw new Error("Expected fake backend handle");
+
+		backend.emit(started.backendHandle, "stdout", "queued");
+		await manager.terminate(started.id);
+		await manager.waitForExit(started.id);
+		await manager.flush();
+
+		expect(manager.status(started.id).state).toBe("terminated");
+		expect(manager.getEvents(started.id).map((event) => event.type)).toEqual([
+			"process_created",
+			"process_started",
+			"process_output",
+			"process_termination_requested",
+			"process_exited",
+		]);
+	});
+
 	it("rejects invalid process output limits", async () => {
 		const directory = await createTempDirectory();
 		const artifactStore = await createArtifactStore(directory);

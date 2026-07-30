@@ -603,17 +603,21 @@ export class ProcessSessionManager {
 	}
 
 	async terminate(id: string): Promise<void> {
-		const record = this.records.get(id);
-		if (!record) throw new Error(`Process session not found: ${id}`);
-		if (!isActiveState(record.state)) return;
-		if (!record.backendHandle || record.backendId !== this.backend.id) {
-			await this.runForeground(() => this.appendInterrupted(id, "cannot terminate without a live backend handle"));
-			return;
-		}
-		const event = this.createNextEvent(id, { type: "process_termination_requested" });
-		await this.runForeground(() => this.appendAndApply(event));
+		let handle: ProcessBackendHandle | undefined;
+		await this.runForeground(async () => {
+			const record = this.records.get(id);
+			if (!record) throw new Error(`Process session not found: ${id}`);
+			if (!isActiveState(record.state) || record.state === "terminating") return;
+			if (!record.backendHandle || record.backendId !== this.backend.id) {
+				await this.appendInterrupted(id, "cannot terminate without a live backend handle");
+				return;
+			}
+			handle = copyHandle(record.backendHandle);
+			await this.appendAndApply(this.createNextEvent(id, { type: "process_termination_requested" }));
+		});
+		if (!handle) return;
 		try {
-			await this.backend.terminate(record.backendHandle);
+			await this.backend.terminate(handle);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			await this.runForeground(() => this.appendInterrupted(id, `backend termination failed: ${message}`));
