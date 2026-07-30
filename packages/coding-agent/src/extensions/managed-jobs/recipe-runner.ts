@@ -1,7 +1,12 @@
 import type { ProcessSessionRecord } from "../../core/process-session.ts";
 import { getShellEnv } from "../../utils/shell.ts";
 import type { ManagedJobRecipeConfig } from "./config.ts";
-import { type ManagedJobsRuntime, type WaitForManagedJobOutputResult, waitForManagedJobOutput } from "./runtime.ts";
+import {
+	isActiveManagedJobState,
+	type ManagedJobsRuntime,
+	type WaitForManagedJobOutputResult,
+	waitForManagedJobOutput,
+} from "./runtime.ts";
 
 const MINIMAL_RECIPE_ENVIRONMENT_NAMES = [
 	"PATH",
@@ -77,6 +82,36 @@ function createRecipeEnvironment(recipe: ManagedJobRecipeConfig, cwd: string): N
 	return environment;
 }
 
+function scheduleRuntimeLimit(runtime: ManagedJobsRuntime, id: string, timeoutMs: number): void {
+	let timer: NodeJS.Timeout | undefined;
+	let unsubscribe = () => {};
+	const cleanup = (): void => {
+		if (timer) {
+			clearTimeout(timer);
+			timer = undefined;
+		}
+		unsubscribe();
+	};
+	unsubscribe = runtime.manager.subscribe((record) => {
+		if (record.id === id && !isActiveManagedJobState(record.state)) cleanup();
+	});
+	timer = setTimeout(() => {
+		cleanup();
+		const record = runtime.manager.get(id);
+		if (!record || !isActiveManagedJobState(record.state)) return;
+		void (async () => {
+			await runtime.manager.terminate(id);
+			await runtime.manager.waitForExit(id);
+			await runtime.manager.flush();
+		})().catch(() => {
+			// ProcessSessionManager records termination failures durably when possible.
+		});
+	}, timeoutMs);
+	timer.unref();
+	const current = runtime.manager.get(id);
+	if (!current || !isActiveManagedJobState(current.state)) cleanup();
+}
+
 export async function runManagedJobRecipe(options: RunManagedJobRecipeOptions): Promise<ManagedJobRecipeRunResult> {
 	let started: ProcessSessionRecord;
 	try {
@@ -89,6 +124,9 @@ export async function runManagedJobRecipe(options: RunManagedJobRecipeOptions): 
 		});
 	} catch (error) {
 		throw new ManagedJobRecipeRunError("start", options.id, error);
+	}
+	if (options.recipe.maxRuntimeSeconds !== undefined) {
+		scheduleRuntimeLimit(options.runtime, started.id, options.recipe.maxRuntimeSeconds * 1000);
 	}
 	if (!options.recipe.readiness) return { record: started, readinessStatus: "not_configured" };
 

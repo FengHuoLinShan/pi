@@ -231,6 +231,46 @@ describe("managed job agent control", () => {
 		expect(JSON.stringify(waited)).not.toContain(process.execPath);
 	});
 
+	it("automatically terminates a tool-owned recipe at its runtime limit", async () => {
+		const runtime = await createRuntime();
+		const cwd = temporaryDirectories.at(-1)!;
+		const loaded: LoadedManagedJobsConfig = {
+			revision: "c".repeat(64),
+			config: {
+				version: 1,
+				recipes: [
+					{
+						id: "bounded",
+						command: process.execPath,
+						args: ["-e", "setInterval(() => {}, 1000)"],
+						maxRuntimeSeconds: 1,
+					},
+				],
+			},
+		};
+		const tool = createManagedJobControlTool({ runtime, loaded, cwd });
+		const ctx = createContext(cwd);
+
+		const started = await tool.execute(
+			"start-bounded",
+			{ action: "start", recipe: "bounded" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const startDetails = started.details as ManagedJobControlStartDetails;
+		const waited = await tool.execute(
+			"wait-bounded",
+			{ action: "wait", id: startDetails.jobId, timeoutSeconds: 2 },
+			undefined,
+			undefined,
+			ctx,
+		);
+
+		expect(waited.details).toMatchObject({ action: "wait", waitStatus: "terminal", state: "terminated" });
+		expect(tool.description).toContain("runtime <= 1s");
+	});
+
 	it("redacts host operation errors from tool failures", async () => {
 		const runtime = await createRuntime();
 		const cwd = temporaryDirectories.at(-1)!;

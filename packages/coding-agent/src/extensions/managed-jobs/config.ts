@@ -16,6 +16,7 @@ const MAX_ARGUMENT_BYTES_PER_RECIPE = 65_536;
 const MAX_INHERITED_ENVIRONMENT_NAMES = 32;
 const MAX_ENVIRONMENT_NAME_LENGTH = 128;
 const MAX_AGENT_STARTS_PER_RECIPE = 100;
+const MAX_RUNTIME_SECONDS = 86_400;
 const MAX_READINESS_TEXT_LENGTH = 512;
 const MAX_READINESS_TIMEOUT_SECONDS = 30;
 
@@ -31,6 +32,7 @@ export interface ManagedJobRecipeConfig {
 	args: string[];
 	inheritEnv?: string[];
 	maxAgentStarts?: number;
+	maxRuntimeSeconds?: number;
 	readiness?: ManagedJobReadinessConfig;
 }
 
@@ -103,7 +105,11 @@ function parseReadiness(value: unknown, recipeIndex: number): ManagedJobReadines
 function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 	const label = `recipes[${index}]`;
 	if (!isPlainObject(value)) throw new Error(`${label} must be an object`);
-	rejectUnknownFields(value, ["id", "command", "args", "inheritEnv", "maxAgentStarts", "readiness"], label);
+	rejectUnknownFields(
+		value,
+		["id", "command", "args", "inheritEnv", "maxAgentStarts", "maxRuntimeSeconds", "readiness"],
+		label,
+	);
 	const id = parsePortableId(value.id, `${label}.id`);
 	const command = parseText(value.command, `${label}.command`, MAX_COMMAND_LENGTH);
 	const rawArguments = value.args ?? [];
@@ -154,12 +160,21 @@ function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 	) {
 		throw new Error(`${label}.maxAgentStarts must be a safe integer between 1 and ${MAX_AGENT_STARTS_PER_RECIPE}`);
 	}
+	if (
+		value.maxRuntimeSeconds !== undefined &&
+		(!Number.isSafeInteger(value.maxRuntimeSeconds) ||
+			(value.maxRuntimeSeconds as number) < 1 ||
+			(value.maxRuntimeSeconds as number) > MAX_RUNTIME_SECONDS)
+	) {
+		throw new Error(`${label}.maxRuntimeSeconds must be a safe integer between 1 and ${MAX_RUNTIME_SECONDS}`);
+	}
 	return {
 		id,
 		command,
 		args,
 		...(inheritEnv === undefined ? {} : { inheritEnv }),
 		...(value.maxAgentStarts === undefined ? {} : { maxAgentStarts: value.maxAgentStarts as number }),
+		...(value.maxRuntimeSeconds === undefined ? {} : { maxRuntimeSeconds: value.maxRuntimeSeconds as number }),
 		...(value.readiness === undefined ? {} : { readiness: parseReadiness(value.readiness, index) }),
 	};
 }

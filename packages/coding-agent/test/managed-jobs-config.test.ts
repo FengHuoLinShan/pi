@@ -32,6 +32,7 @@ function validConfig(): unknown {
 				args: ["run", "dev"],
 				inheritEnv: ["PORT", "DATABASE_URL"],
 				maxAgentStarts: 3,
+				maxRuntimeSeconds: 3_600,
 				readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 10 },
 			},
 		],
@@ -167,6 +168,27 @@ describe("managed jobs config", () => {
 				recipes: [{ id: "deploy", command: "deploy", maxAgentStarts: 101 }],
 			}),
 		).toThrow("maxAgentStarts must be a safe integer between 1 and 100");
+	});
+
+	it("bounds optional recipe runtime limits", () => {
+		expect(
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "server", command: "server", maxRuntimeSeconds: 60 }],
+			}).recipes[0]?.maxRuntimeSeconds,
+		).toBe(60);
+		expect(() =>
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "server", command: "server", maxRuntimeSeconds: 0 }],
+			}),
+		).toThrow("maxRuntimeSeconds must be a safe integer between 1 and 86400");
+		expect(() =>
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "server", command: "server", maxRuntimeSeconds: 86_401 }],
+			}),
+		).toThrow("maxRuntimeSeconds must be a safe integer between 1 and 86400");
 	});
 
 	it("loads a bounded regular project config with a stable source revision", async () => {

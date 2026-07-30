@@ -145,7 +145,8 @@ export function createManagedJobControlTool(options: ManagedJobControlToolOption
 	const controlledJobs = new Map<string, ManagedJobRecipeConfig>();
 	const startCounts = new Map<string, number>();
 	const recipeSummaries = [...recipes.values()].map(
-		(recipe) => `${recipe.id}${recipe.maxAgentStarts === undefined ? "" : ` (max ${recipe.maxAgentStarts} starts)`}`,
+		(recipe) =>
+			`${recipe.id}${recipe.maxAgentStarts === undefined ? "" : ` (max ${recipe.maxAgentStarts} starts)`}${recipe.maxRuntimeSeconds === undefined ? "" : ` (runtime <= ${recipe.maxRuntimeSeconds}s)`}`,
 	);
 	const recordControlledStart = (recipe: ManagedJobRecipeConfig, id: string): void => {
 		controlledJobs.set(id, recipe);

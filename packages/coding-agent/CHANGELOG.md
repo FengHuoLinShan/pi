@@ -35,6 +35,7 @@
 - Added `/job recipes` for bounded local review of the frozen agent-control recipe revision or a non-activating config preview.
 - Added trusted `/job run <recipe>` execution through the same fixed recipe and readiness runner used by agent control.
 - Added optional per-recipe `maxAgentStarts` budgets for bounding agent-controlled process launches without limiting explicit human runs.
+- Added optional 1-second to 24-hour runtime limits that automatically terminate agent- or human-started fixed recipe jobs.
 - Added an opt-in workspace-change discipline verifier with synchronous or asynchronous PatchSet capture, path, operation, minimum/maximum file-count, and byte-count gates, and privacy-preserving completion evidence.
 - Added request-only safe context trimming for reproducible tool results and unsigned plaintext thinking, with content-free `context_trim` TUI, JSON, and RPC observability.
 - Added conservative startup recovery reports with low-sensitivity `/recovery` review, durable acknowledgement, and no automatic provider or tool replay.
