@@ -496,10 +496,10 @@ describe("managed jobs built-in extension", () => {
 			expect.stringContaining("Agent managed-job control loaded 1 fixed recipe(s)"),
 			"warning",
 		);
-		await tool.execute("start-call", { action: "start", recipe: "api" }, undefined, undefined, extension.ctx);
 		const prompt = await extension.beforeAgentStart();
 		expect(prompt?.systemPrompt).toContain("managed_job_control can start only the fixed trusted-project recipes");
 		expect(prompt?.systemPrompt).not.toContain("You cannot control managed jobs directly");
+		await tool.execute("start-call", { action: "start", recipe: "api" }, undefined, undefined, extension.ctx);
 	});
 
 	it("rejects agent control for untrusted or execution-bounded projects", async () => {

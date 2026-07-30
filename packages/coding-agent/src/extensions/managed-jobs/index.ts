@@ -419,7 +419,9 @@ export default function managedJobsExtension(pi: ExtensionAPI, options: ManagedJ
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (pi.getFlag(MANAGED_JOBS_FLAG) !== true) return;
 		const opened = await requireRuntime(ctx);
-		if (!opened || opened.manager.list().length === 0) return;
+		if (!opened || (opened.manager.list().length === 0 && !agentReadToolRegistered && !agentControlToolRegistered)) {
+			return;
+		}
 		const controlRule = agentControlToolRegistered
 			? "managed_job_control can start only the fixed trusted-project recipes in its tool description and can stop only jobs it started. It cannot accept arbitrary commands, arguments, working directories, or environment overrides. Ask the user to use /job for any other state change."
 			: "You cannot control managed jobs directly; ask the user to use /job when another action is needed.";
