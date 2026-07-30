@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added built-in `/goal` mode with branch-persistent objectives, explicit agent progress/completion/blocking, autonomous continuations, visible status, pause/resume/stop controls, and bounded activation batches.
 - Added a responsive model sidebar for quickly selecting recent or scoped models and supported reasoning effort with the keyboard.
 - Added capability search and activation, on-demand skill loading, and package-declared lazy extensions with reload-safe lifecycle handling.
 - Added versioned offline, browser, and live capability evaluations for MCP and pinned Playwright integration candidates.
