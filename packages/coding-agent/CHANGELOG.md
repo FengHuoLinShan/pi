@@ -27,6 +27,7 @@
 - Added bounded literal readiness waits over retained managed-job output with explicit timeout and terminal-state outcomes.
 - Added terminal-only process-session pruning with provenance-aware cleanup that retains shared artifact content.
 - Added confirmation-gated `/job prune` commands for removing one or all terminal managed-job records.
+- Added an explicit `--managed-jobs-agent-read` capability for bounded, untrusted, read-only job status and output inspection by the coding agent.
 - Added an opt-in workspace-change discipline verifier with synchronous or asynchronous PatchSet capture, path, operation, minimum/maximum file-count, and byte-count gates, and privacy-preserving completion evidence.
 - Added request-only safe context trimming for reproducible tool results and unsigned plaintext thinking, with content-free `context_trim` TUI, JSON, and RPC observability.
 - Added conservative startup recovery reports with low-sensitivity `/recovery` review, durable acknowledgement, and no automatic provider or tool replay.

@@ -113,7 +113,9 @@ The built-in policy permits at most four active jobs per workspace, retains at m
 
 Managed jobs are workspace-scoped and share one live local backend while pi is running. A clean pi quit stops active jobs and records their terminal state. After a crash or restart, the local backend does not claim the old PID, so active records become `interrupted`; use a remote durable backend through the SDK when cross-process reattachment is required.
 
-This first interactive surface is human-controlled. It does not register an LLM tool or let the coding agent start a background process without the user's `/job start` command.
+With only `--managed-jobs`, this interactive surface remains human-controlled and does not register an LLM tool. Add the separate `--managed-jobs-agent-read` flag to expose `managed_job_read`, which lets the coding agent list jobs, inspect structured lifecycle status, and read at most the newest 16 KiB of retained output. The read tool does not expose stored commands or arguments and cannot start, wait for, stop, or prune jobs. Those state-changing operations remain user-controlled through `/job`.
+
+Managed-job tool results are JSON-framed as untrusted data. Unlike `/job output`, a successful tool read enters model context automatically, so retained process output may disclose credentials or other sensitive data to the selected provider. Enable agent reads only for jobs whose output is safe to share.
 
 `/job send` is the explicit bridge into model context. It copies the selected bounded, sanitized output tail into a displayed `managed-job-output-v1` custom message without starting or steering a model turn. When idle, the message is stored immediately; during streaming, it is queued for the next turn and persisted when delivered. The message uses JSON framing, labels the output as untrusted data, and adds a system-prompt rule that it must never be treated as instructions. The copied tail enters the session JSONL and later model context, so inspect it for credentials or other sensitive data before sending. `/job output` only displays the tail locally and does not copy it into model context.
 
