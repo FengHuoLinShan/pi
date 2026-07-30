@@ -105,7 +105,8 @@ function formatRecipe(recipe: ManagedJobRecipeConfig): string {
 			: ` env=minimal${recipe.inheritEnv.length > 0 ? `+${recipe.inheritEnv.map(displayText).join(",")}` : ""}`;
 	const budget = recipe.maxAgentStarts === undefined ? "" : ` agentStarts<=${recipe.maxAgentStarts}`;
 	const runtime = recipe.maxRuntimeSeconds === undefined ? "" : ` runtime<=${recipe.maxRuntimeSeconds}s`;
-	return `${displayText(recipe.id)}${readiness}${environment}${budget}${runtime}\n  ${boundedCommand}`;
+	const approval = recipe.requireApproval ? " approval=always" : "";
+	return `${displayText(recipe.id)}${readiness}${environment}${budget}${runtime}${approval}\n  ${boundedCommand}`;
 }
 
 function agentRecordSnapshot(record: ProcessSessionRecord) {

@@ -33,6 +33,7 @@ export interface ManagedJobRecipeConfig {
 	inheritEnv?: string[];
 	maxAgentStarts?: number;
 	maxRuntimeSeconds?: number;
+	requireApproval?: boolean;
 	readiness?: ManagedJobReadinessConfig;
 }
 
@@ -107,7 +108,7 @@ function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 	if (!isPlainObject(value)) throw new Error(`${label} must be an object`);
 	rejectUnknownFields(
 		value,
-		["id", "command", "args", "inheritEnv", "maxAgentStarts", "maxRuntimeSeconds", "readiness"],
+		["id", "command", "args", "inheritEnv", "maxAgentStarts", "maxRuntimeSeconds", "requireApproval", "readiness"],
 		label,
 	);
 	const id = parsePortableId(value.id, `${label}.id`);
@@ -168,6 +169,9 @@ function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 	) {
 		throw new Error(`${label}.maxRuntimeSeconds must be a safe integer between 1 and ${MAX_RUNTIME_SECONDS}`);
 	}
+	if (value.requireApproval !== undefined && typeof value.requireApproval !== "boolean") {
+		throw new Error(`${label}.requireApproval must be a boolean`);
+	}
 	return {
 		id,
 		command,
@@ -175,6 +179,7 @@ function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 		...(inheritEnv === undefined ? {} : { inheritEnv }),
 		...(value.maxAgentStarts === undefined ? {} : { maxAgentStarts: value.maxAgentStarts as number }),
 		...(value.maxRuntimeSeconds === undefined ? {} : { maxRuntimeSeconds: value.maxRuntimeSeconds as number }),
+		...(value.requireApproval === undefined ? {} : { requireApproval: value.requireApproval }),
 		...(value.readiness === undefined ? {} : { readiness: parseReadiness(value.readiness, index) }),
 	};
 }

@@ -40,11 +40,23 @@ afterEach(async () => {
 	vi.unstubAllEnvs();
 });
 
-function createContext(cwd: string, options?: { trusted?: boolean; boundary?: boolean }): ExtensionContext {
+function createContext(
+	cwd: string,
+	options?: {
+		trusted?: boolean;
+		boundary?: boolean;
+		hasUI?: boolean;
+		confirm?: (title: string, message: string) => Promise<boolean>;
+	},
+): ExtensionContext {
 	return {
 		cwd,
 		hasExecutionBoundary: options?.boundary ?? false,
+		hasUI: options?.hasUI ?? true,
 		isProjectTrusted: () => options?.trusted ?? true,
+		ui: {
+			confirm: options?.confirm ?? (async () => true),
+		},
 	} as unknown as ExtensionContext;
 }
 
@@ -269,6 +281,67 @@ describe("managed job agent control", () => {
 
 		expect(waited.details).toMatchObject({ action: "wait", waitStatus: "terminal", state: "terminated" });
 		expect(tool.description).toContain("runtime <= 1s");
+	});
+
+	it("requires fresh UI approval before each protected recipe start", async () => {
+		const runtime = await createRuntime();
+		const cwd = temporaryDirectories.at(-1)!;
+		const loaded: LoadedManagedJobsConfig = {
+			revision: "d".repeat(64),
+			config: {
+				version: 1,
+				recipes: [
+					{
+						id: "deploy",
+						command: process.execPath,
+						args: ["-e", "setInterval(() => {}, 1000)", "x".repeat(5_000)],
+						maxAgentStarts: 1,
+						requireApproval: true,
+					},
+				],
+			},
+		};
+		const tool = createManagedJobControlTool({ runtime, loaded, cwd });
+		const confirm = vi.fn<(title: string, message: string) => Promise<boolean>>();
+		confirm.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+
+		await expect(
+			tool.execute(
+				"headless-start",
+				{ action: "start", recipe: "deploy" },
+				undefined,
+				undefined,
+				createContext(cwd, { hasUI: false, confirm }),
+			),
+		).rejects.toThrow("requires approval UI");
+		await expect(
+			tool.execute(
+				"declined-start",
+				{ action: "start", recipe: "deploy" },
+				undefined,
+				undefined,
+				createContext(cwd, { confirm }),
+			),
+		).rejects.toThrow("was not approved by the user");
+		expect(runtime.manager.list()).toHaveLength(0);
+
+		const started = await tool.execute(
+			"approved-start",
+			{ action: "start", recipe: "deploy" },
+			undefined,
+			undefined,
+			createContext(cwd, { confirm }),
+		);
+		expect(started.details).toMatchObject({ action: "start", recipeId: "deploy", state: "running" });
+		expect(confirm).toHaveBeenCalledTimes(2);
+		expect(confirm).toHaveBeenLastCalledWith(
+			"Run agent-managed job recipe?",
+			expect.stringContaining(process.execPath),
+		);
+		const approvalMessage = confirm.mock.calls.at(-1)?.[1] ?? "";
+		expect(approvalMessage).not.toContain("x".repeat(4_100));
+		expect(approvalMessage).toContain("...");
+		expect(tool.description).toContain("approval required");
 	});
 
 	it("redacts host operation errors from tool failures", async () => {

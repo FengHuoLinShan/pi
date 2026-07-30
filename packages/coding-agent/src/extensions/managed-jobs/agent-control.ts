@@ -2,12 +2,15 @@ import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import { defineTool } from "../../core/extensions/index.ts";
 import type { ProcessSessionRecord } from "../../core/process-session.ts";
+import { stripAnsi } from "../../utils/ansi.ts";
+import { sanitizeBinaryOutput } from "../../utils/shell.ts";
 import type { LoadedManagedJobsConfig, ManagedJobRecipeConfig } from "./config.ts";
 import { ManagedJobRecipeRunError, runManagedJobRecipe } from "./recipe-runner.ts";
 import { isActiveManagedJobState, MANAGED_JOBS_MAX_ACTIVE, type ManagedJobsRuntime } from "./runtime.ts";
 
 export const MANAGED_JOBS_AGENT_CONTROL_TOOL = "managed_job_control";
 const MANAGED_JOB_CONTROL_WAIT_MAX_SECONDS = 30;
+const MANAGED_JOB_APPROVAL_COMMAND_MAX_CHARACTERS = 4_096;
 
 interface ManagedJobControlDetails {
 	version: 1;
@@ -94,6 +97,16 @@ function operationError(action: "start" | "readiness check" | "wait" | "stop", r
 	);
 }
 
+function approvalCommand(recipe: ManagedJobRecipeConfig): string {
+	const command = [recipe.command, ...recipe.args]
+		.map((argument) => (/\s/.test(argument) ? JSON.stringify(argument) : argument))
+		.join(" ");
+	const display = sanitizeBinaryOutput(stripAnsi(command)).replace(/\r/g, "\n");
+	return display.length <= MANAGED_JOB_APPROVAL_COMMAND_MAX_CHARACTERS
+		? display
+		: `${display.slice(0, MANAGED_JOB_APPROVAL_COMMAND_MAX_CHARACTERS - 3)}...`;
+}
+
 async function waitForTerminalJob(
 	runtime: ManagedJobsRuntime,
 	id: string,
@@ -146,7 +159,7 @@ export function createManagedJobControlTool(options: ManagedJobControlToolOption
 	const startCounts = new Map<string, number>();
 	const recipeSummaries = [...recipes.values()].map(
 		(recipe) =>
-			`${recipe.id}${recipe.maxAgentStarts === undefined ? "" : ` (max ${recipe.maxAgentStarts} starts)`}${recipe.maxRuntimeSeconds === undefined ? "" : ` (runtime <= ${recipe.maxRuntimeSeconds}s)`}`,
+			`${recipe.id}${recipe.maxAgentStarts === undefined ? "" : ` (max ${recipe.maxAgentStarts} starts)`}${recipe.maxRuntimeSeconds === undefined ? "" : ` (runtime <= ${recipe.maxRuntimeSeconds}s)`}${recipe.requireApproval ? " (approval required)" : ""}`,
 	);
 	const recordControlledStart = (recipe: ManagedJobRecipeConfig, id: string): void => {
 		controlledJobs.set(id, recipe);
@@ -176,24 +189,42 @@ export function createManagedJobControlTool(options: ManagedJobControlToolOption
 			if (params.action === "start") {
 				const recipe = recipes.get(params.recipe);
 				if (!recipe) throw new Error(`Managed job recipe is not approved: ${params.recipe}`);
-				const active = options.runtime.manager.list().filter((record) => isActiveManagedJobState(record.state));
-				if (active.length >= MANAGED_JOBS_MAX_ACTIVE) {
-					throw new Error(`Managed job limit reached (${MANAGED_JOBS_MAX_ACTIVE} active)`);
-				}
-				const duplicate = [...controlledJobs].find(([id, controlledRecipe]) => {
-					const record = options.runtime.manager.get(id);
-					return (
-						controlledRecipe.id === recipe.id && record !== undefined && isActiveManagedJobState(record.state)
+				const assertCanStart = (): number => {
+					const active = options.runtime.manager.list().filter((record) => isActiveManagedJobState(record.state));
+					if (active.length >= MANAGED_JOBS_MAX_ACTIVE) {
+						throw new Error(`Managed job limit reached (${MANAGED_JOBS_MAX_ACTIVE} active)`);
+					}
+					const duplicate = [...controlledJobs].find(([id, controlledRecipe]) => {
+						const record = options.runtime.manager.get(id);
+						return (
+							controlledRecipe.id === recipe.id && record !== undefined && isActiveManagedJobState(record.state)
+						);
+					});
+					if (duplicate) {
+						throw new Error(`Managed job recipe already has an active tool-controlled run: ${recipe.id}`);
+					}
+					const startsUsed = startCounts.get(recipe.id) ?? 0;
+					if (recipe.maxAgentStarts !== undefined && startsUsed >= recipe.maxAgentStarts) {
+						throw new Error(
+							`Managed job recipe reached its agent start budget: ${recipe.id} (${startsUsed}/${recipe.maxAgentStarts})`,
+						);
+					}
+					return startsUsed;
+				};
+				const startsUsed = assertCanStart();
+				if (recipe.requireApproval) {
+					if (!ctx.hasUI) {
+						throw new Error(`Managed job recipe requires approval UI: ${recipe.id}`);
+					}
+					const approved = await ctx.ui.confirm(
+						"Run agent-managed job recipe?",
+						`Recipe: ${recipe.id}\nRevision: ${options.loaded.revision.slice(0, 12)}\nAgent starts: ${startsUsed}${recipe.maxAgentStarts === undefined ? "" : `/${recipe.maxAgentStarts}`}\nCommand: ${approvalCommand(recipe)}`,
 					);
-				});
-				if (duplicate) {
-					throw new Error(`Managed job recipe already has an active tool-controlled run: ${recipe.id}`);
-				}
-				const startsUsed = startCounts.get(recipe.id) ?? 0;
-				if (recipe.maxAgentStarts !== undefined && startsUsed >= recipe.maxAgentStarts) {
-					throw new Error(
-						`Managed job recipe reached its agent start budget: ${recipe.id} (${startsUsed}/${recipe.maxAgentStarts})`,
-					);
+					if (!approved) throw new Error(`Managed job recipe was not approved by the user: ${recipe.id}`);
+					if (ctx.cwd !== options.cwd || !ctx.isProjectTrusted() || ctx.hasExecutionBoundary) {
+						throw new Error("Managed job control context changed while awaiting approval; retry");
+					}
+					assertCanStart();
 				}
 				let id: string;
 				do {

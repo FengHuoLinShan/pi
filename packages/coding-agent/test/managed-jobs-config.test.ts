@@ -33,6 +33,7 @@ function validConfig(): unknown {
 				inheritEnv: ["PORT", "DATABASE_URL"],
 				maxAgentStarts: 3,
 				maxRuntimeSeconds: 3_600,
+				requireApproval: true,
 				readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 10 },
 			},
 		],
@@ -189,6 +190,21 @@ describe("managed jobs config", () => {
 				recipes: [{ id: "server", command: "server", maxRuntimeSeconds: 86_401 }],
 			}),
 		).toThrow("maxRuntimeSeconds must be a safe integer between 1 and 86400");
+	});
+
+	it("accepts only boolean per-start approval requirements", () => {
+		expect(
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "deploy", command: "deploy", requireApproval: true }],
+			}).recipes[0]?.requireApproval,
+		).toBe(true);
+		expect(() =>
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "deploy", command: "deploy", requireApproval: "always" }],
+			}),
+		).toThrow("requireApproval must be a boolean");
 	});
 
 	it("loads a bounded regular project config with a stable source revision", async () => {
