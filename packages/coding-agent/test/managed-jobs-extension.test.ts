@@ -515,6 +515,7 @@ describe("managed jobs built-in extension", () => {
 		);
 		const prompt = await extension.beforeAgentStart();
 		expect(prompt?.systemPrompt).toContain("managed_job_control can start only the fixed trusted-project recipes");
+		expect(prompt?.systemPrompt).toContain("can wait on or stop only jobs it started");
 		expect(prompt?.systemPrompt).not.toContain("You cannot control managed jobs directly");
 		await tool.execute("start-call", { action: "start", recipe: "api" }, undefined, undefined, extension.ctx);
 	});

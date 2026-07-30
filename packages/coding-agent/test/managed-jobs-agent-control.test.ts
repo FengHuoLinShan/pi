@@ -110,6 +110,20 @@ describe("managed job agent control", () => {
 		await expect(
 			tool.execute("foreign-stop-call", { action: "stop", id: human.id }, undefined, undefined, ctx),
 		).rejects.toThrow("was not started by this control tool");
+		await expect(
+			tool.execute("foreign-wait-call", { action: "wait", id: human.id }, undefined, undefined, ctx),
+		).rejects.toThrow("was not started by this control tool");
+
+		const controller = new AbortController();
+		controller.abort();
+		const waiting = await tool.execute(
+			"wait-call",
+			{ action: "wait", id: startDetails.jobId },
+			controller.signal,
+			undefined,
+			ctx,
+		);
+		expect(waiting.details).toMatchObject({ action: "wait", waitStatus: "aborted", state: "running" });
 
 		const stopped = await tool.execute(
 			"stop-call",
@@ -157,6 +171,52 @@ describe("managed job agent control", () => {
 		expect(runtime.manager.list()).toHaveLength(0);
 	});
 
+	it("waits for a tool-owned one-shot recipe without returning its output", async () => {
+		const runtime = await createRuntime();
+		const cwd = temporaryDirectories.at(-1)!;
+		const secretOutput = "local completion output";
+		const loaded: LoadedManagedJobsConfig = {
+			revision: "b".repeat(64),
+			config: {
+				version: 1,
+				recipes: [
+					{
+						id: "check",
+						command: process.execPath,
+						args: ["-e", `process.stdout.write(${JSON.stringify(secretOutput)})`],
+					},
+				],
+			},
+		};
+		const tool = createManagedJobControlTool({ runtime, loaded, cwd });
+		const ctx = createContext(cwd);
+
+		const started = await tool.execute(
+			"start-check",
+			{ action: "start", recipe: "check" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const startDetails = started.details as ManagedJobControlStartDetails;
+		const waited = await tool.execute(
+			"wait-check",
+			{ action: "wait", id: startDetails.jobId, timeoutSeconds: 1 },
+			undefined,
+			undefined,
+			ctx,
+		);
+
+		expect(waited.details).toMatchObject({
+			action: "wait",
+			recipeId: "check",
+			waitStatus: "terminal",
+			state: "exited",
+		});
+		expect(JSON.stringify(waited)).not.toContain(secretOutput);
+		expect(JSON.stringify(waited)).not.toContain(process.execPath);
+	});
+
 	it("redacts host operation errors from tool failures", async () => {
 		const runtime = await createRuntime();
 		const cwd = temporaryDirectories.at(-1)!;
@@ -183,6 +243,16 @@ describe("managed job agent control", () => {
 
 		const jobId = runtime.manager.list().find((record) => record.id.startsWith("agent-api-"))?.id;
 		if (!jobId) throw new Error("Expected a tool-controlled job");
+		const status = vi.spyOn(runtime.manager, "status").mockImplementationOnce(() => {
+			throw new Error(sensitiveError);
+		});
+		const waitMessage = await rejectedMessage(
+			tool.execute("wait-failure", { action: "wait", id: jobId }, undefined, undefined, ctx),
+		);
+		expect(waitMessage).toContain("Managed job wait failed for approved recipe api");
+		expect(waitMessage).not.toContain(sensitiveError);
+		status.mockRestore();
+
 		const terminate = vi.spyOn(runtime.manager, "terminate").mockRejectedValueOnce(new Error(sensitiveError));
 		const stopMessage = await rejectedMessage(
 			tool.execute("stop-failure", { action: "stop", id: jobId }, undefined, undefined, ctx),
