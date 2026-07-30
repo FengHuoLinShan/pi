@@ -8,6 +8,7 @@ import {
 	isActiveManagedJobState,
 	MANAGED_JOBS_MAX_ACTIVE,
 	type ManagedJobsRuntime,
+	type WaitForManagedJobOutputResult,
 	waitForManagedJobOutput,
 } from "./runtime.ts";
 
@@ -78,6 +79,12 @@ function resultContent(
 	);
 }
 
+function operationError(action: "start" | "readiness check" | "stop", recipeId: string, jobId: string): Error {
+	return new Error(
+		`Managed job ${action} failed for approved recipe ${recipeId} (job ${jobId}); inspect local details with /job status ${jobId}`,
+	);
+}
+
 export function createManagedJobControlTool(options: ManagedJobControlToolOptions) {
 	const recipes = new Map(
 		options.loaded.config.recipes.map((recipe) => [
@@ -130,13 +137,18 @@ export function createManagedJobControlTool(options: ManagedJobControlToolOption
 				do {
 					id = `agent-${recipe.id.slice(0, 40)}-${randomUUID().slice(0, 8)}`;
 				} while (options.runtime.manager.get(id));
-				const started = await options.runtime.manager.start({
-					id,
-					command: recipe.command,
-					args: recipe.args,
-					cwd: options.cwd,
-					env: getShellEnv(),
-				});
+				let started: ProcessSessionRecord;
+				try {
+					started = await options.runtime.manager.start({
+						id,
+						command: recipe.command,
+						args: recipe.args,
+						cwd: options.cwd,
+						env: getShellEnv(),
+					});
+				} catch {
+					throw operationError("start", recipe.id, id);
+				}
 				controlledJobs.set(started.id, recipe);
 				if (!recipe.readiness) {
 					return {
@@ -157,15 +169,20 @@ export function createManagedJobControlTool(options: ManagedJobControlToolOption
 						},
 					};
 				}
-				const readiness = await waitForManagedJobOutput(options.runtime, started.id, {
-					contains: recipe.readiness.contains,
-					stream:
-						recipe.readiness.stream === "stdout" || recipe.readiness.stream === "stderr"
-							? recipe.readiness.stream
-							: undefined,
-					timeoutMs: recipe.readiness.timeoutSeconds * 1000,
-					signal,
-				});
+				let readiness: WaitForManagedJobOutputResult;
+				try {
+					readiness = await waitForManagedJobOutput(options.runtime, started.id, {
+						contains: recipe.readiness.contains,
+						stream:
+							recipe.readiness.stream === "stdout" || recipe.readiness.stream === "stderr"
+								? recipe.readiness.stream
+								: undefined,
+						timeoutMs: recipe.readiness.timeoutSeconds * 1000,
+						signal,
+					});
+				} catch {
+					throw operationError("readiness check", recipe.id, started.id);
+				}
 				return {
 					content: [
 						{
@@ -193,10 +210,14 @@ export function createManagedJobControlTool(options: ManagedJobControlToolOption
 				throw new Error(`Managed job not found: ${params.id}`);
 			}
 			let stopped = record;
-			if (isActiveManagedJobState(record.state)) {
-				await options.runtime.manager.terminate(record.id);
-				stopped = await options.runtime.manager.waitForExit(record.id);
-				await options.runtime.manager.flush();
+			try {
+				if (isActiveManagedJobState(record.state)) {
+					await options.runtime.manager.terminate(record.id);
+					stopped = await options.runtime.manager.waitForExit(record.id);
+					await options.runtime.manager.flush();
+				}
+			} catch {
+				throw operationError("stop", recipe.id, record.id);
 			}
 			return {
 				content: [

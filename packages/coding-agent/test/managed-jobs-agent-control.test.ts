@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "../src/core/extensions/index.ts";
 import {
 	createManagedJobControlTool,
@@ -62,6 +62,15 @@ function createLoadedConfig(): LoadedManagedJobsConfig {
 			],
 		},
 	};
+}
+
+async function rejectedMessage(operation: Promise<unknown>): Promise<string> {
+	try {
+		await operation;
+		return "";
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
 }
 
 describe("managed job agent control", () => {
@@ -146,6 +155,41 @@ describe("managed job agent control", () => {
 			),
 		).rejects.toThrow("cannot execute across an execution boundary");
 		expect(runtime.manager.list()).toHaveLength(0);
+	});
+
+	it("redacts host operation errors from tool failures", async () => {
+		const runtime = await createRuntime();
+		const cwd = temporaryDirectories.at(-1)!;
+		const loaded = createLoadedConfig();
+		const tool = createManagedJobControlTool({ runtime, loaded, cwd });
+		const ctx = createContext(cwd);
+		const sensitiveError = `sensitive host path ${process.execPath}`;
+		const start = vi.spyOn(runtime.manager, "start").mockRejectedValueOnce(new Error(sensitiveError));
+
+		const startMessage = await rejectedMessage(
+			tool.execute("start-failure", { action: "start", recipe: "api" }, undefined, undefined, ctx),
+		);
+		expect(startMessage).toContain("Managed job start failed for approved recipe api");
+		expect(startMessage).not.toContain(sensitiveError);
+		start.mockRestore();
+
+		const output = vi.spyOn(runtime.manager, "readOutputTail").mockRejectedValueOnce(new Error(sensitiveError));
+		const readinessMessage = await rejectedMessage(
+			tool.execute("readiness-failure", { action: "start", recipe: "api" }, undefined, undefined, ctx),
+		);
+		expect(readinessMessage).toContain("Managed job readiness check failed for approved recipe api");
+		expect(readinessMessage).not.toContain(sensitiveError);
+		output.mockRestore();
+
+		const jobId = runtime.manager.list().find((record) => record.id.startsWith("agent-api-"))?.id;
+		if (!jobId) throw new Error("Expected a tool-controlled job");
+		const terminate = vi.spyOn(runtime.manager, "terminate").mockRejectedValueOnce(new Error(sensitiveError));
+		const stopMessage = await rejectedMessage(
+			tool.execute("stop-failure", { action: "stop", id: jobId }, undefined, undefined, ctx),
+		);
+		expect(stopMessage).toContain("Managed job stop failed for approved recipe api");
+		expect(stopMessage).not.toContain(sensitiveError);
+		terminate.mockRestore();
 	});
 });
 

@@ -508,7 +508,8 @@ The user may attach bounded process output through custom messages of type manag
 				}
 				if (action === "status") {
 					const record = resolveRecord(opened, args[0] ?? "");
-					ctx.ui.notify(formatRecord(record), "info");
+					const summary = formatRecord(record);
+					ctx.ui.notify(record.error ? `${summary}\nerror=${displayText(record.error)}` : summary, "info");
 					return;
 				}
 				if (action === "output") {

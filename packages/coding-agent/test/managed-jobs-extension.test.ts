@@ -276,6 +276,23 @@ describe("managed jobs built-in extension", () => {
 		expect(extension.notify).toHaveBeenLastCalledWith("ready\nnext", "info");
 	});
 
+	it("shows process errors only through explicit local status inspection", async () => {
+		const runtime = await createRuntime();
+		const extension = setupExtension(runtime);
+		await extension.sessionStart();
+		const missingCommand = join(temporaryDirectories.at(-1)!, "missing-command");
+
+		await extension.command(`start --name broken ${quoteArgument(missingCommand)}`, extension.ctx);
+		await runtime.manager.waitForExit("broken");
+		await runtime.manager.flush();
+		await extension.command("list", extension.ctx);
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.not.stringContaining("ENOENT"), "info");
+
+		await extension.command("status broken", extension.ctx);
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("error="), "info");
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("ENOENT"), "info");
+	});
+
 	it("attaches selected output to model context only through an explicit untrusted-data command", async () => {
 		const runtime = await createRuntime();
 		const extension = setupExtension(runtime);
