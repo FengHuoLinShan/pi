@@ -171,6 +171,44 @@ describe("ProcessSessionManager", () => {
 		expect(repairedLog).not.toContain('{"partial":');
 		expect(repairedLog).toContain('"type":"process_interrupted"');
 	});
+
+	it("fails and terminates a process at its durable output limit and reads bounded output tails", async () => {
+		const directory = await createTempDirectory();
+		const artifactStore = await createArtifactStore(directory);
+		const backend = new FakeProcessBackend();
+		const { manager } = await ProcessSessionManager.open({
+			root: join(directory, "processes"),
+			artifactStore,
+			backend,
+			maxOutputBytesPerSession: 5,
+		});
+		const started = await manager.start({ command: "fake" });
+		if (!started.backendHandle) throw new Error("Expected fake backend handle");
+
+		backend.emit(started.backendHandle, "stdout", "1234567");
+		await manager.flush();
+
+		expect(manager.status(started.id)).toMatchObject({
+			state: "failed",
+			error: "Process output reached the configured 5 byte limit",
+		});
+		expect((await manager.readOutput(started.id)).toString()).toBe("12345");
+		expect((await manager.readOutputTail(started.id, { maxBytes: 3 })).toString()).toBe("345");
+		expect(await backend.status(started.backendHandle)).toEqual({ state: "unavailable" });
+	});
+
+	it("rejects invalid process output limits", async () => {
+		const directory = await createTempDirectory();
+		const artifactStore = await createArtifactStore(directory);
+
+		await expect(
+			ProcessSessionManager.open({
+				root: join(directory, "processes"),
+				artifactStore,
+				maxOutputBytesPerSession: 0,
+			}),
+		).rejects.toThrow("output limit must be a positive safe integer");
+	});
 });
 
 describe("ProcessSessionManager execution boundary", () => {

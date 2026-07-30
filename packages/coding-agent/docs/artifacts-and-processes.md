@@ -56,6 +56,7 @@ const { manager } = await ProcessSessionManager.open({
   root: "/trusted/pi-state/processes",
   artifactStore: store,
   defaultCwd: "/workspace",
+  maxOutputBytesPerSession: 10 * 1024 * 1024,
 });
 
 const processSession = await manager.start({
@@ -64,10 +65,15 @@ const processSession = await manager.start({
 });
 
 const completed = await manager.waitForExit(processSession.id);
-const stdout = await manager.readOutput(completed.id, "stdout");
+const stdoutTail = await manager.readOutputTail(completed.id, {
+  stream: "stdout",
+  maxBytes: 64 * 1024,
+});
 ```
 
 The event log is `<root>/process-sessions.jsonl`. Appends are flushed before state is published. On open, a partial unterminated tail is discarded before new events are appended, valid events are replayed in sequence, and impossible lifecycle transitions are rejected.
+
+`maxOutputBytesPerSession` is optional for SDK compatibility. When configured, the manager persists at most that many output bytes, records a durable `process_failed` event at the limit, and terminates the backend handle. `readOutputTail()` bounds returned output and reads only the newest artifact records needed for the requested tail; `readOutput()` remains available when a caller explicitly needs the complete retained output.
 
 ## Recovery and Attach Semantics
 

@@ -111,6 +111,13 @@ export interface ProcessSessionManagerOptions {
 	backend?: ProcessSessionBackend;
 	executionBoundary?: ExecutionBoundary;
 	defaultCwd?: string;
+	/** Fail and terminate a process after persisting this many output bytes. Unbounded when omitted. */
+	maxOutputBytesPerSession?: number;
+}
+
+export interface ReadProcessOutputTailOptions {
+	stream?: ProcessOutputStream;
+	maxBytes?: number;
 }
 
 interface ProcessEventBase {
@@ -359,6 +366,7 @@ export class ProcessSessionManager {
 	private readonly eventLogPath: string;
 	private readonly defaultCwd: string;
 	private readonly boundary?: ExecutionBoundary;
+	private readonly maxOutputBytesPerSession?: number;
 	private readonly records = new Map<string, ProcessSessionRecord>();
 	private readonly eventsBySession = new Map<string, ProcessSessionEvent[]>();
 	private readonly listeners = new Set<ProcessSessionListener>();
@@ -371,6 +379,13 @@ export class ProcessSessionManager {
 		this.artifactStore = options.artifactStore;
 		this.eventLogPath = join(this.root, "process-sessions.jsonl");
 		this.boundary = options.executionBoundary;
+		if (
+			options.maxOutputBytesPerSession !== undefined &&
+			(!Number.isSafeInteger(options.maxOutputBytesPerSession) || options.maxOutputBytesPerSession <= 0)
+		) {
+			throw new Error("Process session output limit must be a positive safe integer");
+		}
+		this.maxOutputBytesPerSession = options.maxOutputBytesPerSession;
 
 		if (options.executionBoundary) {
 			const resolvedBoundary = resolveExecutionBoundary(options.executionBoundary, ["bash"]);
@@ -616,6 +631,26 @@ export class ProcessSessionManager {
 		return Buffer.concat(chunks);
 	}
 
+	async readOutputTail(id: string, options: ReadProcessOutputTailOptions = {}): Promise<Buffer> {
+		const record = this.records.get(id);
+		if (!record) throw new Error(`Process session not found: ${id}`);
+		const maxBytes = options.maxBytes ?? 64 * 1024;
+		if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+			throw new Error("Process output tail limit must be a positive safe integer");
+		}
+		const selected = [];
+		let selectedBytes = 0;
+		for (let index = record.outputs.length - 1; index >= 0 && selectedBytes < maxBytes; index--) {
+			const output = record.outputs[index];
+			if (!output || (options.stream && output.stream !== options.stream)) continue;
+			selected.unshift(output);
+			selectedBytes += output.byteLength;
+		}
+		const chunks = await Promise.all(selected.map((output) => this.artifactStore.read(output.artifact)));
+		const combined = Buffer.concat(chunks);
+		return combined.length <= maxBytes ? combined : combined.subarray(combined.length - maxBytes);
+	}
+
 	getEvents(id: string): ProcessSessionEvent[] {
 		return (this.eventsBySession.get(id) ?? []).map(copyEvent);
 	}
@@ -697,21 +732,45 @@ export class ProcessSessionManager {
 	private async appendOutput(id: string, stream: ProcessOutputStream, chunk: Buffer): Promise<void> {
 		const record = this.records.get(id);
 		if (!record || !isActiveState(record.state) || chunk.length === 0) return;
-		const artifact = await this.artifactStore.put(chunk, {
-			mediaType: "application/octet-stream",
-			provenance: {
-				producer: this.backend.id,
-				processSessionId: id,
-				attributes: { stream, outputSequence: record.outputs.length },
-			},
-		});
-		const event = this.createNextEvent(id, {
-			type: "process_output",
-			stream,
-			artifact: artifact.ref,
-			byteLength: chunk.length,
-		});
-		await this.appendAndApply(event);
+		const persistedBytes = record.outputs.reduce((total, output) => total + output.byteLength, 0);
+		const remainingBytes =
+			this.maxOutputBytesPerSession === undefined
+				? chunk.length
+				: Math.max(0, this.maxOutputBytesPerSession - persistedBytes);
+		const durableChunk = remainingBytes < chunk.length ? chunk.subarray(0, remainingBytes) : chunk;
+		if (durableChunk.length > 0) {
+			const artifact = await this.artifactStore.put(durableChunk, {
+				mediaType: "application/octet-stream",
+				provenance: {
+					producer: this.backend.id,
+					processSessionId: id,
+					attributes: { stream, outputSequence: record.outputs.length },
+				},
+			});
+			const event = this.createNextEvent(id, {
+				type: "process_output",
+				stream,
+				artifact: artifact.ref,
+				byteLength: durableChunk.length,
+			});
+			await this.appendAndApply(event);
+		}
+		if (
+			this.maxOutputBytesPerSession !== undefined &&
+			persistedBytes + chunk.length >= this.maxOutputBytesPerSession
+		) {
+			await this.appendFailed(
+				id,
+				`Process output reached the configured ${this.maxOutputBytesPerSession} byte limit`,
+			);
+			if (record.backendHandle) {
+				try {
+					await this.backend.terminate(record.backendHandle);
+				} catch {
+					// The durable output-limit failure remains authoritative.
+				}
+			}
+		}
 	}
 
 	private async appendExit(id: string, exit: ProcessBackendExit): Promise<void> {
