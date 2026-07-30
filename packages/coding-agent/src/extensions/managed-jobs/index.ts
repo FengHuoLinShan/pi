@@ -103,7 +103,8 @@ function formatRecipe(recipe: ManagedJobRecipeConfig): string {
 		recipe.inheritEnv === undefined
 			? " env=full"
 			: ` env=minimal${recipe.inheritEnv.length > 0 ? `+${recipe.inheritEnv.map(displayText).join(",")}` : ""}`;
-	return `${displayText(recipe.id)}${readiness}${environment}\n  ${boundedCommand}`;
+	const budget = recipe.maxAgentStarts === undefined ? "" : ` agentStarts<=${recipe.maxAgentStarts}`;
+	return `${displayText(recipe.id)}${readiness}${environment}${budget}\n  ${boundedCommand}`;
 }
 
 function agentRecordSnapshot(record: ProcessSessionRecord) {

@@ -59,6 +59,7 @@ function createLoadedConfig(): LoadedManagedJobsConfig {
 					command: process.execPath,
 					args: ["-e", "process.stdout.write('ready'); setInterval(() => {}, 1000)"],
 					inheritEnv: ["PI_MANAGED_JOBS_ALLOWED"],
+					maxAgentStarts: 1,
 					readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 1 },
 				},
 			],
@@ -144,6 +145,9 @@ describe("managed job agent control", () => {
 		);
 		expect(stopped.details).toMatchObject({ action: "stop", recipeId: "api", state: "terminated" });
 		expect(runtime.manager.status(startDetails.jobId).state).toBe("terminated");
+		await expect(
+			tool.execute("budget-call", { action: "start", recipe: "api" }, undefined, undefined, ctx),
+		).rejects.toThrow("reached its agent start budget: api (1/1)");
 	});
 
 	it("rejects unknown recipes, untrusted projects, and execution boundaries", async () => {

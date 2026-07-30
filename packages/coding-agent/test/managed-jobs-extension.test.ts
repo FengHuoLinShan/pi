@@ -499,7 +499,7 @@ describe("managed jobs built-in extension", () => {
 			join(cwd, MANAGED_JOBS_CONFIG_PATH),
 			JSON.stringify({
 				version: 1,
-				recipes: [{ id: "api", command: process.execPath, args: ["-e", ""] }],
+				recipes: [{ id: "api", command: process.execPath, args: ["-e", ""], maxAgentStarts: 1 }],
 			}),
 			"utf8",
 		);
@@ -555,6 +555,7 @@ describe("managed jobs built-in extension", () => {
 						command: "npm",
 						args: ["run", "check", "x".repeat(2_000)],
 						inheritEnv: [],
+						maxAgentStarts: 2,
 						readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 5 },
 					},
 				],
@@ -571,6 +572,7 @@ describe("managed jobs built-in extension", () => {
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("npm run check"), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining('readiness=stdout:"ready"/5s'), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("env=minimal"), "info");
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("agentStarts<=2"), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.not.stringContaining("x".repeat(1_100)), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("..."), "info");
 	});

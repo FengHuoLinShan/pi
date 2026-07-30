@@ -31,6 +31,7 @@ function validConfig(): unknown {
 				command: "npm",
 				args: ["run", "dev"],
 				inheritEnv: ["PORT", "DATABASE_URL"],
+				maxAgentStarts: 3,
 				readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 10 },
 			},
 		],
@@ -145,6 +146,27 @@ describe("managed jobs config", () => {
 				recipes: [{ id: "check", command: "npm", inheritEnv: ["BAD-NAME"] }],
 			}),
 		).toThrow("portable environment name");
+	});
+
+	it("bounds optional per-recipe agent start budgets", () => {
+		expect(
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "deploy", command: "deploy", maxAgentStarts: 2 }],
+			}).recipes[0]?.maxAgentStarts,
+		).toBe(2);
+		expect(() =>
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "deploy", command: "deploy", maxAgentStarts: 0 }],
+			}),
+		).toThrow("maxAgentStarts must be a safe integer between 1 and 100");
+		expect(() =>
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "deploy", command: "deploy", maxAgentStarts: 101 }],
+			}),
+		).toThrow("maxAgentStarts must be a safe integer between 1 and 100");
 	});
 
 	it("loads a bounded regular project config with a stable source revision", async () => {
