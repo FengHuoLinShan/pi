@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an authenticated HTTP/SSE remote gateway for mobile Pi clients with event replay, approvals, file uploads, explicit project trust, and session resume across graceful or unexpected service restarts.
+
 ## [0.80.10] - 2026-07-16
 
 ## [0.80.9] - 2026-07-16

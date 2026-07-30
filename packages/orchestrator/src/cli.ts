@@ -5,9 +5,10 @@ import { dirname, join } from "node:path";
 import { cwd } from "node:process";
 import { fileURLToPath } from "node:url";
 import type { RpcCommand, RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
-import { getSocketPath } from "./config.ts";
+import { getRemoteTokenPath, getSocketPath } from "./config.ts";
 import { sendIpcRequest } from "./ipc/client.ts";
 import { encodeMessage } from "./ipc/protocol.ts";
+import { loadOrCreateRemoteToken } from "./remote/auth.ts";
 import { serve } from "./serve.ts";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -18,7 +19,7 @@ const packageJson = JSON.parse(readFileSync(join(__dirname, "../package.json"), 
 
 function printHelp(): void {
 	console.log(
-		`orchestrator v${packageJson.version}\n\nUsage:\n  orchestrator serve\n  orchestrator list\n  orchestrator spawn [--cwd <path>] [--label <label>]\n  orchestrator status <instance-id>\n  orchestrator stop <instance-id>\n  orchestrator rpc <instance-id> <json-command>\n  orchestrator rpc-stream <instance-id>\n  orchestrator --help\n  orchestrator --version\n\nRPC stream stdin expects JSONL RpcCommand or extension_ui_response messages.`,
+		`orchestrator v${packageJson.version}\n\nUsage:\n  orchestrator serve [--remote] [--remote-host <host>] [--remote-port <port>]\n  orchestrator remote-token\n  orchestrator list\n  orchestrator spawn [--cwd <path>] [--label <label>]\n  orchestrator status <instance-id>\n  orchestrator stop <instance-id>\n  orchestrator rpc <instance-id> <json-command>\n  orchestrator rpc-stream <instance-id>\n  orchestrator --help\n  orchestrator --version\n\nRemote gateway defaults to 127.0.0.1:8787 and uses PI_REMOTE_TOKEN or a generated token.\nRPC stream stdin expects JSONL RpcCommand or extension_ui_response messages.`,
 	);
 }
 
@@ -90,7 +91,26 @@ async function main(): Promise<void> {
 	}
 
 	if (args[0] === "serve") {
-		await serve();
+		if (!args.includes("--remote")) {
+			await serve();
+			return;
+		}
+		const host = getFlagValue(args, "--remote-host") ?? "127.0.0.1";
+		const rawPort = getFlagValue(args, "--remote-port") ?? "8787";
+		const port = Number(rawPort);
+		if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+			throw new Error(`Invalid remote port: ${rawPort}`);
+		}
+		const token = process.env.PI_REMOTE_TOKEN || loadOrCreateRemoteToken();
+		console.error(
+			`remote authentication token: ${process.env.PI_REMOTE_TOKEN ? "PI_REMOTE_TOKEN" : getRemoteTokenPath()}`,
+		);
+		await serve({ remote: { host, port, token } });
+		return;
+	}
+
+	if (args[0] === "remote-token") {
+		console.log(loadOrCreateRemoteToken());
 		return;
 	}
 

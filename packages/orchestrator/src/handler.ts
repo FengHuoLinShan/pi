@@ -60,6 +60,7 @@ export async function handleIpcRequest(request: OrchestratorRequest): Promise<Or
 			const instance = await supervisor.spawnInstance({
 				cwd: request.cwd,
 				label: request.label,
+				approveProject: request.approveProject,
 			});
 			return {
 				type: "spawn_result",

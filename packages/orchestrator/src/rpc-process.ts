@@ -34,8 +34,8 @@ export class RpcProcessInstance {
 	private readonly exitListeners = new Set<(error?: Error) => void>();
 	private uiRequestHandler: ((request: RpcExtensionUIRequest) => void) | undefined;
 
-	constructor(options: { cwd: string }) {
-		const rpcCommand = this.getSpawnCommand();
+	constructor(options: { cwd: string; approveProject?: boolean }) {
+		const rpcCommand = this.getSpawnCommand(options.approveProject === true);
 		this.process = spawn(rpcCommand.command, rpcCommand.args, {
 			cwd: options.cwd,
 			env: process.env,
@@ -47,16 +47,17 @@ export class RpcProcessInstance {
 		this.attachListeners();
 	}
 
-	private getSpawnCommand(): { command: string; args: string[] } {
+	private getSpawnCommand(approveProject: boolean): { command: string; args: string[] } {
+		const trustArgs = approveProject ? ["--approve"] : [];
 		if (isBunBinary) {
 			return {
 				command: join(dirname(process.execPath), process.platform === "win32" ? "pi.exe" : "pi"),
-				args: ["--mode", "rpc"],
+				args: ["--mode", "rpc", ...trustArgs],
 			};
 		}
 		return {
 			command: process.execPath,
-			args: [require.resolve("@earendil-works/pi-coding-agent/rpc-entry")],
+			args: [require.resolve("@earendil-works/pi-coding-agent/rpc-entry"), ...trustArgs],
 		};
 	}
 
@@ -196,6 +197,6 @@ export class RpcProcessInstance {
 	}
 }
 
-export function createRpcProcessInstance(options: { cwd: string }): RpcProcessInstance {
+export function createRpcProcessInstance(options: { cwd: string; approveProject?: boolean }): RpcProcessInstance {
 	return new RpcProcessInstance(options);
 }

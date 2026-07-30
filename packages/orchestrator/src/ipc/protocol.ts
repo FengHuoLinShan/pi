@@ -13,6 +13,7 @@ export interface SpawnRequest {
 	label?: string;
 	provider?: string;
 	model?: string;
+	approveProject?: boolean;
 }
 
 export interface ListRequest {

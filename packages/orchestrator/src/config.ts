@@ -64,6 +64,10 @@ export function getInstancesPath(): string {
 	return join(getOrchestratorDir(), "instances.json");
 }
 
+export function getRemoteTokenPath(): string {
+	return join(getOrchestratorDir(), "remote-token");
+}
+
 export function getSocketPath(): string {
 	return join(getOrchestratorDir(), "orchestrator.sock");
 }

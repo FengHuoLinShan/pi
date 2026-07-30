@@ -4,16 +4,19 @@ import { getSocketPath } from "./config.ts";
 import { handleIpcRequest, openRpcStream } from "./handler.ts";
 import { startIpcServer } from "./ipc/server.ts";
 import { getRadiusOrchestratorBaseUrl, isRadiusEnabled, radiusPresence } from "./radius.ts";
+import { type RemoteServerOptions, type RunningRemoteServer, startRemoteServer } from "./remote/server.ts";
 import { supervisor } from "./supervisor.ts";
 
-export async function serve(): Promise<void> {
+export interface ServeOptions {
+	remote?: RemoteServerOptions;
+}
+
+export async function serve(options: ServeOptions = {}): Promise<void> {
 	const socketPath = getSocketPath();
 	mkdirSync(dirname(socketPath), { recursive: true });
-	const server = await startIpcServer(
-		Object.assign(handleIpcRequest, {
-			openRpcStream,
-		}),
-	);
+	const handler = Object.assign(handleIpcRequest, { openRpcStream });
+	const server = await startIpcServer(handler);
+	let remoteServer: RunningRemoteServer | undefined;
 
 	try {
 		await supervisor.recoverAfterRestart();
@@ -26,7 +29,12 @@ export async function serve(): Promise<void> {
 		} else {
 			console.log("radius integration disabled: login radius in ~/.pi/agent/auth.json or set RADIUS_API_KEY");
 		}
+		if (options.remote) {
+			remoteServer = await startRemoteServer(options.remote, handler);
+			console.log(`remote gateway listening on http://${remoteServer.host}:${remoteServer.port}`);
+		}
 	} catch (error) {
+		await remoteServer?.close();
 		server.close();
 		if (existsSync(socketPath)) {
 			unlinkSync(socketPath);
@@ -44,6 +52,7 @@ export async function serve(): Promise<void> {
 		}
 
 		shutdownPromise = (async () => {
+			await remoteServer?.close();
 			server.close();
 			await supervisor.shutdown();
 			await radiusPresence.stop();

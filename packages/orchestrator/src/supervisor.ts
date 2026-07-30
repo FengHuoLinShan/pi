@@ -22,9 +22,19 @@ interface LiveInstance {
 	record: InstanceRecord;
 	resources: LiveInstanceResources;
 	subscribers: Set<AgentSessionEventListener>;
-	onUiRequest?: (request: RpcExtensionUIRequest) => void;
+	uiSubscribers: Set<(request: RpcExtensionUIRequest) => void>;
+	pendingUiRequests: Map<string, RpcExtensionUIRequest>;
 	unsubscribeEvents?: () => void;
 	unsubscribeExit?: () => void;
+}
+
+function isPendingUiRequest(request: RpcExtensionUIRequest): boolean {
+	return (
+		request.method === "select" ||
+		request.method === "confirm" ||
+		request.method === "input" ||
+		request.method === "editor"
+	);
 }
 
 function cloneInstance(record: InstanceRecord): InstanceRecord {
@@ -92,7 +102,8 @@ export class OrchestratorSupervisor {
 		live.unsubscribeExit?.();
 		live.unsubscribeEvents = undefined;
 		live.unsubscribeExit = undefined;
-		live.onUiRequest = undefined;
+		live.uiSubscribers.clear();
+		live.pendingUiRequests.clear();
 		live.resources.rpcProcess?.setUiRequestHandler(undefined);
 	}
 
@@ -108,7 +119,12 @@ export class OrchestratorSupervisor {
 			void this.handleUnexpectedRpcExit(live, error);
 		});
 		rpcProcess.setUiRequestHandler((request) => {
-			live.onUiRequest?.(request);
+			if (isPendingUiRequest(request)) {
+				live.pendingUiRequests.set(request.id, request);
+			}
+			for (const subscriber of live.uiSubscribers) {
+				subscriber(request);
+			}
 		});
 	}
 
@@ -211,7 +227,10 @@ export class OrchestratorSupervisor {
 			return undefined;
 		}
 		live.subscribers.add(onEvent);
-		live.onUiRequest = onUiRequest;
+		live.uiSubscribers.add(onUiRequest);
+		for (const request of live.pendingUiRequests.values()) {
+			onUiRequest(request);
+		}
 		return {
 			handleRpc: async (command) => {
 				const response = await rpcProcess.send(command);
@@ -221,12 +240,11 @@ export class OrchestratorSupervisor {
 				return response;
 			},
 			handleUiResponse: (response) => {
+				live.pendingUiRequests.delete(response.id);
 				rpcProcess.handleUiResponse(response);
 			},
 			close: () => {
-				if (live.onUiRequest === onUiRequest) {
-					live.onUiRequest = undefined;
-				}
+				live.uiSubscribers.delete(onUiRequest);
 				live.subscribers.delete(onEvent);
 			},
 		};
@@ -267,7 +285,7 @@ export class OrchestratorSupervisor {
 		return stored ? cloneInstance(stored) : undefined;
 	}
 
-	async spawnInstance(options: { cwd: string; label?: string }): Promise<InstanceRecord> {
+	async spawnInstance(options: { cwd: string; label?: string; approveProject?: boolean }): Promise<InstanceRecord> {
 		const now = new Date().toISOString();
 		const live: LiveInstance = {
 			record: {
@@ -280,12 +298,17 @@ export class OrchestratorSupervisor {
 			},
 			resources: {},
 			subscribers: new Set(),
+			uiSubscribers: new Set(),
+			pendingUiRequests: new Map(),
 		};
 		this.liveInstances.set(live.record.id, live);
 		upsertInstance(live.record);
 
 		try {
-			const rpcProcess = createRpcProcessInstance({ cwd: options.cwd });
+			const rpcProcess = createRpcProcessInstance({
+				cwd: options.cwd,
+				approveProject: options.approveProject,
+			});
 			this.bindRpcProcess(live, rpcProcess);
 			await this.syncInstanceRecord(live);
 			const registeredRecord = await radiusPresence.registerPi(live.record);
@@ -300,7 +323,16 @@ export class OrchestratorSupervisor {
 	async stopInstance(instanceId: string): Promise<InstanceRecord | undefined> {
 		const live = this.liveInstances.get(instanceId);
 		if (!live) {
-			return undefined;
+			const stored = getInstance(instanceId);
+			if (!stored) {
+				return undefined;
+			}
+			removeInstance(instanceId);
+			return {
+				...stored,
+				status: "stopped",
+				lastSeenAt: new Date().toISOString(),
+			};
 		}
 
 		this.setStatus(live, "stopping");
@@ -333,8 +365,21 @@ export class OrchestratorSupervisor {
 	}
 
 	async shutdown(): Promise<void> {
-		for (const instanceId of [...this.liveInstances.keys()]) {
-			await this.stopInstance(instanceId);
+		for (const live of [...this.liveInstances.values()]) {
+			this.setStatus(live, "stopping");
+			try {
+				await this.cleanupAcquiredResources(live);
+			} catch (error) {
+				console.error(`Failed to cleanly suspend Pi ${live.record.id}: ${String(error)}`);
+			} finally {
+				live.record = {
+					...live.record,
+					status: "stopped",
+					lastSeenAt: new Date().toISOString(),
+				};
+				upsertInstance(live.record);
+				this.liveInstances.delete(live.record.id);
+			}
 		}
 	}
 }
