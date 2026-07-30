@@ -21,6 +21,11 @@ import {
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type { ImageContent, Models, TextContent } from "@earendil-works/pi-ai";
 import { AgentHarnessSessionStorageAdapter } from "./agent-harness-session-adapter.ts";
+import {
+	type CodingAgentRecoveryReport,
+	createCodingAgentRecoveryReport,
+	setCodingAgentRecoveryReport,
+} from "./harness-recovery-report.ts";
 import type { SessionManager } from "./session-manager.ts";
 
 export interface CodingAgentHarnessRuntimeOptions extends AgentOptions {
@@ -90,6 +95,7 @@ export class CodingAgentHarnessRuntime extends Agent {
 	private lastTurnEnd?: Extract<AgentEvent, { type: "turn_end" }>;
 	private activeLoopContext?: AgentContext;
 	private currentRunMessages?: AgentMessage[];
+	private recoveryReport?: CodingAgentRecoveryReport;
 
 	constructor(options: CodingAgentHarnessRuntimeOptions) {
 		super(options);
@@ -152,6 +158,10 @@ export class CodingAgentHarnessRuntime extends Agent {
 		return this.projectedState;
 	}
 
+	getRecoveryReport(): CodingAgentRecoveryReport | undefined {
+		return this.recoveryReport ? structuredClone(this.recoveryReport) : undefined;
+	}
+
 	get harness(): AgentHarness {
 		if (!this.harnessRuntime) throw new Error("CodingAgentHarnessRuntime has not been initialized");
 		return this.harnessRuntime;
@@ -181,6 +191,12 @@ export class CodingAgentHarnessRuntime extends Agent {
 			toolPolicy: this.toolPolicy,
 		});
 		this.harnessRuntime = restored.harness;
+		const runtimeEvents = restored.harness.runtimeEvents;
+		if (!runtimeEvents) {
+			throw new Error("Restored AgentHarness is missing its runtime event store");
+		}
+		this.recoveryReport = createCodingAgentRecoveryReport(restored.recovery, runtimeEvents.getState());
+		setCodingAgentRecoveryReport(this.sessionManager, this.recoveryReport);
 		this.state.model = this.harness.getModel();
 		this.state.thinkingLevel = this.harness.getThinkingLevel();
 		this.state.tools = this.harness.getActiveTools();

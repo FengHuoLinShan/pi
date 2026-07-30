@@ -85,6 +85,7 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export * from "./harness-recovery-report.ts";
 export * from "./process-session-verifier.ts";
 export * from "./shadow-runs.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";
