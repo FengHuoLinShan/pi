@@ -1,5 +1,26 @@
-import { describe, expect, it } from "vitest";
-import { parseManagedJobsConfig } from "../src/extensions/managed-jobs/config.ts";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+	loadManagedJobsConfig,
+	MANAGED_JOBS_CONFIG_PATH,
+	parseManagedJobsConfig,
+} from "../src/extensions/managed-jobs/config.ts";
+
+const temporaryDirectories: string[] = [];
+
+async function createWorkspace(): Promise<string> {
+	const workspace = await mkdtemp(join(tmpdir(), "pi-managed-jobs-config-"));
+	temporaryDirectories.push(workspace);
+	await mkdir(join(workspace, ".pi"));
+	return workspace;
+}
+
+afterEach(async () => {
+	await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
 
 function validConfig(): unknown {
 	return {
@@ -102,5 +123,30 @@ describe("managed jobs config", () => {
 				recipes: [{ id: "dev", command: "npm", readiness: { contains: "ready", timeoutSeconds: 31 } }],
 			}),
 		).toThrow("timeoutSeconds must be a safe integer between 1 and 30");
+	});
+
+	it("loads a bounded regular project config with a stable source revision", async () => {
+		const workspace = await createWorkspace();
+		const source = `${JSON.stringify(validConfig())}\n`;
+		await writeFile(join(workspace, MANAGED_JOBS_CONFIG_PATH), source, "utf8");
+
+		const loaded = await loadManagedJobsConfig(workspace);
+
+		expect(loaded.config).toEqual(validConfig());
+		expect(loaded.revision).toBe(createHash("sha256").update(source).digest("hex"));
+	});
+
+	it("rejects symbolic links and oversized project configs", async () => {
+		const workspace = await createWorkspace();
+		const outside = join(workspace, "outside.json");
+		const configPath = join(workspace, MANAGED_JOBS_CONFIG_PATH);
+		await writeFile(outside, JSON.stringify(validConfig()), "utf8");
+		await symlink(outside, configPath);
+
+		await expect(loadManagedJobsConfig(workspace)).rejects.toThrow("must be a regular non-symbolic-link file");
+
+		await rm(configPath);
+		await writeFile(configPath, " ".repeat(256 * 1024 + 1), "utf8");
+		await expect(loadManagedJobsConfig(workspace)).rejects.toThrow("exceeds 262144 bytes");
 	});
 });

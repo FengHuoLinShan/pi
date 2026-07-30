@@ -1,6 +1,12 @@
+import { createHash } from "node:crypto";
+import { lstat, readFile, realpath } from "node:fs/promises";
+import { join } from "node:path";
+import { captureFilePathSnapshot, revalidateFilePathSnapshot } from "../../core/tools/file-transaction.ts";
+
 export const MANAGED_JOBS_CONFIG_VERSION = 1 as const;
 export const MANAGED_JOBS_CONFIG_PATH = ".pi/managed-jobs.json";
 
+const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_RECIPES = 16;
 const MAX_COMMAND_LENGTH = 4_096;
 const MAX_ARGUMENTS = 64;
@@ -25,6 +31,11 @@ export interface ManagedJobRecipeConfig {
 export interface ManagedJobsConfig {
 	version: typeof MANAGED_JOBS_CONFIG_VERSION;
 	recipes: ManagedJobRecipeConfig[];
+}
+
+export interface LoadedManagedJobsConfig {
+	config: ManagedJobsConfig;
+	revision: string;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -124,4 +135,34 @@ export function parseManagedJobsConfig(value: unknown): ManagedJobsConfig {
 		throw new Error("recipe ids must be unique");
 	}
 	return { version: MANAGED_JOBS_CONFIG_VERSION, recipes };
+}
+
+export async function loadManagedJobsConfig(cwd: string): Promise<LoadedManagedJobsConfig> {
+	const path = join(cwd, MANAGED_JOBS_CONFIG_PATH);
+	const info = await lstat(path);
+	if (!info.isFile() || info.isSymbolicLink()) {
+		throw new Error(`${MANAGED_JOBS_CONFIG_PATH} must be a regular non-symbolic-link file`);
+	}
+	if (info.size > MAX_CONFIG_BYTES) {
+		throw new Error(`${MANAGED_JOBS_CONFIG_PATH} exceeds ${MAX_CONFIG_BYTES} bytes`);
+	}
+	const snapshot = await captureFilePathSnapshot(path, MANAGED_JOBS_CONFIG_PATH, [cwd], realpath, true);
+	await revalidateFilePathSnapshot(snapshot, MANAGED_JOBS_CONFIG_PATH, [cwd], realpath);
+	const source = await readFile(snapshot.targetPath);
+	await revalidateFilePathSnapshot(snapshot, MANAGED_JOBS_CONFIG_PATH, [cwd], realpath);
+	if (source.byteLength > MAX_CONFIG_BYTES) {
+		throw new Error(`${MANAGED_JOBS_CONFIG_PATH} exceeds ${MAX_CONFIG_BYTES} bytes`);
+	}
+	let value: unknown;
+	try {
+		value = JSON.parse(source.toString("utf8")) as unknown;
+	} catch (error) {
+		throw new Error(
+			`cannot parse ${MANAGED_JOBS_CONFIG_PATH}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	return {
+		config: parseManagedJobsConfig(value),
+		revision: createHash("sha256").update(source).digest("hex"),
+	};
 }
