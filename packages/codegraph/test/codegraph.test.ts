@@ -9,7 +9,7 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import codeGraphExtension from "../src/extension.ts";
 import { openTypeScriptCodeGraph, type TypeScriptCodeGraph } from "../src/service.ts";
 
@@ -111,6 +111,7 @@ describe("TypeScriptCodeGraph", () => {
 		const baseDependents = graph.dependents(base.node.id, { maxDepth: 1 });
 		expect(baseDependents.paths.some((path) => path.nodes[1]?.id === child.node.id)).toBe(true);
 		expect(graph.nodeIdsForFile("consumer.ts")).toContain(child.node.id);
+		expect(graph.impactMap(["base.ts"]).affectedFiles).toEqual(["base.ts", "consumer.ts"]);
 		await graph.dispose();
 	});
 
@@ -236,7 +237,10 @@ describe("TypeScriptCodeGraph", () => {
 		} as unknown as ExtensionAPI);
 		if (!tool) throw new Error("Code graph extension did not register its tool");
 		const registeredTool = tool;
-		const context = { cwd: fixture.workspaceRoot } as ExtensionContext;
+		const context = {
+			cwd: fixture.cacheDir,
+			workspace: { logicalRoot: fixture.workspaceRoot, execution: { target: "host" } },
+		} as ExtensionContext;
 		const execute = (params: { action: string; query?: string }) =>
 			registeredTool.execute("test", params as never, undefined, undefined, context);
 
@@ -245,6 +249,88 @@ describe("TypeScriptCodeGraph", () => {
 			await expect(execute({ action: "dependencies", query: "run" })).rejects.toThrow(/ambiguous/);
 			await writeFile(join(fixture.workspaceRoot, "tsconfig.json"), "{ invalid after the index is ready");
 			await expect(execute({ action: "search", query: "Child" })).resolves.toBeDefined();
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		}
+	});
+
+	it("plans and executes trusted PatchSet verification from the check catalog", async () => {
+		const fixture = await createFixture();
+		await mkdir(join(fixture.workspaceRoot, ".pi"));
+		await writeFile(
+			join(fixture.workspaceRoot, ".pi", "checks.json"),
+			JSON.stringify({
+				version: 1,
+				checks: [
+					{
+						id: "base-check",
+						command: "node",
+						args: ["base-check.mjs"],
+						selection: { mode: "direct", paths: ["base.ts"] },
+					},
+					{
+						id: "consumer-check",
+						command: "node",
+						args: ["consumer-check.mjs"],
+						selection: { mode: "affected", paths: ["consumer.ts"] },
+					},
+					{
+						id: "full-suite",
+						command: "./test.sh",
+						selection: { mode: "fallback" },
+					},
+				],
+			}),
+		);
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = fixture.cacheDir;
+		let tool: ToolDefinition | undefined;
+		const exec = vi.fn(async () => ({ stdout: "ok", stderr: "", code: 0, killed: false }));
+		codeGraphExtension({
+			exec,
+			registerTool(definition: ToolDefinition) {
+				tool = definition;
+			},
+			on() {},
+		} as unknown as ExtensionAPI);
+		if (!tool) throw new Error("Code graph extension did not register its tool");
+		const context = {
+			cwd: fixture.workspaceRoot,
+			isProjectTrusted: () => true,
+			workspace: {
+				sourceRoot: fixture.workspaceRoot,
+				logicalRoot: fixture.workspaceRoot,
+				execution: { target: "host" },
+			},
+		} as ExtensionContext;
+
+		try {
+			const result = await tool.execute(
+				"verify",
+				{ action: "verify", paths: ["base.ts"], objective: "verify base change" } as never,
+				undefined,
+				undefined,
+				context,
+			);
+			expect(result.details).toMatchObject({
+				status: "pass",
+				plan: {
+					coverage: "complete",
+					selected: [{ check: { id: "base-check" } }, { check: { id: "consumer-check" } }],
+				},
+				evidence: {
+					id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+					selectedCheckIds: ["base-check", "consumer-check"],
+				},
+			});
+			expect(exec).toHaveBeenCalledTimes(2);
+			expect(exec).toHaveBeenNthCalledWith(
+				2,
+				"node",
+				["consumer-check.mjs"],
+				expect.objectContaining({ cwd: fixture.workspaceRoot }),
+			);
 		} finally {
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -316,6 +402,54 @@ describe("TypeScriptCodeGraph", () => {
 		await graph.dispose();
 	});
 
+	it("indexes Python, Go, and Rust with conservative cross-file import impact", async () => {
+		const fixture = await createFixture();
+		await Promise.all([
+			mkdir(join(fixture.workspaceRoot, "py")),
+			mkdir(join(fixture.workspaceRoot, "cmd")),
+			mkdir(join(fixture.workspaceRoot, "internal", "lib"), { recursive: true }),
+			mkdir(join(fixture.workspaceRoot, "src")),
+		]);
+		await Promise.all([
+			writeFile(join(fixture.workspaceRoot, "py", "base.py"), "class PyBase:\n    pass\n"),
+			writeFile(
+				join(fixture.workspaceRoot, "py", "consumer.py"),
+				"from .base import PyBase\n\ndef use_base():\n    return PyBase()\n",
+			),
+			writeFile(join(fixture.workspaceRoot, "go.mod"), "module example.com/project\n\ngo 1.24\n"),
+			writeFile(
+				join(fixture.workspaceRoot, "cmd", "main.go"),
+				'package main\n\nimport "example.com/project/internal/lib"\n\nfunc main() {}\n',
+			),
+			writeFile(join(fixture.workspaceRoot, "internal", "lib", "value.go"), "package lib\n\ntype Value struct{}\n"),
+			writeFile(
+				join(fixture.workspaceRoot, "src", "lib.rs"),
+				"pub mod engine;\nuse crate::engine::Engine;\n\npub fn start() -> Engine { Engine {} }\n",
+			),
+			writeFile(join(fixture.workspaceRoot, "src", "engine.rs"), "pub struct Engine {}\n"),
+		]);
+		const graph = await openTypeScriptCodeGraph(fixture);
+		const sync = await graph.sync();
+
+		expect(sync.status.fileCount).toBe(8);
+		expect(sync.status.adapters).toEqual([
+			expect.objectContaining({ id: "typescript-compiler", precision: "semantic", fileCount: 2 }),
+			expect.objectContaining({ id: "python-structural", fileCount: 2 }),
+			expect.objectContaining({ id: "go-structural", fileCount: 2 }),
+			expect.objectContaining({ id: "rust-structural", fileCount: 2 }),
+		]);
+		expect(graph.search("PyBase")[0]?.node.filePath).toBe("py/base.py");
+		expect(graph.search("Value")[0]?.node.filePath).toBe("internal/lib/value.go");
+		expect(graph.search("Engine")[0]?.node.filePath).toBe("src/engine.rs");
+		expect(graph.impactMap(["py/base.py"]).affectedFiles).toEqual(["py/base.py", "py/consumer.py"]);
+		expect(graph.impactMap(["internal/lib/value.go"]).affectedFiles).toEqual([
+			"cmd/main.go",
+			"internal/lib/value.go",
+		]);
+		expect(graph.impactMap(["src/engine.rs"]).affectedFiles).toEqual(["src/engine.rs", "src/lib.rs"]);
+		await graph.dispose();
+	});
+
 	it("keeps failed cache commits out of the active graph and retries them", async () => {
 		const fixture = await createFixture();
 		const blockedCachePath = join(fixture.workspaceRoot, "blocked-cache");
@@ -349,6 +483,43 @@ describe("TypeScriptCodeGraph", () => {
 		await expect(graph.sync()).rejects.toThrow(/disposed/);
 		await Promise.all([finalSync, disposing]);
 		expect(graph.status().state).toBe("disposed");
+	});
+
+	it("preserves invalidations raised while synchronization is in progress", async () => {
+		const fixture = await createFixture();
+		const graph = await openTypeScriptCodeGraph(fixture);
+		await graph.sync();
+
+		const syncing = graph.sync({ force: true });
+		graph.markDirty(["base.ts"]);
+		await syncing;
+		expect(graph.status().dirty).toBe(true);
+
+		const followUp = await graph.sync();
+		expect(followUp.updated).toBe(false);
+		expect(followUp.status.dirty).toBe(false);
+		await graph.dispose();
+	});
+
+	it("fails closed when the workspace is only visible inside an execution boundary", async () => {
+		let tool: ToolDefinition | undefined;
+		codeGraphExtension({
+			registerTool(definition: ToolDefinition) {
+				tool = definition;
+			},
+			on() {},
+		} as unknown as ExtensionAPI);
+		if (!tool) throw new Error("Code graph extension did not register its tool");
+		const context = {
+			workspace: {
+				logicalRoot: "/workspace",
+				execution: { target: "boundary" },
+			},
+		} as ExtensionContext;
+
+		await expect(
+			tool.execute("status", { action: "status" } as never, undefined, undefined, context),
+		).rejects.toThrow(/unavailable for execution-boundary workspaces/);
 	});
 
 	it("rejects TypeScript configuration paths outside the workspace", async () => {

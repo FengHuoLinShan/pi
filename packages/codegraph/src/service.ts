@@ -3,18 +3,31 @@ import { realpathSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import {
+	buildCodeImpactMap,
 	type CodeGraphEdge,
 	CodeGraphError,
+	type CodeGraphExtraction,
 	type CodeGraphNode,
 	type CodeGraphPath,
 	type CodeGraphQueryOptions,
 	type CodeGraphQueryResult,
 	type CodeGraphSnapshot,
+	type CodeImpactMap,
 	computeCodeGraphFileRevision,
 	getAgentDir,
 	IncrementalCodeGraph,
 } from "@earendil-works/pi-coding-agent";
 import ts from "typescript";
+import {
+	extractSourceLanguageFile,
+	isSupportedSourceLanguageFile,
+	parseGoModulePath,
+	SOURCE_LANGUAGE_ADAPTER_DESCRIPTORS,
+	SOURCE_LANGUAGE_ADAPTER_VERSION,
+	SOURCE_LANGUAGE_EXTENSIONS,
+	type SourceLanguageFile,
+	type SourceLanguageProject,
+} from "./language-adapters.ts";
 import {
 	extractTypeScriptProgram,
 	isSupportedTypeScriptFile,
@@ -27,6 +40,16 @@ const CACHE_FILE_NAME = "index.json";
 const LOCK_STALE_MS = 10_000;
 const LOCK_RETRY_COUNT = 800;
 const LOCK_RETRY_MS = 25;
+const PARSER_VERSION = `${ts.version};${SOURCE_LANGUAGE_ADAPTER_VERSION}`;
+const SOURCE_EXCLUDES = [
+	"**/node_modules/**",
+	"**/.git/**",
+	"**/dist/**",
+	"**/build/**",
+	"**/.next/**",
+	"**/coverage/**",
+	"**/vendor/**",
+] as const;
 
 export type TypeScriptCodeGraphState = "idle" | "stale" | "indexing" | "ready" | "degraded" | "failed" | "disposed";
 
@@ -47,7 +70,15 @@ export interface TypeScriptCodeGraphStatus {
 	edgeCount: number;
 	dirty: boolean;
 	cacheRestored: boolean;
+	adapters: TypeScriptCodeGraphAdapterStatus[];
 	diagnostics: string[];
+}
+
+export interface TypeScriptCodeGraphAdapterStatus {
+	id: string;
+	language: string;
+	precision: "semantic" | "structural";
+	fileCount: number;
 }
 
 export interface TypeScriptCodeGraphSyncResult {
@@ -112,6 +143,10 @@ function compareStrings(left: string, right: string): number {
 	return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function isSupportedCodeGraphFile(fileName: string): boolean {
+	return isSupportedTypeScriptFile(fileName) || isSupportedSourceLanguageFile(fileName);
+}
+
 function formatDiagnostic(diagnostic: ts.Diagnostic): string {
 	const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n");
 	if (!diagnostic.file || diagnostic.start === undefined) return message;
@@ -125,6 +160,33 @@ function workspaceHash(workspaceRoot: string): string {
 
 function defaultCacheDir(workspaceRoot: string): string {
 	return join(getAgentDir(), "cache", "codegraph-v1", workspaceHash(workspaceRoot));
+}
+
+async function readOptionalFile(path: string): Promise<string | undefined> {
+	try {
+		return await readFile(path, "utf8");
+	} catch (error) {
+		const code = error instanceof Error && "code" in error ? error.code : undefined;
+		if (code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+async function readSourceLanguageProject(workspaceRoot: string): Promise<SourceLanguageProject> {
+	const paths = ts.sys
+		.readDirectory(workspaceRoot, [...SOURCE_LANGUAGE_EXTENSIONS], [...SOURCE_EXCLUDES], ["**/*"])
+		.map((path) => resolve(path))
+		.sort(compareStrings);
+	const files: SourceLanguageFile[] = [];
+	for (const path of paths) {
+		const workspacePath = toWorkspaceRelativePath(workspaceRoot, path);
+		if (!workspacePath || !isSupportedSourceLanguageFile(workspacePath)) continue;
+		files.push({ path: workspacePath, content: await readFile(path, "utf8") });
+	}
+	return {
+		files,
+		goModulePath: parseGoModulePath(await readOptionalFile(join(workspaceRoot, "go.mod"))),
+	};
 }
 
 function assertNotAborted(signal: AbortSignal | undefined): void {
@@ -207,12 +269,7 @@ function readConfiguration(workspaceRoot: string, requestedPath: string | undefi
 
 	if (!configPath) {
 		const rootNames = ts.sys
-			.readDirectory(
-				workspaceRoot,
-				[...TYPESCRIPT_CODE_GRAPH_EXTENSIONS],
-				["**/node_modules/**", "**/.git/**", "**/dist/**", "**/build/**", "**/.next/**", "**/coverage/**"],
-				["**/*"],
-			)
+			.readDirectory(workspaceRoot, [...TYPESCRIPT_CODE_GRAPH_EXTENSIONS], [...SOURCE_EXCLUDES], ["**/*"])
 			.filter(isSupportedTypeScriptFile)
 			.map((fileName) => resolve(fileName))
 			.sort(compareStrings);
@@ -227,7 +284,7 @@ function readConfiguration(workspaceRoot: string, requestedPath: string | undefi
 			target: ts.ScriptTarget.ES2022,
 		};
 		const fingerprint = createHash("sha256")
-			.update(JSON.stringify({ parserVersion: ts.version, options }))
+			.update(JSON.stringify({ parserVersion: PARSER_VERSION, options }))
 			.digest("hex");
 		return { rootNames, options, fingerprint, diagnostics: [] };
 	}
@@ -249,7 +306,7 @@ function readConfiguration(workspaceRoot: string, requestedPath: string | undefi
 	const fingerprint = createHash("sha256")
 		.update(
 			JSON.stringify({
-				parserVersion: ts.version,
+				parserVersion: PARSER_VERSION,
 				configPath: portablePath(relative(workspaceRoot, configPath)),
 				config: readResult.config,
 				options: parsed.options,
@@ -272,7 +329,7 @@ function isCachePayload(value: unknown): value is CodeGraphCachePayload {
 	const payload = value as Partial<CodeGraphCachePayload>;
 	return (
 		payload.version === CACHE_VERSION &&
-		payload.parserVersion === ts.version &&
+		payload.parserVersion === PARSER_VERSION &&
 		typeof payload.configFingerprint === "string" &&
 		typeof payload.graph === "object" &&
 		payload.graph !== null
@@ -335,6 +392,7 @@ export class TypeScriptCodeGraph {
 	private state: TypeScriptCodeGraphState = "idle";
 	private dirty = true;
 	private invalidateAll = false;
+	private invalidationVersion = 0;
 	private cacheRestored = false;
 	private diagnostics: string[] = [];
 	private syncPromise: Promise<TypeScriptCodeGraphSyncResult> | undefined;
@@ -368,6 +426,7 @@ export class TypeScriptCodeGraph {
 
 	status(): TypeScriptCodeGraphStatus {
 		const counts = this.graph.getCounts();
+		const files = this.graph.snapshot().files;
 		return {
 			state: this.state,
 			workspaceRoot: this.workspaceRoot,
@@ -377,6 +436,21 @@ export class TypeScriptCodeGraph {
 			...counts,
 			dirty: this.dirty,
 			cacheRestored: this.cacheRestored,
+			adapters: [
+				{
+					id: "typescript-compiler",
+					language: "typescript/javascript",
+					precision: "semantic",
+					fileCount: files.filter((file) => isSupportedTypeScriptFile(file.path)).length,
+				},
+				...SOURCE_LANGUAGE_ADAPTER_DESCRIPTORS.map((adapter) => ({
+					id: adapter.id,
+					language: adapter.language,
+					precision: adapter.precision,
+					fileCount: files.filter((file) => adapter.extensions.some((extension) => file.path.endsWith(extension)))
+						.length,
+				})),
+			],
 			diagnostics: [...this.diagnostics],
 		};
 	}
@@ -384,7 +458,8 @@ export class TypeScriptCodeGraph {
 	markDirty(paths?: readonly string[]): void {
 		this.assertUsable();
 		this.dirty = true;
-		if (!paths || paths.some((path) => !isSupportedTypeScriptFile(path))) this.invalidateAll = true;
+		this.invalidationVersion++;
+		if (!paths || paths.some((path) => !isSupportedCodeGraphFile(path))) this.invalidateAll = true;
 	}
 
 	async sync(options: { force?: boolean; signal?: AbortSignal } = {}): Promise<TypeScriptCodeGraphSyncResult> {
@@ -435,6 +510,11 @@ export class TypeScriptCodeGraph {
 		return this.resolveQuery(this.graph.findImpactPaths(nodeIds, options));
 	}
 
+	impactMap(paths: readonly string[], options?: CodeGraphQueryOptions): CodeImpactMap {
+		this.assertQueryable();
+		return buildCodeImpactMap(this.graph.snapshot(), paths, options);
+	}
+
 	nodeIdsForFile(path: string): string[] {
 		this.assertQueryable();
 		const absolutePath = isAbsolute(path) ? resolve(path) : resolve(this.workspaceRoot, path);
@@ -474,6 +554,8 @@ export class TypeScriptCodeGraph {
 	}): Promise<TypeScriptCodeGraphSyncResult> {
 		const startedAt = performance.now();
 		const previousState = this.state;
+		const invalidationVersion = this.invalidationVersion;
+		const invalidateAll = this.invalidateAll;
 		this.state = "indexing";
 		try {
 			assertNotAborted(options.signal);
@@ -484,8 +566,18 @@ export class TypeScriptCodeGraph {
 				projectReferences: configuration.projectReferences,
 				oldProgram: this.program,
 			});
+			const sourceLanguageProject = await readSourceLanguageProject(this.workspaceRoot);
+			const configFingerprint = createHash("sha256")
+				.update(
+					JSON.stringify({
+						typescript: configuration.fingerprint,
+						sourceAdapters: SOURCE_LANGUAGE_ADAPTER_VERSION,
+						goModulePath: sourceLanguageProject.goModulePath,
+					}),
+				)
+				.digest("hex");
 			assertNotAborted(options.signal);
-			const sourceFiles = program
+			const typeScriptSourceFiles = program
 				.getSourceFiles()
 				.map((sourceFile) => ({
 					sourceFile,
@@ -496,12 +588,16 @@ export class TypeScriptCodeGraph {
 						value.filePath !== undefined && isSupportedTypeScriptFile(value.filePath),
 				)
 				.sort((left, right) => compareStrings(left.filePath, right.filePath));
-			const revisions = new Map(
-				sourceFiles.map(({ sourceFile, filePath }) => [filePath, computeCodeGraphFileRevision(sourceFile.text)]),
-			);
+			const revisions = new Map<string, ReturnType<typeof computeCodeGraphFileRevision>>();
+			for (const { sourceFile, filePath } of typeScriptSourceFiles) {
+				revisions.set(filePath, computeCodeGraphFileRevision(sourceFile.text));
+			}
+			for (const file of sourceLanguageProject.files) {
+				revisions.set(file.path, computeCodeGraphFileRevision(file.content));
+			}
 			const previousSnapshot = this.graph.snapshot();
 			const cachedRevisions = new Map(previousSnapshot.files.map((file) => [file.path, file.revision]));
-			const configurationChanged = configuration.fingerprint !== this.configFingerprint;
+			const configurationChanged = configFingerprint !== this.configFingerprint;
 			const directlyChanged = new Set<string>();
 			const addedFiles = new Set<string>();
 			for (const [filePath, revision] of revisions) {
@@ -513,7 +609,7 @@ export class TypeScriptCodeGraph {
 			for (const filePath of cachedRevisions.keys()) {
 				if (!revisions.has(filePath)) directlyChanged.add(filePath);
 			}
-			const reindexAll = (options.force ?? false) || configurationChanged || this.invalidateAll;
+			const reindexAll = (options.force ?? false) || configurationChanged || invalidateAll;
 			const affected = reindexAll
 				? new Set([...cachedRevisions.keys(), ...revisions.keys()])
 				: expandAffectedFiles(previousSnapshot, directlyChanged, addedFiles);
@@ -522,12 +618,19 @@ export class TypeScriptCodeGraph {
 			let diagnostics = [...configuration.diagnostics];
 			if (needsCommit) {
 				const currentAffected = new Set([...affected].filter((filePath) => revisions.has(filePath)));
-				const extraction = extractTypeScriptProgram(program, this.workspaceRoot, currentAffected);
-				diagnostics = [...diagnostics, ...extraction.diagnostics].slice(0, 100);
+				const typeScriptAffected = new Set([...currentAffected].filter(isSupportedTypeScriptFile));
+				const typeScriptExtraction = extractTypeScriptProgram(program, this.workspaceRoot, typeScriptAffected);
+				const extractions = new Map<string, CodeGraphExtraction>(typeScriptExtraction.extractions);
+				diagnostics = [...diagnostics, ...typeScriptExtraction.diagnostics].slice(0, 100);
+				for (const file of sourceLanguageProject.files) {
+					if (!currentAffected.has(file.path)) continue;
+					const extraction = extractSourceLanguageFile(file, sourceLanguageProject);
+					if (extraction) extractions.set(file.path, extraction);
+				}
 				const removals = [...affected].filter((path) => !revisions.has(path)).sort(compareStrings);
 				const upserts = [...currentAffected].sort(compareStrings).map((filePath) => {
 					const revision = revisions.get(filePath);
-					const fileExtraction = extraction.extractions.get(filePath);
+					const fileExtraction = extractions.get(filePath);
 					if (!revision || !fileExtraction) {
 						throw new Error(`Code graph extractor omitted affected file: ${filePath}`);
 					}
@@ -547,9 +650,9 @@ export class TypeScriptCodeGraph {
 						extraction: fileExtraction,
 					});
 				}
-				await this.persistCache(stagedGraph, configuration.fingerprint);
+				await this.persistCache(stagedGraph, configFingerprint);
 				this.graph = stagedGraph;
-				this.configFingerprint = configuration.fingerprint;
+				this.configFingerprint = configFingerprint;
 				updated = true;
 			} else {
 				diagnostics = [
@@ -560,8 +663,10 @@ export class TypeScriptCodeGraph {
 			this.program = program;
 			this.configPath = configuration.configPath;
 			this.diagnostics = diagnostics;
-			this.dirty = false;
-			this.invalidateAll = false;
+			if (this.invalidationVersion === invalidationVersion) {
+				this.dirty = false;
+				this.invalidateAll = false;
+			}
 			this.state = diagnostics.length > 0 ? "degraded" : "ready";
 			return {
 				updated,
@@ -580,7 +685,7 @@ export class TypeScriptCodeGraph {
 		await mkdir(this.cacheDir, { recursive: true });
 		const payload: CodeGraphCachePayload = {
 			version: CACHE_VERSION,
-			parserVersion: ts.version,
+			parserVersion: PARSER_VERSION,
 			configFingerprint,
 			graph: graph.snapshot(),
 		};

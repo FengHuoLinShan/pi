@@ -1,4 +1,10 @@
-import type { CodeGraphQueryOptions, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	type CodeGraphQueryOptions,
+	type ExtensionAPI,
+	loadImpactVerificationCatalog,
+	planImpactVerification,
+	verifyImpactPlan,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
 	type CodeGraphResolvedQueryResult,
@@ -15,6 +21,8 @@ const ACTIONS = Type.Union([
 	Type.Literal("dependencies"),
 	Type.Literal("dependents"),
 	Type.Literal("impact"),
+	Type.Literal("plan_verification"),
+	Type.Literal("verify"),
 ]);
 
 const CODE_GRAPH_PARAMETERS = Type.Object({
@@ -22,6 +30,14 @@ const CODE_GRAPH_PARAMETERS = Type.Object({
 	query: Type.Optional(Type.String({ description: "Symbol search query. Used when nodeId is omitted." })),
 	nodeId: Type.Optional(Type.String({ description: "Exact graph node id returned by search." })),
 	path: Type.Optional(Type.String({ description: "Workspace-relative file path for impact analysis." })),
+	paths: Type.Optional(
+		Type.Array(Type.String(), {
+			minItems: 1,
+			maxItems: 100,
+			description: "Workspace-relative PatchSet paths for impact-aware verification.",
+		}),
+	),
+	objective: Type.Optional(Type.String({ description: "Verification objective recorded in the completion report." })),
 	kinds: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
 	edgeKinds: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
@@ -140,16 +156,23 @@ export default function codeGraphExtension(pi: ExtensionAPI): void {
 		name: "code_graph",
 		label: "Code Graph",
 		description:
-			"Index and query TypeScript/JavaScript symbols and relationships. Supports status, sync, reindex, search, dependencies, dependents, and impact.",
-		promptSnippet: "Search code symbols and trace dependency or impact paths with source evidence",
+			"Index and query TypeScript, JavaScript, Python, Go, and Rust symbols and relationships. Also plans and executes repository-aware checks from .pi/checks.json for supplied PatchSet paths.",
+		promptSnippet: "Search symbols, trace impact paths, or verify a PatchSet with repository-aware checks",
 		promptGuidelines: [
-			"Use code_graph search before broad repository scans when locating TypeScript or JavaScript symbols.",
+			"Use code_graph search before broad repository scans when locating symbols in supported languages.",
+			"Treat Python, Go, and Rust results as structural declarations and imports; confirm semantic call relationships from source.",
 			"Use code_graph impact before modifying shared symbols, then confirm evidence by reading the returned file locations.",
+			"Use code_graph plan_verification or verify with the complete changed-path list when .pi/checks.json defines repository checks.",
 		],
 		parameters: CODE_GRAPH_PARAMETERS,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const graph = await getService(ctx.cwd);
+			if (ctx.workspace.execution.target !== "host") {
+				throw new Error(
+					"Code graph is unavailable for execution-boundary workspaces because extensions cannot read boundary paths",
+				);
+			}
+			const graph = await getService(ctx.workspace.logicalRoot);
 			if (params.action === "status") return textResult(graph.status());
 			if (params.action === "sync" || params.action === "reindex") {
 				return textResult(await graph.sync({ force: params.action === "reindex", signal }));
@@ -163,6 +186,30 @@ export default function codeGraphExtension(pi: ExtensionAPI): void {
 				return textResult({
 					matches: compactMatches(graph.search(params.query, { limit: params.limit, kinds: params.kinds })),
 				});
+			}
+			if (params.action === "plan_verification" || params.action === "verify") {
+				if (!ctx.isProjectTrusted()) {
+					throw new Error("Impact verification requires a trusted project");
+				}
+				if (!params.paths || params.paths.length === 0) {
+					throw new Error("paths is required for impact verification");
+				}
+				const catalog = await loadImpactVerificationCatalog(ctx.workspace.sourceRoot);
+				if (!catalog) throw new Error("Impact verification requires .pi/checks.json");
+				const impact = graph.impactMap(params.paths, queryOptions(params));
+				if (params.action === "plan_verification") {
+					return textResult(planImpactVerification(catalog, impact));
+				}
+				return textResult(
+					await verifyImpactPlan(
+						params.objective ?? `Verify impact of ${params.paths.join(", ")}`,
+						catalog,
+						impact,
+						ctx.workspace.logicalRoot,
+						(command, args, options) => pi.exec(command, args, options),
+						signal,
+					),
+				);
 			}
 			if (params.action === "impact" && params.path) {
 				const nodeIds = graph.nodeIdsForFile(params.path);

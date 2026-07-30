@@ -1,7 +1,7 @@
 {
 	"name": "@earendil-works/pi-codegraph",
 	"version": "0.80.10",
-	"description": "On-demand TypeScript and JavaScript code graph for pi",
+	"description": "On-demand polyglot code graph for pi",
 	"type": "module",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
@@ -32,8 +32,8 @@
 			{
 				"id": "codegraph",
 				"path": "./src/extension.ts",
-				"description": "Index and query TypeScript and JavaScript symbols, dependencies, dependents, and impact paths.",
-				"keywords": ["code", "graph", "symbol", "dependency", "impact", "typescript", "javascript"]
+				"description": "Index and query TypeScript, JavaScript, Python, Go, and Rust symbols, dependencies, dependents, and impact paths.",
+				"keywords": ["code", "graph", "symbol", "dependency", "impact", "typescript", "javascript", "python", "go", "rust"]
 			}
 		]
 	},
@@ -42,7 +42,10 @@
 		"pi",
 		"codegraph",
 		"typescript",
-		"javascript"
+		"javascript",
+		"python",
+		"go",
+		"rust"
 	],
 	"author": "Earendil Works",
 	"license": "MIT",
