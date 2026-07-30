@@ -192,7 +192,6 @@ function patchEntriesEqual(left: WorkspacePatchSetEntry, right: WorkspacePatchSe
 		left.afterByteLength === right.afterByteLength &&
 		left.beforeMode === right.beforeMode &&
 		left.afterMode === right.afterMode &&
-		left.patch === right.patch &&
 		(left.afterContent === undefined
 			? right.afterContent === undefined
 			: right.afterContent !== undefined && left.afterContent.equals(right.afterContent))

@@ -278,6 +278,50 @@ describe("shadow runs", () => {
 		}
 	});
 
+	it("does not confuse an external base change during verification with candidate mutation", async () => {
+		const workspace = createTempDir();
+		writeFileSync(join(workspace, "answer.txt"), "base");
+		const verifier: CompletionVerifier<ShadowRunVerificationContext<CandidateConfig, number>> = {
+			id: "external-change",
+			verify: ({ context }) => {
+				writeFileSync(join(context.overlay.getWorkspaceRoot(), "answer.txt"), "external");
+				return { status: "pass", summary: "Base changed externally" };
+			},
+		};
+		const report = await runShadowCandidates({
+			workspaceRoot: workspace,
+			candidates: [{ id: "candidate", config: { content: "candidate", quality: 1 } }],
+			run: async ({ candidate, overlay }) => {
+				writeFileSync(join(overlay.getWorkingDirectory(), "answer.txt"), candidate.config.content);
+				return candidate.config.quality;
+			},
+			completion: {
+				contract: {
+					version: COMPLETION_CONTRACT_VERSION,
+					id: "external",
+					objective: "Retain a candidate after an external base change",
+					conditions: [{ id: "gate", description: "External change", verifierIds: ["external-change"] }],
+				},
+				verifiers: [verifier],
+			},
+		});
+
+		try {
+			expect(report.status).toBe("completed");
+			expect(report.runs[0]).toMatchObject({
+				status: "completed",
+				completion: { status: "pass" },
+			});
+			expect(readFileSync(join(workspace, "answer.txt"), "utf8")).toBe("external");
+			await expect(applyShadowRunCandidate(report, "candidate")).rejects.toMatchObject({
+				code: "workspace_conflict",
+			});
+			expect(report.runs[0]?.overlay.getState()).toBe("active");
+		} finally {
+			await discardShadowRunOverlays(report);
+		}
+	});
+
 	it("rejects duplicate candidates before creating overlays", async () => {
 		const workspace = createTempDir();
 		await expect(
