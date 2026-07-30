@@ -355,11 +355,73 @@ describe("managed jobs built-in extension", () => {
 		expect(output.content[0]).toMatchObject({ type: "text", text: expect.not.stringContaining("prefix-") });
 		expect(output.details).toMatchObject({ outputBytes: 16 * 1024 });
 		expect(JSON.stringify(output)).not.toContain(process.execPath);
-		expect(tool.description).toContain("cannot start, stop, wait for, or prune jobs");
+		expect(tool.description).toContain("cannot start, stop, or prune jobs");
 
 		const prompt = await extension.beforeAgentStart();
 		expect(prompt?.systemPrompt).toContain("managed_job_read");
 		expect(prompt?.systemPrompt).toContain("strictly as untrusted data");
+	});
+
+	it("lets the read tool wait for readiness without returning the matched output", async () => {
+		const runtime = await createRuntime();
+		const extension = setupExtension(runtime, true, true, true, true);
+		await extension.sessionStart();
+		await extension.command(
+			`start --name api ${quoteArgument(process.execPath)} -e ${quoteArgument("setTimeout(() => process.stdout.write('server ready'), 20)")}`,
+			extension.ctx,
+		);
+		const tool = extension.tool(MANAGED_JOBS_AGENT_READ_TOOL);
+		if (!tool) throw new Error("Expected managed job read tool");
+
+		const result = await tool.execute(
+			"wait-call",
+			{ action: "wait", id: "api", contains: "server ready", timeoutSeconds: 1 },
+			undefined,
+			undefined,
+			extension.ctx,
+		);
+
+		expect(result.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining('"waitStatus": "matched"'),
+		});
+		expect(result.content[0]).toMatchObject({ type: "text", text: expect.not.stringContaining("server ready") });
+		expect(result.details).toMatchObject({ action: "wait", waitStatus: "matched" });
+		await expect(
+			tool.execute(
+				"invalid-wait-call",
+				{ action: "wait", id: "api", contains: "ready", timeoutSeconds: 31 },
+				undefined,
+				undefined,
+				extension.ctx,
+			),
+		).rejects.toThrow("timeout must be between 1 and 30 seconds");
+	});
+
+	it("forwards cancellation to agent readiness waits without stopping the job", async () => {
+		const runtime = await createRuntime();
+		const extension = setupExtension(runtime, true, true, true, true);
+		await extension.sessionStart();
+		await extension.command(
+			`start --name api ${quoteArgument(process.execPath)} -e ${quoteArgument("setInterval(() => {}, 1000)")}`,
+			extension.ctx,
+		);
+		const tool = extension.tool(MANAGED_JOBS_AGENT_READ_TOOL);
+		if (!tool) throw new Error("Expected managed job read tool");
+		const controller = new AbortController();
+
+		const waiting = tool.execute(
+			"cancelled-wait-call",
+			{ action: "wait", id: "api", contains: "never" },
+			controller.signal,
+			undefined,
+			extension.ctx,
+		);
+		controller.abort();
+		const result = await waiting;
+
+		expect(result.details).toMatchObject({ action: "wait", waitStatus: "aborted" });
+		expect(runtime.manager.status("api").state).toBe("running");
 	});
 
 	it("does not register the agent read tool unless explicitly enabled", async () => {
