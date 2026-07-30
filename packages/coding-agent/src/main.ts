@@ -43,6 +43,7 @@ import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import type { WorkspaceOverlay } from "./core/workspace-overlay.ts";
 import { builtInExtensions } from "./extensions/index.ts";
+import { SHADOW_RUNS_FLAG } from "./extensions/shadow-runs/index.ts";
 import { openCliWorkspaceOverlay, WORKSPACE_OVERLAY_FLAG } from "./extensions/workspace-overlay/index.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
@@ -725,7 +726,7 @@ export async function main(args: string[], options?: MainOptions) {
 			parsed.listModels === undefined &&
 			!diagnostics.some((diagnostic) => diagnostic.type === "error")
 		) {
-			const incompatibleFlags = ["task-contract", "verify-loop"].filter(
+			const incompatibleFlags = [SHADOW_RUNS_FLAG, "task-contract", "verify-loop"].filter(
 				(flag) => resourceLoader.getExtensions().runtime.flagValues.get(flag) === true,
 			);
 			if (incompatibleFlags.length > 0) {

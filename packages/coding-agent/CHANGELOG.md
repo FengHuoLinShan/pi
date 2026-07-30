@@ -18,6 +18,7 @@
 - Added an opt-in interactive CLI for persistent transactional workspace overlays, with independent Git metadata, scrollable PatchSet review, explicit apply/discard, conflict handling, and session-switch guards.
 - Added a language-neutral incremental code graph with revision-atomic updates, deterministic snapshots, and bounded dependency/impact queries.
 - Added explicit Shadow Runs over comparable isolated overlays with completion-contract gates and caller-defined ranking.
+- Added an opt-in interactive Shadow Runs workflow with bounded candidate agents, direct-command completion gates, evidence and PatchSet review, explicit human selection, atomic apply, conflict retention, and session lifecycle cleanup.
 - Added an opt-in process-session completion verifier that keeps command output in ArtifactStore and exposes only structured status and opaque evidence references.
 - Added an opt-in workspace-change discipline verifier with synchronous or asynchronous PatchSet capture, path, operation, minimum/maximum file-count, and byte-count gates, and privacy-preserving completion evidence.
 - Added request-only safe context trimming for reproducible tool results and unsigned plaintext thinking, with content-free `context_trim` TUI, JSON, and RPC observability.

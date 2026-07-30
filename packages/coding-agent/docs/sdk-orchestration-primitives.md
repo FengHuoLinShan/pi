@@ -1,6 +1,6 @@
 # SDK orchestration primitives
 
-The coding-agent package exposes optional workspace and orchestration primitives for SDK hosts. `createAgentSession()` only enables them when passed explicitly. The interactive CLI can opt into a persistent `WorkspaceOverlay` with `--workspace-overlay`.
+The coding-agent package exposes optional workspace and orchestration primitives for SDK hosts. `createAgentSession()` only enables them when passed explicitly. The interactive CLI can opt into a persistent `WorkspaceOverlay` with `--workspace-overlay` or reviewed multi-candidate runs with `--shadow-runs`.
 
 ## Transactional workspace overlays
 
@@ -71,3 +71,50 @@ const ranking = await rankShadowRuns(report, (run) => ({
 ```
 
 Candidate failures are isolated by default and retain partial PatchSets for inspection. Completion contracts can gate ranking. The SDK never chooses, applies, or discards a winner automatically; use the selected overlay's `applyPatchSet()` or call `discardShadowRunOverlays()` explicitly.
+
+`applyShadowRunCandidate()` closes the host-side selection transaction without making the decision: the caller supplies one candidate id, the helper rejects incomplete, failed, completion-rejected, or empty candidates, applies its captured PatchSet, then discards every retained overlay. Apply conflicts leave every overlay intact. Cleanup failures after a successful commit are reported separately so the host cannot misreport an applied change as an all-or-nothing failure. Completion verifiers are required to be observational; a verifier that changes the candidate workspace fails that candidate.
+
+## Interactive reviewed candidates
+
+Start interactive pi with `--shadow-runs`, then use `/shadow run <objective>`. The built-in workflow reads the trusted project file `.pi/shadow-runs.json`:
+
+```json
+{
+  "version": 1,
+  "execution": "sequential",
+  "candidates": [
+    {
+      "id": "minimal",
+      "label": "Minimal patch",
+      "instructions": "Make the smallest complete change."
+    },
+    {
+      "id": "defensive",
+      "label": "Defensive design",
+      "instructions": "Prioritize failure handling and maintainability.",
+      "thinkingLevel": "high"
+    }
+  ],
+  "checks": [
+    {
+      "id": "check",
+      "command": "npm",
+      "args": ["run", "check"],
+      "timeoutMs": 120000
+    }
+  ],
+  "budget": {
+    "maxModelCalls": 8,
+    "maxToolCalls": 80,
+    "maxWallTimeMs": 600000,
+    "maxModelTokens": 200000,
+    "maxCost": 2
+  }
+}
+```
+
+The workflow accepts two to four candidates and runs them sequentially unless parallel execution is explicitly configured. Every candidate uses the active model, its own isolated overlay and in-memory session, optional candidate-specific thinking, hard run budgets, loop detection, independent Git metadata, and no extensions. Configured checks execute directly without a shell inside each candidate overlay, inherit the host process environment, and form required completion-contract conditions. Checks must not mutate workspace contents.
+
+The original workspace remains unchanged while `/shadow status` and `/shadow review [id]` expose candidate responses, usage, verifier evidence, and PatchSets. `/shadow apply [id]` accepts only a completed, non-empty candidate that passed every check, shows it for review, requests explicit confirmation, applies it atomically, and discards its peers. `/shadow discard` abandons all candidates. Session switching and forking are blocked while candidates remain; shutdown discards them.
+
+The project must be trusted because its config supplies model instructions and executable commands. The CLI requires explicit cost approval before starting and rejects combination with `--workspace-overlay`, `--task-contract`, or `--verify-loop`. Like `WorkspaceOverlay`, Shadow Runs provide a comparison and review boundary, not OS confinement: candidate shell commands could still address host paths.
