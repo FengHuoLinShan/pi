@@ -87,6 +87,26 @@ A backend decides whether a durable handle can be reattached. During recovery:
 
 Container, VM, or remote-sandbox integrations can implement `ProcessSessionBackend` with durable remote handles, `attach`, `status`, and `terminate` operations.
 
+## Interactive Managed Jobs
+
+Start pi with `--managed-jobs` to enable a user-controlled background process surface:
+
+```text
+/job start npm run dev
+/job list
+/job status <id>
+/job output <id> [stdout|stderr|all]
+/job stop <id>
+```
+
+Commands use direct executable-and-argument spawning, not a shell. Quotes and escaped whitespace group arguments, but pipes, redirects, variable expansion, and other shell syntax are not interpreted. If shell behavior is intentionally required, invoke the shell executable explicitly.
+
+The built-in policy permits at most four active jobs per workspace, retains at most 10 MiB of artifact-backed output per job, and displays at most the newest 16 KiB. Reaching the output limit durably fails and terminates the job. Job IDs, commands, arguments, working directories, backend handles, environment variable names, lifecycle states, and artifact references are journaled; environment values and output bytes are not. Do not put credentials directly in command arguments.
+
+Managed jobs are workspace-scoped and share one live local backend while pi is running. A clean pi quit stops active jobs and records their terminal state. After a crash or restart, the local backend does not claim the old PID, so active records become `interrupted`; use a remote durable backend through the SDK when cross-process reattachment is required.
+
+This first interactive surface is human-controlled. It does not register an LLM tool or let the coding agent start a background process without the user's `/job start` command.
+
 ## Execution Boundary
 
 Passing `executionBoundary` changes construction to fail closed:
@@ -116,4 +136,4 @@ Environment values and output content are never copied into completion evidence.
 
 ## Integration Status
 
-These modules are exported from the public SDK but remain intentionally separate from the current foreground `bash` implementation. The completion verifier is invoked only by a caller's explicit verification flow; it does not add background bash. Wiring process sessions into the interactive tool surface would require an explicit product choice about foreground versus durable/background command behavior, output presentation, retention, and cleanup policy. Importing the modules does not change existing `bash` behavior or session JSONL format.
+These modules are exported from the public SDK and remain separate from the foreground `bash` implementation. The completion verifier is invoked only by a caller's explicit verification flow; it does not add background bash. The opt-in `/job` surface uses a bounded local manager with explicit user control. Importing the modules does not change existing `bash` behavior or session JSONL format.
