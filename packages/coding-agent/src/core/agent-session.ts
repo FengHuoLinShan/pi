@@ -13,7 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
 	Agent,
@@ -45,7 +45,6 @@ import {
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
-import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { getShellEnv } from "../utils/shell.ts";
 import { sleep } from "../utils/sleep.ts";
@@ -75,6 +74,7 @@ import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
 	type ContextUsage,
+	type Extension,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
 	type ExtensionMode,
@@ -104,7 +104,7 @@ import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./m
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
-import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
+import type { LazyExtensionActivationResult, ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
 import {
 	buildSessionContext,
@@ -113,10 +113,17 @@ import {
 	type SessionHeader,
 } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
+import { loadSkillBody } from "./skills.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
+import {
+	type CapabilityKind,
+	type CapabilityLoadResult,
+	type CapabilitySearchMatch,
+	createCapabilityToolDefinition,
+} from "./tools/capability.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import type { WorkspaceOverlay } from "./workspace-overlay.ts";
@@ -248,6 +255,7 @@ export interface ExtensionBindings {
 	abortHandler?: () => void;
 	shutdownHandler?: ShutdownHandler;
 	onError?: ExtensionErrorListener;
+	onExtensionsChanged?: () => void | Promise<void>;
 }
 
 /** Options for AgentSession.prompt() */
@@ -262,6 +270,11 @@ export interface PromptOptions {
 	source?: InputSource;
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean) => void;
+}
+
+/** Options for selecting a model and its reasoning effort together. */
+export interface SetModelOptions {
+	thinkingLevel?: ThinkingLevel;
 }
 
 /** Result from cycleModel() */
@@ -373,7 +386,11 @@ export class AgentSession {
 	private _extensionAbortHandler?: () => void;
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
+	private _extensionsChangedHandler?: () => void | Promise<void>;
 	private _extensionErrorUnsubscriber?: () => void;
+	private _extensionActivations = new Map<string, Promise<LazyExtensionActivationResult>>();
+	private _extensionActivationGeneration = 0;
+	private _acceptingExtensionActivations = true;
 
 	private _modelRuntime: ModelRuntime;
 
@@ -931,6 +948,8 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._acceptingExtensionActivations = false;
+		this._extensionActivationGeneration++;
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -941,6 +960,9 @@ export class AgentSession {
 			// Dispose must succeed even if an abort hook throws.
 		}
 
+		// Keep the public dispose() API synchronous while still starting extension
+		// cleanup. AgentSessionRuntime.dispose() remains the awaited graceful path.
+		void this._extensionRunner.disposeExtensions();
 		this._extensionRunner.invalidate(
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
@@ -1140,6 +1162,7 @@ export class AgentSession {
 		this._baseSystemPromptOptions = {
 			cwd: this._cwd,
 			skills: loadedSkills,
+			skillLoading: this._executionBoundary ? "prompt" : this.settingsManager.getSkillLoading(),
 			contextFiles: loadedContextFiles,
 			customPrompt: loaderSystemPrompt,
 			appendSystemPrompt,
@@ -1148,6 +1171,165 @@ export class AgentSession {
 			promptGuidelines,
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
+	}
+
+	searchCapabilities(kind: "all" | CapabilityKind, query: string, limit = 10): CapabilitySearchMatch[] {
+		const normalizedQuery = query.trim().toLowerCase();
+		const candidates: Array<CapabilitySearchMatch & { searchText: string; score: number }> = [];
+		const score = (id: string, searchText: string): number | undefined => {
+			if (!normalizedQuery) return 3;
+			if (id.toLowerCase() === normalizedQuery) return 0;
+			if (id.toLowerCase().startsWith(normalizedQuery)) return 1;
+			const terms = normalizedQuery.split(/\s+/).filter(Boolean);
+			return terms.every((term) => searchText.includes(term)) ? 2 : undefined;
+		};
+
+		if (kind === "all" || kind === "skill") {
+			for (const skill of this._resourceLoader.getSkills().skills) {
+				if (skill.disableModelInvocation) continue;
+				const searchText = `${skill.name} ${skill.description}`.toLowerCase();
+				const matchScore = score(skill.name, searchText);
+				if (matchScore === undefined) continue;
+				candidates.push({
+					id: skill.name,
+					kind: "skill",
+					description: skill.description,
+					searchText,
+					score: matchScore,
+				});
+			}
+		}
+
+		if (kind === "all" || kind === "extension") {
+			for (const extension of this._resourceLoader.getLazyExtensions?.() ?? []) {
+				const searchText =
+					`${extension.id} ${extension.description} ${(extension.keywords ?? []).join(" ")}`.toLowerCase();
+				const matchScore = score(extension.id, searchText);
+				if (matchScore === undefined) continue;
+				candidates.push({
+					id: extension.id,
+					kind: "extension",
+					description: extension.description,
+					status: extension.status,
+					searchText,
+					score: matchScore,
+				});
+			}
+		}
+
+		return candidates
+			.sort((a, b) => a.score - b.score || a.id.localeCompare(b.id) || a.kind.localeCompare(b.kind))
+			.slice(0, Math.max(1, Math.min(50, limit)))
+			.map(({ searchText: _searchText, score: _score, ...match }) => match);
+	}
+
+	async loadCapability(id: string, retry = false, kind?: CapabilityKind): Promise<CapabilityLoadResult> {
+		const skill =
+			kind === "extension"
+				? undefined
+				: this._resourceLoader
+						.getSkills()
+						.skills.find((candidate) => candidate.name === id && !candidate.disableModelInvocation);
+		const lazyExtension =
+			kind === "skill"
+				? undefined
+				: this._resourceLoader.getLazyExtensions?.().find((candidate) => candidate.id === id);
+		if (skill && lazyExtension) {
+			return {
+				id,
+				kind: "extension",
+				description: lazyExtension.description,
+				status: lazyExtension.status,
+				error: `Capability id "${id}" is ambiguous between a skill and an extension`,
+			};
+		}
+		if (skill) {
+			try {
+				return {
+					id,
+					kind: "skill",
+					description: skill.description,
+					content: loadSkillBody(skill),
+					baseDir: skill.baseDir,
+				};
+			} catch (error) {
+				return {
+					id,
+					kind: "skill",
+					description: skill.description,
+					error: error instanceof Error ? error.message : String(error),
+				};
+			}
+		}
+		if (lazyExtension) {
+			const result = await this.activateExtension(id, { retry });
+			return {
+				id,
+				kind: "extension",
+				description: result.info.description,
+				status: result.info.status,
+				error: result.info.error,
+			};
+		}
+		return { id, kind: kind ?? "skill", description: "", error: `Unknown ${kind ?? "capability"}: ${id}` };
+	}
+
+	async activateExtension(id: string, options?: { retry?: boolean }): Promise<LazyExtensionActivationResult> {
+		if (!this._acceptingExtensionActivations) {
+			throw new Error("Lazy extensions cannot be activated while the session is reloading or disposing");
+		}
+		const activeRequest = this._extensionActivations.get(id);
+		if (activeRequest) return activeRequest;
+		const generation = this._extensionActivationGeneration;
+		const runner = this._extensionRunner;
+		const request = this._activateExtension(id, options, generation, runner).finally(() => {
+			if (this._extensionActivations.get(id) === request) {
+				this._extensionActivations.delete(id);
+			}
+		});
+		this._extensionActivations.set(id, request);
+		return request;
+	}
+
+	private async _activateExtension(
+		id: string,
+		options: { retry?: boolean } | undefined,
+		generation: number,
+		runner: ExtensionRunner,
+	): Promise<LazyExtensionActivationResult> {
+		if (this._executionBoundary) {
+			throw new Error("Lazy extensions cannot be activated with an execution boundary");
+		}
+		if (!this._resourceLoader.activateExtension) {
+			throw new Error("The configured resource loader does not support lazy extensions");
+		}
+		const result = await this._resourceLoader.activateExtension(id, options);
+		if (!result.extension || result.info.status !== "active") return result;
+		if (generation !== this._extensionActivationGeneration || runner !== this._extensionRunner) {
+			const disposable = result.extension.disposable;
+			if (disposable) {
+				result.extension.disposable = undefined;
+				try {
+					await disposable.dispose();
+				} catch {}
+			}
+			return {
+				info: {
+					...result.info,
+					status: "failed",
+					error: "Lazy extension activation was invalidated by a session reload or dispose",
+				},
+				activated: false,
+			};
+		}
+
+		if (runner.addExtension(result.extension)) {
+			await runner.emitActivationStart(result.extension);
+			await this.extendResourcesFromExtensions("activation", [result.extension]);
+			this._refreshToolRegistry();
+			await this._extensionsChangedHandler?.();
+		}
+		return result;
 	}
 
 	// =========================================================================
@@ -1411,8 +1593,7 @@ export class AgentSession {
 		if (!skill) return text; // Unknown skill, pass through
 
 		try {
-			const content = readFileSync(skill.filePath, "utf-8");
-			const body = stripFrontmatter(content).trim();
+			const body = loadSkillBody(skill);
 			const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
 			return args ? `${skillBlock}\n\n${args}` : skillBlock;
 		} catch (err) {
@@ -1677,19 +1858,18 @@ export class AgentSession {
 	 * Validates that auth is configured, saves to session and settings.
 	 * @throws Error if no auth is configured for the model
 	 */
-	async setModel(model: Model<any>): Promise<void> {
+	async setModel(model: Model<any>, options: SetModelOptions = {}): Promise<void> {
 		if (!(await this._modelRuntime.checkAuth(model.provider))) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
 		const previousModel = this.model;
-		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		const thinkingLevel = options.thinkingLevel ?? this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = model;
+		this.setThinkingLevel(thinkingLevel);
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
-
-		// Re-clamp thinking level for new model's capabilities
-		this.setThinkingLevel(thinkingLevel);
+		this.settingsManager.recordRecentModel(model.provider, model.id);
 
 		await this._emitModelSelect(model, previousModel, "set");
 	}
@@ -1730,6 +1910,7 @@ export class AgentSession {
 		this.agent.state.model = next.model;
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+		this.settingsManager.recordRecentModel(next.model.provider, next.model.id);
 
 		// Apply thinking level.
 		// - Explicit scoped model thinking level overrides current session level
@@ -1758,6 +1939,7 @@ export class AgentSession {
 		this.agent.state.model = nextModel;
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
+		this.settingsManager.recordRecentModel(nextModel.provider, nextModel.id);
 
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(thinkingLevel);
@@ -2554,13 +2736,19 @@ export class AgentSession {
 		if (bindings.onError !== undefined) {
 			this._extensionErrorListener = bindings.onError;
 		}
+		if (bindings.onExtensionsChanged !== undefined) {
+			this._extensionsChangedHandler = bindings.onExtensionsChanged;
+		}
 
 		this._applyExtensionBindings(this._extensionRunner);
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
 	}
 
-	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
+	private async extendResourcesFromExtensions(
+		reason: "startup" | "reload" | "activation",
+		extensions?: Extension[],
+	): Promise<void> {
 		if (!this._extensionRunner.hasHandlers("resources_discover")) {
 			return;
 		}
@@ -2568,6 +2756,7 @@ export class AgentSession {
 		const { skillPaths, promptPaths, themePaths } = await this._extensionRunner.emitResourcesDiscover(
 			this._cwd,
 			reason,
+			extensions,
 		);
 
 		if (skillPaths.length === 0 && promptPaths.length === 0 && themePaths.length === 0) {
@@ -2878,6 +3067,19 @@ export class AgentSession {
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
 		);
+		const hasVisibleOnDemandSkills =
+			this.settingsManager.getSkillLoading() === "on-demand" &&
+			this._resourceLoader.getSkills().skills.some((skill) => !skill.disableModelInvocation);
+		const hasLazyExtensions = (this._resourceLoader.getLazyExtensions?.().length ?? 0) > 0;
+		if (!this._executionBoundary && (hasVisibleOnDemandSkills || hasLazyExtensions)) {
+			this._baseToolDefinitions.set(
+				"capability",
+				createCapabilityToolDefinition({
+					search: (kind, query, limit) => this.searchCapabilities(kind, query, limit),
+					load: (id, retry, kind) => this.loadCapability(id, retry, kind),
+				}) as ToolDefinition,
+			);
+		}
 
 		const extensionsResult = this._resourceLoader.getExtensions();
 		if (this._executionBoundary) {
@@ -2910,7 +3112,10 @@ export class AgentSession {
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
 			: ["read", "bash", "edit", "write"];
-		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
+		const baseActiveToolNames = [...(options.activeToolNames ?? defaultActiveToolNames)];
+		if (this._baseToolDefinitions.has("capability") && options.activeToolNames === undefined) {
+			baseActiveToolNames.push("capability");
+		}
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
 			includeAllExtensionTools: options.includeAllExtensionTools,
@@ -2918,27 +3123,35 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
-		const previousFlagValues = this._extensionRunner.getFlagValues();
-		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
-		await this.settingsManager.reload();
-		this.syncQueueModesFromSettings();
-		resetApiProviders();
-		await this._resourceLoader.reload();
-		this._buildRuntime({
-			activeToolNames: this.getActiveToolNames(),
-			flagValues: previousFlagValues,
-			includeAllExtensionTools: true,
-		});
+		this._acceptingExtensionActivations = false;
+		try {
+			await Promise.allSettled([...this._extensionActivations.values()]);
+			this._extensionActivationGeneration++;
+			const previousFlagValues = this._extensionRunner.getFlagValues();
+			await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
+			await this.settingsManager.reload();
+			this.syncQueueModesFromSettings();
+			resetApiProviders();
+			await this._resourceLoader.reload();
+			this._buildRuntime({
+				activeToolNames: this.getActiveToolNames(),
+				flagValues: previousFlagValues,
+				includeAllExtensionTools: true,
+			});
 
-		const hasBindings =
-			this._extensionUIContext ||
-			this._extensionCommandContextActions ||
-			this._extensionShutdownHandler ||
-			this._extensionErrorListener;
-		if (hasBindings) {
-			await options?.beforeSessionStart?.();
-			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
-			await this.extendResourcesFromExtensions("reload");
+			const hasBindings =
+				this._extensionUIContext ||
+				this._extensionCommandContextActions ||
+				this._extensionShutdownHandler ||
+				this._extensionErrorListener ||
+				this._extensionsChangedHandler;
+			if (hasBindings) {
+				await options?.beforeSessionStart?.();
+				await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+				await this.extendResourcesFromExtensions("reload");
+			}
+		} finally {
+			this._acceptingExtensionActivations = true;
 		}
 	}
 

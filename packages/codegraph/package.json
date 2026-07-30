@@ -1,0 +1,71 @@
+{
+	"name": "@earendil-works/pi-codegraph",
+	"version": "0.80.10",
+	"description": "On-demand TypeScript and JavaScript code graph for pi",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./extension": {
+			"types": "./dist/extension.d.ts",
+			"import": "./dist/extension.js"
+		}
+	},
+	"files": [
+		"dist",
+		"src",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"test": "vitest --run",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"pi": {
+		"lazyExtensions": [
+			{
+				"id": "codegraph",
+				"path": "./src/extension.ts",
+				"description": "Index and query TypeScript and JavaScript symbols, dependencies, dependents, and impact paths.",
+				"keywords": ["code", "graph", "symbol", "dependency", "impact", "typescript", "javascript"]
+			}
+		]
+	},
+	"keywords": [
+		"pi-package",
+		"pi",
+		"codegraph",
+		"typescript",
+		"javascript"
+	],
+	"author": "Earendil Works",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/earendil-works/pi.git",
+		"directory": "packages/codegraph"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"dependencies": {
+		"typescript": "5.9.3"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^0.80.10",
+		"@types/node": "24.12.4",
+		"shx": "0.4.0",
+		"typebox": "1.1.38",
+		"vitest": "4.1.9"
+	}
+}

@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "name": "capability-browser-v1",
+  "defaults": {
+    "budgets": {
+      "maxWallTimeMs": 90000,
+      "maxModelRequests": 0,
+      "maxToolCalls": 12,
+      "maxTotalTokens": 100
+    },
+    "attempts": {
+      "count": 1,
+      "minimumPassing": 1
+    }
+  },
+  "scenarios": [
+    {
+      "version": 1,
+      "id": "playwright-mcp-smoke",
+      "description": "Pinned Playwright MCP drives an isolated headless Chromium session against the local fixture",
+      "layer": "browser",
+      "task": "Add and complete a todo through Playwright MCP",
+      "driver": {
+        "id": "playwright-mcp-smoke"
+      },
+      "verifiers": [
+        {
+          "type": "output",
+          "operator": "equals",
+          "expected": "EVAL_OK"
+        },
+        {
+          "type": "trace_order",
+          "expected": [
+            "tool_execution_start:browser_navigate",
+            "tool_execution_start:browser_type",
+            "tool_execution_start:browser_click",
+            "tool_execution_start:browser_snapshot",
+            "tool_execution_start:browser_close"
+          ]
+        },
+        {
+          "type": "artifact_json",
+          "path": "fixture-state.json",
+          "pointer": "/todos",
+          "expected": [
+            {
+              "text": "playwright mcp probe",
+              "completed": true
+            }
+          ]
+        },
+        {
+          "type": "metric",
+          "metric": "orphanProcesses",
+          "operator": "equals",
+          "expected": 0
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "id": "playwright-cli-smoke",
+      "description": "Pinned Playwright CLI drives a uniquely named in-memory browser session against the local fixture",
+      "layer": "browser",
+      "task": "Add and complete a todo through Playwright CLI",
+      "driver": {
+        "id": "playwright-cli-smoke"
+      },
+      "verifiers": [
+        {
+          "type": "output",
+          "operator": "equals",
+          "expected": "EVAL_OK"
+        },
+        {
+          "type": "trace_order",
+          "expected": [
+            "tool_execution_start:playwright_cli_open",
+            "tool_execution_start:playwright_cli_fill",
+            "tool_execution_start:playwright_cli_click",
+            "tool_execution_start:playwright_cli_snapshot"
+          ]
+        },
+        {
+          "type": "artifact_json",
+          "path": "fixture-state.json",
+          "pointer": "/todos",
+          "expected": [
+            {
+              "text": "playwright cli probe",
+              "completed": true
+            }
+          ]
+        },
+        {
+          "type": "metric",
+          "metric": "orphanProcesses",
+          "operator": "equals",
+          "expected": 0
+        }
+      ]
+    }
+  ]
+}

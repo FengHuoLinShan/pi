@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "fs";
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "fs";
 import ignore from "ignore";
 import { basename, dirname, join, relative, resolve, sep } from "path";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
@@ -12,6 +12,9 @@ const MAX_NAME_LENGTH = 64;
 
 /** Max description length per spec */
 const MAX_DESCRIPTION_LENGTH = 1024;
+
+/** Bound startup reads to frontmatter metadata instead of loading complete skill bodies. */
+const MAX_FRONTMATTER_BYTES = 64 * 1024;
 
 const IGNORE_FILE_NAMES = [".gitignore", ".ignore", ".fdignore"];
 
@@ -281,7 +284,7 @@ function loadSkillFromFile(
 	const diagnostics: ResourceDiagnostic[] = [];
 
 	try {
-		const rawContent = readFileSync(filePath, "utf-8");
+		const rawContent = readSkillFrontmatter(filePath);
 		const { frontmatter } = parseFrontmatter<SkillFrontmatter>(rawContent);
 		const skillDir = dirname(filePath);
 		const parentDirName = basename(skillDir);
@@ -324,6 +327,37 @@ function loadSkillFromFile(
 	}
 }
 
+function readSkillFrontmatter(filePath: string): string {
+	const fd = openSync(filePath, "r");
+	try {
+		const chunks: Buffer[] = [];
+		let totalBytes = 0;
+		while (totalBytes < MAX_FRONTMATTER_BYTES) {
+			const chunk = Buffer.alloc(Math.min(4096, MAX_FRONTMATTER_BYTES - totalBytes));
+			const bytesRead = readSync(fd, chunk, 0, chunk.length, totalBytes);
+			if (bytesRead === 0) break;
+			chunks.push(chunk.subarray(0, bytesRead));
+			totalBytes += bytesRead;
+
+			const content = Buffer.concat(chunks, totalBytes).toString("utf-8");
+			if (!content.startsWith("---")) return content;
+			const closingDelimiter = /\r?\n---(?:\r?\n|$)/.exec(content.slice(3));
+			if (closingDelimiter) {
+				return content.slice(0, closingDelimiter.index + 3 + closingDelimiter[0].length);
+			}
+		}
+		return Buffer.concat(chunks, totalBytes).toString("utf-8");
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** Load a selected skill body. Discovery intentionally does not call this. */
+export function loadSkillBody(skill: Skill): string {
+	const rawContent = readFileSync(skill.filePath, "utf-8");
+	return parseFrontmatter(rawContent).body.trim();
+}
+
 /**
  * Format skills for inclusion in a system prompt.
  * Uses XML format per Agent Skills standard.
@@ -358,6 +392,14 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
 	lines.push("</available_skills>");
 
 	return lines.join("\n");
+}
+
+export function formatOnDemandSkillsPrompt(): string {
+	return [
+		"\n\nSpecialized skills are available on demand.",
+		"Use the capability tool to search skills by task, then load the selected skill before following its instructions.",
+		"When a loaded skill references a relative path, resolve it against the skill directory reported by the tool.",
+	].join("\n");
 }
 
 function escapeXml(str: string): string {

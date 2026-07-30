@@ -205,17 +205,26 @@ export {
 	type ModelRuntimeAuthOverrides,
 } from "./core/model-runtime.ts";
 export type {
+	LazyExtensionManifestEntry,
 	PackageManager,
 	PathMetadata,
 	ProgressCallback,
 	ProgressEvent,
+	ResolvedLazyExtension,
 	ResolvedPaths,
 	ResolvedResource,
 } from "./core/package-manager.ts";
 export { DefaultPackageManager } from "./core/package-manager.ts";
 export * from "./core/process-session.ts";
 export * from "./core/process-session-verifier.ts";
-export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.ts";
+export type {
+	LazyExtensionActivationResult,
+	LazyExtensionInfo,
+	LazyExtensionStatus,
+	ResourceCollision,
+	ResourceDiagnostic,
+	ResourceLoader,
+} from "./core/resource-loader.ts";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
 // SDK for programmatic usage
 export {
@@ -282,13 +291,16 @@ export {
 	type RetrySettings,
 	SettingsManager,
 	type SettingsManagerCreateOptions,
+	type SkillLoadingMode,
 } from "./core/settings-manager.ts";
 export * from "./core/shadow-runs.ts";
 // Skills
 export {
+	formatOnDemandSkillsPrompt,
 	formatSkillsForPrompt,
 	type LoadSkillsFromDirOptions,
 	type LoadSkillsResult,
+	loadSkillBody,
 	loadSkills,
 	loadSkillsFromDir,
 	type Skill,

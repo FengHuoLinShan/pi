@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .artifacts/
+.playwright-cli/
+.playwright-mcp/
 *.log
 .DS_Store
 *.tsbuildinfo

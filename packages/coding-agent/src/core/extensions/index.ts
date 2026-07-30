@@ -65,6 +65,7 @@ export type {
 	ExtensionCommandContextActions,
 	ExtensionContext,
 	ExtensionContextActions,
+	ExtensionDisposable,
 	// Errors
 	ExtensionError,
 	ExtensionEvent,

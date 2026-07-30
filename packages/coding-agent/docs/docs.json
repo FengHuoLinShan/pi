@@ -155,6 +155,10 @@
         {
           "title": "Development",
           "path": "development.md"
+        },
+        {
+          "title": "Capability Evaluations",
+          "path": "capability-evals.md"
         }
       ]
     }

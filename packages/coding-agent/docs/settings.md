@@ -33,6 +33,7 @@ Use `/trust` in interactive mode to save a project trust decision for future ses
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
 | `showCacheMissNotices` | boolean | `false` | Show transcript notices for significant prompt-cache misses |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
+| `recentModels` | string[] | `[]` | Global model MRU maintained automatically by successful model switches; project values are ignored |
 
 #### thinkingBudgets
 
@@ -209,7 +210,9 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
 
 When multiple sources specify a session directory, precedence is `--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, then `sessionDir` in settings.json.
 
-### Model Cycling
+### Model Cycling and Sidebar
+
+On terminals wide enough to leave at least 60 columns for the conversation, interactive mode displays a 28-column model sidebar. It shows scoped models when configured, otherwise available models, ordered by `recentModels`. Press the configured `app.model.select` key (Ctrl+L by default) to focus it. Use Up/Down to select a model, Left/Right to select reasoning effort, Enter to apply, and Escape to cancel. Narrow terminals keep the existing full-width searchable model selector.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
@@ -241,6 +244,7 @@ Paths in `~/.pi/agent/settings.json` resolve relative to `~/.pi/agent`. Paths in
 | `prompts` | string[] | `[]` | Local prompt template paths or directories |
 | `themes` | string[] | `[]` | Local theme file paths or directories |
 | `enableSkillCommands` | boolean | `true` | Register skills as `/skill:name` commands |
+| `skillLoading` | string | `"prompt"` | `"prompt"` lists skill metadata in the system prompt; `"on-demand"` searches and loads skills through the `capability` tool |
 
 Arrays support glob patterns and exclusions. Use `!pattern` to exclude. Use `+path` to force-include an exact path and `-path` to force-exclude an exact path.
 

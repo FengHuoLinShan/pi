@@ -117,6 +117,37 @@ describe("InteractiveMode.showStatus", () => {
 	});
 });
 
+describe("InteractiveMode.focusModelSidebar", () => {
+	test("focuses the docked sidebar when it is visible", () => {
+		const sidebar = new TestFocusableComponent("SIDEBAR");
+		const fakeThis = {
+			ui: { terminal: { columns: 120 }, setFocus: vi.fn(), requestRender: vi.fn() },
+			layout: { isDockVisible: vi.fn(() => true) },
+			modelSidebar: sidebar,
+			showModelSelector: vi.fn(),
+		};
+
+		(InteractiveMode as any).prototype.focusModelSidebar.call(fakeThis);
+
+		expect(fakeThis.ui.setFocus).toHaveBeenCalledWith(sidebar);
+		expect(fakeThis.showModelSelector).not.toHaveBeenCalled();
+	});
+
+	test("opens the existing selector when the dock is hidden on a narrow terminal", () => {
+		const fakeThis = {
+			ui: { terminal: { columns: 80 }, setFocus: vi.fn(), requestRender: vi.fn() },
+			layout: { isDockVisible: vi.fn(() => false) },
+			modelSidebar: new TestFocusableComponent("SIDEBAR"),
+			showModelSelector: vi.fn(),
+		};
+
+		(InteractiveMode as any).prototype.focusModelSidebar.call(fakeThis);
+
+		expect(fakeThis.showModelSelector).toHaveBeenCalledOnce();
+		expect(fakeThis.ui.setFocus).not.toHaveBeenCalled();
+	});
+});
+
 describe("InteractiveMode.setToolsExpanded", () => {
 	test("applies expansion state to the active header and chat entries", () => {
 		const header = { setExpanded: vi.fn() };

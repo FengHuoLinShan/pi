@@ -63,6 +63,8 @@ export type DefaultProjectTrust = "ask" | "always" | "never";
 
 export type TransportSetting = Transport;
 
+export type SkillLoadingMode = "prompt" | "on-demand";
+
 /**
  * Package source for npm/git packages.
  * - String form: load all resources from the package
@@ -110,9 +112,11 @@ export interface Settings {
 	prompts?: string[]; // Array of local prompt template paths or directories
 	themes?: string[]; // Array of local theme file paths or directories
 	enableSkillCommands?: boolean; // default: true - register skills as /skill:name commands
+	skillLoading?: SkillLoadingMode; // default: "prompt" - list skills in prompt; "on-demand" exposes capability search/load instead
 	terminal?: TerminalSettings;
 	images?: ImageSettings;
 	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
+	recentModels?: string[]; // Global MRU model IDs used by the interactive sidebar
 	doubleEscapeAction?: "fork" | "tree" | "none"; // Action for double-escape with empty editor (default: "tree")
 	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default filter when opening /tree
 	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
@@ -1050,6 +1054,16 @@ export class SettingsManager {
 		return this.settings.enableSkillCommands ?? true;
 	}
 
+	getSkillLoading(): SkillLoadingMode {
+		return this.settings.skillLoading === "on-demand" ? "on-demand" : "prompt";
+	}
+
+	setSkillLoading(mode: SkillLoadingMode): void {
+		this.globalSettings.skillLoading = mode;
+		this.markModified("skillLoading");
+		this.save();
+	}
+
 	setEnableSkillCommands(enabled: boolean): void {
 		this.globalSettings.enableSkillCommands = enabled;
 		this.markModified("enableSkillCommands");
@@ -1153,6 +1167,23 @@ export class SettingsManager {
 	setEnabledModels(patterns: string[] | undefined): void {
 		this.globalSettings.enabledModels = patterns;
 		this.markModified("enabledModels");
+		this.save();
+	}
+
+	getRecentModels(): string[] {
+		if (!Array.isArray(this.globalSettings.recentModels)) return [];
+		return [
+			...new Set(this.globalSettings.recentModels.filter((id) => typeof id === "string" && id.length > 0)),
+		].slice(0, 20);
+	}
+
+	recordRecentModel(provider: string, modelId: string): void {
+		const id = `${provider}/${modelId}`;
+		this.globalSettings.recentModels = [id, ...this.getRecentModels().filter((recentId) => recentId !== id)].slice(
+			0,
+			20,
+		);
+		this.markModified("recentModels");
 		this.save();
 	}
 

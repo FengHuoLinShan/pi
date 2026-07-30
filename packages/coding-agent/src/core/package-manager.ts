@@ -66,8 +66,21 @@ export interface ResolvedResource {
 	metadata: PathMetadata;
 }
 
+export interface LazyExtensionManifestEntry {
+	id: string;
+	path: string;
+	description: string;
+	keywords?: string[];
+}
+
+export interface ResolvedLazyExtension extends LazyExtensionManifestEntry {
+	enabled: boolean;
+	metadata: PathMetadata;
+}
+
 export interface ResolvedPaths {
 	extensions: ResolvedResource[];
+	lazyExtensions?: ResolvedLazyExtension[];
 	skills: ResolvedResource[];
 	prompts: ResolvedResource[];
 	themes: ResolvedResource[];
@@ -157,6 +170,7 @@ interface GitUpdateTarget extends ConfiguredUpdateSource {
 
 interface PiManifest {
 	extensions?: string[];
+	lazyExtensions?: LazyExtensionManifestEntry[];
 	skills?: string[];
 	prompts?: string[];
 	themes?: string[];
@@ -164,6 +178,7 @@ interface PiManifest {
 
 interface ResourceAccumulator {
 	extensions: Map<string, { metadata: PathMetadata; enabled: boolean }>;
+	lazyExtensions: Map<string, ResolvedLazyExtension>;
 	skills: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	prompts: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	themes: Map<string, { metadata: PathMetadata; enabled: boolean }>;
@@ -2099,13 +2114,14 @@ export class DefaultPackageManager implements PackageManager {
 					this.collectDefaultResources(packageRoot, resourceType, target, metadata);
 				}
 			}
+			this.collectLazyExtensionManifestEntries(packageRoot, accumulator, metadata, filter);
 			return true;
 		}
 
 		const manifest = this.readPiManifest(packageRoot);
 		if (manifest) {
 			for (const resourceType of RESOURCE_TYPES) {
-				const entries = manifest[resourceType as keyof PiManifest];
+				const entries = manifest[resourceType];
 				this.addManifestEntries(
 					entries,
 					packageRoot,
@@ -2114,6 +2130,7 @@ export class DefaultPackageManager implements PackageManager {
 					metadata,
 				);
 			}
+			this.collectLazyExtensionManifestEntries(packageRoot, accumulator, metadata);
 			return true;
 		}
 
@@ -2132,6 +2149,50 @@ export class DefaultPackageManager implements PackageManager {
 		return hasAnyDir;
 	}
 
+	private collectLazyExtensionManifestEntries(
+		packageRoot: string,
+		accumulator: ResourceAccumulator,
+		metadata: PathMetadata,
+		filter?: PackageFilter,
+	): void {
+		const entries = this.readPiManifest(packageRoot)?.lazyExtensions;
+		if (!Array.isArray(entries)) return;
+
+		for (const candidate of entries) {
+			if (typeof candidate !== "object" || candidate === null) continue;
+			const entry = candidate as Partial<LazyExtensionManifestEntry>;
+			if (
+				typeof entry.id !== "string" ||
+				typeof entry.path !== "string" ||
+				typeof entry.description !== "string" ||
+				accumulator.lazyExtensions.has(entry.id)
+			) {
+				continue;
+			}
+			const resolvedPath = resolve(packageRoot, entry.path);
+			let enabled = true;
+			if (filter?.extensions !== undefined) {
+				if (filter.autoload === false) {
+					enabled =
+						applyAutoloadDisabledPatterns([resolvedPath], filter.extensions, packageRoot).get(resolvedPath) ??
+						false;
+				} else {
+					enabled = applyPatterns([resolvedPath], filter.extensions, packageRoot).has(resolvedPath);
+				}
+			}
+			accumulator.lazyExtensions.set(entry.id, {
+				id: entry.id,
+				path: resolvedPath,
+				description: entry.description,
+				keywords: Array.isArray(entry.keywords)
+					? entry.keywords.filter((keyword): keyword is string => typeof keyword === "string")
+					: undefined,
+				enabled,
+				metadata,
+			});
+		}
+	}
+
 	private collectDefaultResources(
 		packageRoot: string,
 		resourceType: ResourceType,
@@ -2139,7 +2200,7 @@ export class DefaultPackageManager implements PackageManager {
 		metadata: PathMetadata,
 	): void {
 		const manifest = this.readPiManifest(packageRoot);
-		const entries = manifest?.[resourceType as keyof PiManifest];
+		const entries = manifest?.[resourceType];
 		if (entries) {
 			this.addManifestEntries(entries, packageRoot, resourceType, target, metadata);
 			return;
@@ -2208,7 +2269,7 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 	): { allFiles: string[]; enabledByManifest: Set<string> } {
 		const manifest = this.readPiManifest(packageRoot);
-		const entries = manifest?.[resourceType as keyof PiManifest];
+		const entries = manifest?.[resourceType];
 		if (entries && entries.length > 0) {
 			const allFiles = this.collectFilesFromManifestEntries(entries, packageRoot, resourceType);
 			const manifestPatterns = entries.filter(isOverridePattern);
@@ -2518,6 +2579,7 @@ export class DefaultPackageManager implements PackageManager {
 	private createAccumulator(): ResourceAccumulator {
 		return {
 			extensions: new Map(),
+			lazyExtensions: new Map(),
 			skills: new Map(),
 			prompts: new Map(),
 			themes: new Map(),
@@ -2546,6 +2608,9 @@ export class DefaultPackageManager implements PackageManager {
 
 		return {
 			extensions: mapToResolved(accumulator.extensions),
+			lazyExtensions: Array.from(accumulator.lazyExtensions.values()).sort(
+				(a, b) => resourcePrecedenceRank(a.metadata) - resourcePrecedenceRank(b.metadata),
+			),
 			skills: mapToResolved(accumulator.skills),
 			prompts: mapToResolved(accumulator.prompts),
 			themes: mapToResolved(accumulator.themes),

@@ -36,6 +36,7 @@ import type {
 	EntryRenderer,
 	Extension,
 	ExtensionAPI,
+	ExtensionDisposable,
 	ExtensionFactory,
 	ExtensionRuntime,
 	LoadExtensionsResult,
@@ -44,6 +45,10 @@ import type {
 	RegisteredCommand,
 	ToolDefinition,
 } from "./types.ts";
+
+function isExtensionDisposable(value: unknown): value is ExtensionDisposable {
+	return typeof value === "object" && value !== null && "dispose" in value && typeof value.dispose === "function";
+}
 
 /** Modules available to extensions via virtualModules (for compiled Bun binary) */
 const VIRTUAL_MODULES: Record<string, unknown> = {
@@ -223,6 +228,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		getThinkingLevel: notInitialized,
 		setThinkingLevel: notInitialized,
 		flagValues: new Map(),
+		lazyRegistrationRestrictions: false,
 		pendingProviderRegistrations: [],
 		pendingNativeProviderRegistrations: [],
 		assertActive,
@@ -234,12 +240,21 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		// Pre-bind: queue registrations so bindCore() can flush them once the
 		// model registry is available. bindCore() replaces both with direct calls.
 		registerProvider: (name, config, extensionPath = "<unknown>") => {
+			if (runtime.lazyRegistrationRestrictions) {
+				throw new Error("Lazy extensions cannot register providers");
+			}
 			runtime.pendingProviderRegistrations.push({ name, config, extensionPath });
 		},
 		registerNativeProvider: (provider, extensionPath = "<unknown>") => {
+			if (runtime.lazyRegistrationRestrictions) {
+				throw new Error("Lazy extensions cannot register providers");
+			}
 			runtime.pendingNativeProviderRegistrations.push({ provider, extensionPath });
 		},
 		unregisterProvider: (name) => {
+			if (runtime.lazyRegistrationRestrictions) {
+				throw new Error("Lazy extensions cannot unregister providers");
+			}
 			runtime.pendingProviderRegistrations = runtime.pendingProviderRegistrations.filter((r) => r.name !== name);
 			runtime.pendingNativeProviderRegistrations = runtime.pendingNativeProviderRegistrations.filter(
 				(r) => r.provider.id !== name,
@@ -265,6 +280,9 @@ function createExtensionAPI(
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): void {
 			runtime.assertActive();
+			if (runtime.lazyRegistrationRestrictions && event === "project_trust") {
+				throw new Error("Lazy extensions cannot register project_trust handlers");
+			}
 			const list = extension.handlers.get(event) ?? [];
 			list.push(handler);
 			extension.handlers.set(event, list);
@@ -304,6 +322,9 @@ function createExtensionAPI(
 			options: { description?: string; type: "boolean" | "string"; default?: boolean | string },
 		): void {
 			runtime.assertActive();
+			if (runtime.lazyRegistrationRestrictions) {
+				throw new Error("Lazy extensions cannot register CLI flags");
+			}
 			extension.flags.set(name, { name, extensionPath: extension.path, ...options });
 			if (options.default !== undefined && !runtime.flagValues.has(name)) {
 				runtime.flagValues.set(name, options.default);
@@ -497,7 +518,8 @@ async function loadExtension(
 
 		const extension = createExtension(extensionPath, resolvedPath);
 		const api = createExtensionAPI(extension, runtime, cwd, eventBus);
-		await factory(api);
+		const disposable = await factory(api);
+		if (isExtensionDisposable(disposable)) extension.disposable = disposable;
 		time(`${extensionPath} factory`, "extensions");
 
 		return { extension, error: null };
@@ -520,7 +542,8 @@ export async function loadExtensionFromFactory(
 	const extension = createExtension(extensionPath, extensionPath);
 	const resolvedCwd = resolvePath(cwd);
 	const api = createExtensionAPI(extension, runtime, resolvedCwd, eventBus);
-	await factory(api);
+	const disposable = await factory(api);
+	if (isExtensionDisposable(disposable)) extension.disposable = disposable;
 	time(`${extensionPath} factory`, "extensions");
 	return extension;
 }

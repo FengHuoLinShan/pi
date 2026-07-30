@@ -3,7 +3,7 @@
  */
 
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
-import { formatSkillsForPrompt, type Skill } from "./skills.ts";
+import { formatOnDemandSkillsPrompt, formatSkillsForPrompt, type Skill } from "./skills.ts";
 
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces default). */
@@ -22,6 +22,8 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
+	/** Skill prompt strategy. Defaults to the legacy full catalog. */
+	skillLoading?: "prompt" | "on-demand";
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -35,6 +37,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		cwd,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
+		skillLoading = "prompt",
 	} = options;
 	const promptCwd = cwd.replace(/\\/g, "/");
 
@@ -62,7 +65,9 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 		// Append skills section (only if read tool is available)
 		const customPromptHasRead = !selectedTools || selectedTools.includes("read");
-		if (customPromptHasRead && skills.length > 0) {
+		if (skillLoading === "on-demand" && selectedTools?.includes("capability") && skills.length > 0) {
+			prompt += formatOnDemandSkillsPrompt();
+		} else if (customPromptHasRead && skills.length > 0) {
 			prompt += formatSkillsForPrompt(skills);
 		}
 
@@ -152,7 +157,9 @@ Pi documentation (read only when the user asks about pi itself, its SDK, extensi
 	}
 
 	// Append skills section (only if read tool is available)
-	if (hasRead && skills.length > 0) {
+	if (skillLoading === "on-demand" && tools.includes("capability") && skills.length > 0) {
+		prompt += formatOnDemandSkillsPrompt();
+	} else if (hasRead && skills.length > 0) {
 		prompt += formatSkillsForPrompt(skills);
 	}
 

@@ -546,7 +546,7 @@ export type ProjectTrustHandler = (
 export interface ResourcesDiscoverEvent {
 	type: "resources_discover";
 	cwd: string;
-	reason: "startup" | "reload";
+	reason: "startup" | "reload" | "activation";
 }
 
 /** Result from resources_discover event handler */
@@ -564,7 +564,7 @@ export interface ResourcesDiscoverResult {
 export interface SessionStartEvent {
 	type: "session_start";
 	/** Why this session start happened. */
-	reason: "startup" | "reload" | "new" | "resume" | "fork";
+	reason: "startup" | "reload" | "new" | "resume" | "fork" | "activation";
 	/** Previously active session file. Present for "new", "resume", and "fork". */
 	previousSessionFile?: string;
 }
@@ -1489,8 +1489,13 @@ export interface ProviderModelConfig {
 	compat?: Model<Api>["compat"];
 }
 
+export interface ExtensionDisposable {
+	dispose(): void | Promise<void>;
+}
+
 /** Extension factory function type. Supports both sync and async initialization. */
-export type ExtensionFactory = (pi: ExtensionAPI) => void | Promise<void>;
+// biome-ignore lint/suspicious/noConfusingVoidType: void preserves the established factory return contract.
+export type ExtensionFactory = (pi: ExtensionAPI) => void | ExtensionDisposable | Promise<void | ExtensionDisposable>;
 
 export type InlineExtension =
 	| ExtensionFactory
@@ -1573,6 +1578,8 @@ export type SetLabelHandler = (entryId: string, label: string | undefined) => vo
  */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
+	/** Permanently blocks registrations that must happen before lazy activation. */
+	lazyRegistrationRestrictions?: boolean;
 	/** Legacy provider-config registrations queued during extension loading, processed when runner binds. */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;
 	/** Native pi-ai provider registrations queued during extension loading, processed when runner binds. */
@@ -1676,6 +1683,7 @@ export interface Extension {
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+	disposable?: ExtensionDisposable;
 }
 
 /** Result of loading extensions. */

@@ -17,6 +17,7 @@ This is the home of the Pi agent harness project including our self extensible c
 * **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
 * **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
 * **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
+* **[@earendil-works/pi-codegraph](packages/codegraph)**: Optional on-demand TypeScript and JavaScript code graph
 
 To learn more about Pi:
 
@@ -30,6 +31,7 @@ To learn more about Pi:
 | **[@earendil-works/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
 | **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
 | **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
+| **[@earendil-works/pi-codegraph](packages/codegraph)** | Optional on-demand TypeScript and JavaScript code graph |
 | **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
 
 For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).

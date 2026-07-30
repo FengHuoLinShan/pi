@@ -303,13 +303,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
 	}
 
-	const defaultActiveToolNames: ToolName[] = ["read", "bash", "edit", "write"];
 	const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
 	const excludedToolNames = options.excludeTools;
 	const excludedToolNameSet = excludedToolNames ? new Set(excludedToolNames) : undefined;
-	const initialActiveToolNames: string[] = (
-		options.tools ? [...options.tools] : options.noTools ? [] : defaultActiveToolNames
-	).filter((name) => !excludedToolNameSet?.has(name));
+	const initialActiveToolNames: string[] | undefined = options.tools
+		? [...options.tools].filter((name) => !excludedToolNameSet?.has(name))
+		: options.noTools
+			? []
+			: undefined;
 
 	let agent: Agent;
 

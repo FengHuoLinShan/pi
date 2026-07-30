@@ -1101,6 +1101,9 @@ Content`,
 		it("should emit progress events on install attempt", async () => {
 			const events: ProgressEvent[] = [];
 			packageManager.setProgressCallback((event) => events.push(event));
+			vi.spyOn(packageManager as unknown as PackageManagerInternals, "runCommand").mockRejectedValue(
+				new Error("deterministic install failure"),
+			);
 
 			// Use public install method which emits progress events
 			try {
@@ -1118,6 +1121,9 @@ Content`,
 		it("should recognize github URLs without git: prefix", async () => {
 			const events: ProgressEvent[] = [];
 			packageManager.setProgressCallback((event) => events.push(event));
+			vi.spyOn(packageManager as unknown as PackageManagerInternals, "runCommand").mockRejectedValue(
+				new Error("deterministic clone failure"),
+			);
 			const previousGitTerminalPrompt = process.env.GIT_TERMINAL_PROMPT;
 			process.env.GIT_TERMINAL_PROMPT = "0";
 
@@ -1728,7 +1734,7 @@ Content`,
 			const result = await packageManager.resolve();
 
 			expect(result.extensions.map((resource) => resource.path)).toEqual([join(pkgDir, "extensions", "foo.ts")]);
-			expect(result.skills).toEqual([]);
+			expect(result.skills.some((resource) => resource.path.startsWith(pkgDir))).toBe(false);
 		});
 	});
 

@@ -86,6 +86,33 @@ describe("buildSystemPrompt", () => {
 		});
 	});
 
+	test("uses the compact skill-loading instruction in on-demand mode", () => {
+		const prompt = buildSystemPrompt({
+			selectedTools: ["read", "capability"],
+			toolSnippets: { capability: "Search capabilities" },
+			skillLoading: "on-demand",
+			skills: [
+				{
+					name: "secret-skill-name",
+					description: "A large catalog entry",
+					filePath: "/tmp/secret-skill-name/SKILL.md",
+					baseDir: "/tmp/secret-skill-name",
+					sourceInfo: {
+						path: "/tmp/secret-skill-name/SKILL.md",
+						source: "test",
+						scope: "temporary",
+						origin: "top-level",
+					},
+					disableModelInvocation: false,
+				},
+			],
+			cwd: process.cwd(),
+		});
+
+		expect(prompt).toContain("Specialized skills are available on demand");
+		expect(prompt).not.toContain("secret-skill-name");
+	});
+
 	describe("prompt guidelines", () => {
 		test("appends promptGuidelines to default guidelines", () => {
 			const prompt = buildSystemPrompt({

@@ -96,7 +96,7 @@ Then just talk to pi. By default, pi gives the model four tools: `read`, `write`
 
 ## Providers & Models
 
-For each built-in provider, pi maintains a list of tool-capable models. Configured provider catalogs refresh automatically; run `pi update --models` to force an immediate refresh. Authenticate via subscription (`/login`) or API key, then select any model from that provider via `/model` (or Ctrl+L).
+For each built-in provider, pi maintains a list of tool-capable models. Configured provider catalogs refresh automatically; run `pi update --models` to force an immediate refresh. Authenticate via subscription (`/login`) or API key, then select any model from that provider via `/model`. On wide terminals, Ctrl+L focuses the model sidebar; on narrow terminals it opens the searchable model selector.
 
 **Subscriptions:**
 - Anthropic Claude Pro/Max
@@ -147,8 +147,9 @@ See [docs/providers.md](docs/providers.md) for other provider setup instructions
 
 <p align="center"><img src="docs/images/interactive-mode.png" alt="Interactive Mode" width="600"></p>
 
-The interface from top to bottom:
+The interface includes:
 
+- **Model sidebar** - Shows recent or scoped models and reasoning effort on wide terminals
 - **Startup header** - Shows shortcuts (`/hotkeys` for all), loaded AGENTS.md files, prompt templates, skills, and extensions
 - **Messages** - Your messages, assistant responses, tool calls and results, notifications, errors, and extension UI
 - **Editor** - Where you type; border color indicates thinking level
@@ -210,7 +211,7 @@ See `/hotkeys` for the full list. Customize via `~/.pi/agent/keybindings.json`. 
 | Ctrl+C twice | Quit |
 | Escape | Cancel/abort |
 | Escape twice | Open `/tree` |
-| Ctrl+L | Open model selector |
+| Ctrl+L | Focus model sidebar (or open model selector on narrow terminals) |
 | Ctrl+P / Shift+Ctrl+P | Cycle scoped models forward/backward |
 | Shift+Tab | Cycle thinking level |
 | Ctrl+O | Collapse/expand tool output |

@@ -25,6 +25,7 @@ import {
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
+	DockedLayout,
 	fuzzyFilter,
 	getCapabilities,
 	hyperlink,
@@ -114,6 +115,7 @@ import { FooterComponent, formatTokens } from "./components/footer.ts";
 import { formatKeyText, keyDisplayText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.ts";
 import { LoginDialogComponent } from "./components/login-dialog.ts";
 import { ModelSelectorComponent } from "./components/model-selector.ts";
+import { ModelStatusSidebar, type SidebarModel } from "./components/model-status-sidebar.ts";
 import {
 	type AuthSelectorProvider,
 	formatAuthSelectorProviderType,
@@ -316,6 +318,9 @@ export interface InteractiveModeOptions {
 export class InteractiveMode {
 	private runtimeHost: AgentSessionRuntime;
 	private ui: TUI;
+	private mainContainer: Container;
+	private layout: DockedLayout;
+	private modelSidebar: ModelStatusSidebar;
 	private loadedResourcesContainer: Container;
 	private chatContainer: Container;
 	private pendingMessagesContainer: Container;
@@ -451,6 +456,7 @@ export class InteractiveMode {
 		this.version = VERSION;
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
+		this.mainContainer = new Container();
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
 		this.chatContainer = new Container();
@@ -472,6 +478,32 @@ export class InteractiveMode {
 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
+		this.modelSidebar = new ModelStatusSidebar({
+			models: this.getSidebarModels(),
+			currentModel: this.session.model,
+			currentThinkingLevel: this.session.thinkingLevel,
+			recentModelIds: this.settingsManager.getRecentModels(),
+			onConfirm: async ({ model, thinkingLevel }) => {
+				await this.session.setModel(model, { thinkingLevel });
+				this.footer.invalidate();
+				this.updateEditorBorderColor();
+				this.refreshModelSidebar();
+				this.ui.setFocus(this.editor);
+				this.showStatus(`Switched to ${model.provider}/${model.id} • effort ${this.session.thinkingLevel}`);
+				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
+				this.checkDaxnutsEasterEgg(model);
+			},
+			onCancel: () => {
+				this.ui.setFocus(this.editor);
+				this.ui.requestRender();
+			},
+			requestRender: () => this.ui.requestRender(),
+		});
+		this.layout = new DockedLayout(this.mainContainer, this.modelSidebar, {
+			leftWidth: 28,
+			minMainWidth: 60,
+			viewportHeight: () => this.ui.terminal.rows,
+		});
 
 		// Load hide thinking block setting
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -699,17 +731,18 @@ export class InteractiveMode {
 
 		// Add header container as first child. Populate it after applying theme settings.
 		// Keep loaded resources before chat so restored session messages never precede them.
-		this.ui.addChild(this.headerContainer);
-		this.ui.addChild(this.loadedResourcesContainer);
+		this.mainContainer.addChild(this.headerContainer);
+		this.mainContainer.addChild(this.loadedResourcesContainer);
 
-		this.ui.addChild(this.chatContainer);
-		this.ui.addChild(this.pendingMessagesContainer);
-		this.ui.addChild(this.statusContainer);
+		this.mainContainer.addChild(this.chatContainer);
+		this.mainContainer.addChild(this.pendingMessagesContainer);
+		this.mainContainer.addChild(this.statusContainer);
 		this.renderWidgets(); // Initialize with default spacer
-		this.ui.addChild(this.widgetContainerAbove);
-		this.ui.addChild(this.editorContainer);
-		this.ui.addChild(this.widgetContainerBelow);
-		this.ui.addChild(this.footer);
+		this.mainContainer.addChild(this.widgetContainerAbove);
+		this.mainContainer.addChild(this.editorContainer);
+		this.mainContainer.addChild(this.widgetContainerBelow);
+		this.mainContainer.addChild(this.footer);
+		this.ui.addChild(this.layout);
 		this.ui.setFocus(this.editor);
 
 		this.setupKeyHandlers();
@@ -803,6 +836,7 @@ export class InteractiveMode {
 
 		// Initialize available provider count for footer display
 		await this.updateAvailableProviderCount();
+		this.refreshModelSidebar();
 	}
 
 	/**
@@ -1673,6 +1707,12 @@ export class InteractiveMode {
 			onError: (error) => {
 				this.showExtensionError(error.extensionPath, error.error, error.stack);
 			},
+			onExtensionsChanged: () => {
+				setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
+				this.setupAutocompleteProvider();
+				this.setupExtensionShortcuts(this.session.extensionRunner);
+				this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
+			},
 		});
 
 		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
@@ -2016,19 +2056,19 @@ export class InteractiveMode {
 
 		// Remove current footer from UI
 		if (this.customFooter) {
-			this.ui.removeChild(this.customFooter);
+			this.mainContainer.removeChild(this.customFooter);
 		} else {
-			this.ui.removeChild(this.footer);
+			this.mainContainer.removeChild(this.footer);
 		}
 
 		if (factory) {
 			// Create and add custom footer, passing the data provider
 			this.customFooter = factory(this.ui, theme, this.footerDataProvider);
-			this.ui.addChild(this.customFooter);
+			this.mainContainer.addChild(this.customFooter);
 		} else {
 			// Restore built-in footer
 			this.customFooter = undefined;
-			this.ui.addChild(this.footer);
+			this.mainContainer.addChild(this.footer);
 		}
 
 		this.ui.requestRender();
@@ -2566,7 +2606,7 @@ export class InteractiveMode {
 
 		// Global debug handler on TUI (works regardless of focus)
 		this.ui.onDebug = () => this.handleDebugCommand();
-		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
+		this.defaultEditor.onAction("app.model.select", () => this.focusModelSidebar());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
@@ -2591,6 +2631,31 @@ export class InteractiveMode {
 		this.defaultEditor.onPasteImage = () => {
 			void this.handleClipboardPaste();
 		};
+	}
+
+	private focusModelSidebar(): void {
+		if (!this.layout.isDockVisible(this.ui.terminal.columns)) {
+			this.showModelSelector();
+			return;
+		}
+		this.ui.setFocus(this.modelSidebar);
+		this.ui.requestRender();
+	}
+
+	private getSidebarModels(): SidebarModel[] {
+		if (this.session.scopedModels.length > 0) {
+			return this.session.scopedModels.map(({ model, thinkingLevel }) => ({ model, thinkingLevel }));
+		}
+		return this.session.modelRuntime.getAvailableSnapshot().map((model) => ({ model }));
+	}
+
+	private refreshModelSidebar(): void {
+		this.modelSidebar.update({
+			models: this.getSidebarModels(),
+			currentModel: this.session.model,
+			currentThinkingLevel: this.session.thinkingLevel,
+			recentModelIds: this.settingsManager.getRecentModels(),
+		});
 	}
 
 	private async handleClipboardPaste(): Promise<void> {
@@ -3727,6 +3792,7 @@ export class InteractiveMode {
 		} else {
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
+			this.refreshModelSidebar();
 			this.showStatus(`Thinking level: ${newLevel}`);
 		}
 	}
@@ -3740,6 +3806,7 @@ export class InteractiveMode {
 			} else {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
+				this.refreshModelSidebar();
 				const thinkingStr =
 					result.model.reasoning && result.thinkingLevel !== "off" ? ` (thinking: ${result.thinkingLevel})` : "";
 				this.showStatus(`Switched to ${result.model.name || result.model.id}${thinkingStr}`);
@@ -4199,6 +4266,7 @@ export class InteractiveMode {
 						this.session.setThinkingLevel(level);
 						this.footer.invalidate();
 						this.updateEditorBorderColor();
+						this.refreshModelSidebar();
 					},
 					onThemeChange: (themeSetting) => {
 						this.settingsManager.setTheme(themeSetting);
@@ -4308,6 +4376,7 @@ export class InteractiveMode {
 				await this.session.setModel(model);
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
+				this.refreshModelSidebar();
 				this.showStatus(`Model: ${model.id}`);
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 				this.checkDaxnutsEasterEgg(model);
@@ -4439,6 +4508,7 @@ export class InteractiveMode {
 						await this.session.setModel(model);
 						this.footer.invalidate();
 						this.updateEditorBorderColor();
+						this.refreshModelSidebar();
 						done();
 						this.showStatus(`Model: ${model.id}`);
 						void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
@@ -4503,6 +4573,7 @@ export class InteractiveMode {
 				this.session.setScopedModels([]);
 			}
 			await this.updateAvailableProviderCount();
+			this.refreshModelSidebar();
 			this.ui.requestRender();
 		};
 
@@ -5081,6 +5152,7 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.footer.invalidate();
 		this.updateEditorBorderColor();
+		this.refreshModelSidebar();
 		if (selectedModel) {
 			this.showStatus(`${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}`);
 			void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);

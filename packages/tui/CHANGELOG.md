@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `DockedLayout` for responsive left-side panes that reserve width from main content.
+
 ## [0.80.10] - 2026-07-16
 
 ## [0.80.9] - 2026-07-16

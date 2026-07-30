@@ -204,7 +204,7 @@ See [overlay-qa-tests.ts](../examples/extensions/overlay-qa-tests.ts) for compre
 Import from `@earendil-works/pi-tui`:
 
 ```typescript
-import { Text, Box, Container, Spacer, Markdown } from "@earendil-works/pi-tui";
+import { Text, Box, Container, DockedLayout, Spacer, Markdown } from "@earendil-works/pi-tui";
 ```
 
 ### Text
@@ -244,6 +244,20 @@ const container = new Container();
 container.addChild(component1);
 container.addChild(component2);
 container.removeChild(component1);
+```
+
+### DockedLayout
+
+Reserves terminal width for a responsive left pane while rendering the main component in the remaining width. The dock is hidden when `minMainWidth` cannot be preserved.
+
+```typescript
+const layout = new DockedLayout(main, sidebar, {
+  leftWidth: 28,
+  minMainWidth: 60,
+  viewportHeight: () => tui.terminal.rows,
+});
+
+layout.isDockVisible(tui.terminal.columns);
 ```
 
 ### Spacer

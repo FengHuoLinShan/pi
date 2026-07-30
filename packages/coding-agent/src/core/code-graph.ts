@@ -31,6 +31,8 @@ export interface CodeGraphEdge {
 	to: string;
 	/** File whose extractor owns this edge. */
 	filePath: string;
+	/** Source evidence for the relationship in the owning file. */
+	range?: CodeGraphSourceRange;
 	attributes?: Readonly<Record<string, CodeGraphAttributeValue>>;
 }
 
@@ -78,6 +80,12 @@ export interface CodeGraphSnapshot {
 	files: CodeGraphFileRecord[];
 	nodes: CodeGraphNode[];
 	edges: CodeGraphEdge[];
+}
+
+export interface CodeGraphCounts {
+	fileCount: number;
+	nodeCount: number;
+	edgeCount: number;
 }
 
 export interface CodeGraphUpdateResult {
@@ -256,6 +264,7 @@ function cloneEdge(value: unknown, filePath: string, code: CodeGraphError["code"
 		from: edge.from,
 		to: edge.to,
 		filePath,
+		range: cloneRange(edge.range, `Edge ${edge.id} range`, code),
 		attributes: cloneAttributes(edge.attributes, `Edge ${edge.id} attributes`, code),
 	};
 }
@@ -400,6 +409,18 @@ export class IncrementalCodeGraph {
 	getEdge(id: string): CodeGraphEdge | undefined {
 		const edge = this.edges.get(id);
 		return edge ? copyEdge(edge) : undefined;
+	}
+
+	getCounts(): CodeGraphCounts {
+		return {
+			fileCount: this.files.size,
+			nodeCount: this.nodes.size,
+			edgeCount: this.edges.size,
+		};
+	}
+
+	listNodes(): CodeGraphNode[] {
+		return [...this.nodes.values()].sort((left, right) => compareStrings(left.id, right.id)).map(copyNode);
 	}
 
 	async extractAndUpsert<TInput>(

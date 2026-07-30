@@ -44,6 +44,43 @@ describe("AgentSession model and extension characterization", () => {
 		).toEqual([`${nextModel.provider}/${nextModel.id}`]);
 	});
 
+	it("sets model and thinking level together and records model recency", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", name: "One", reasoning: true },
+				{ id: "faux-2", name: "Two", reasoning: true },
+			],
+		});
+		harnesses.push(harness);
+		const nextModel = harness.getModel("faux-2")!;
+
+		await harness.session.setModel(nextModel, { thinkingLevel: "high" });
+
+		expect(harness.session.model?.id).toBe("faux-2");
+		expect(harness.session.thinkingLevel).toBe("high");
+		expect(harness.session.settingsManager.getRecentModels()).toEqual([`${nextModel.provider}/${nextModel.id}`]);
+	});
+
+	it("does not partially apply a model selection when auth is unavailable", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", name: "One", reasoning: true },
+				{ id: "faux-2", name: "Two", reasoning: true },
+			],
+			withConfiguredAuth: false,
+		});
+		harnesses.push(harness);
+		harness.session.setThinkingLevel("low");
+		const entriesBefore = harness.sessionManager.getEntries().length;
+
+		await expect(harness.session.setModel(harness.getModel("faux-2")!, { thinkingLevel: "high" })).rejects.toThrow();
+
+		expect(harness.session.model?.id).toBe("faux-1");
+		expect(harness.session.thinkingLevel).toBe("low");
+		expect(harness.sessionManager.getEntries()).toHaveLength(entriesBefore);
+		expect(harness.session.settingsManager.getRecentModels()).toEqual([]);
+	});
+
 	it("cycles through scoped models and preserves the scoped thinking preference", async () => {
 		const harness = await createHarness({
 			models: [

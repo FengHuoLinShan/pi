@@ -108,11 +108,13 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
-| `app.model.select` | `ctrl+l` | Open model selector |
+| `app.model.select` | `ctrl+l` | Focus the model sidebar, or open the model selector when the terminal is too narrow for the sidebar |
 | `app.model.cycleForward` | `ctrl+p` | Cycle to next model |
 | `app.model.cycleBackward` | `shift+ctrl+p` | Cycle to previous model |
 | `app.thinking.cycle` | `shift+tab` | Cycle thinking level |
 | `app.thinking.toggle` | `ctrl+t` | Collapse or expand thinking blocks |
+
+When the model sidebar is focused, `up`/`down` selects a recent or scoped model, `left`/`right` selects a supported reasoning effort, `enter` applies both, and `escape` or `app.model.select` cancels and returns focus to the editor.
 
 ### Display and Message Queue
 

@@ -6,14 +6,17 @@ This page collects day-to-day usage details that do not fit on the quickstart pa
 
 <p align="center"><img src="images/interactive-mode.png" alt="Interactive Mode" width="600"></p>
 
-The interface has four main areas:
+The interface has five main areas on wide terminals:
 
+- **Model sidebar** - recent or scoped models and the current reasoning effort
 - **Startup header** - shortcuts, loaded context files, prompt templates, skills, and extensions
 - **Messages** - user messages, assistant responses, tool calls, tool results, notifications, errors, and extension UI
 - **Editor** - where you type; border color indicates the current thinking level
 - **Footer** - working directory, session name, token/cache usage, cost, context usage, and current model
 
 The editor can be replaced temporarily by built-in UI such as `/settings` or by custom extension UI.
+
+Press Ctrl+L to focus the model sidebar. Use Up/Down to select a model, Left/Right to select a supported reasoning effort, Enter to apply both, and Escape to cancel. The sidebar is hidden when it would leave fewer than 60 columns for the main interface; Ctrl+L then opens the searchable model selector instead.
 
 ### Editor Features
 

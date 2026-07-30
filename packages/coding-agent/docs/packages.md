@@ -9,6 +9,7 @@ Pi packages bundle extensions, skills, prompt templates, and themes so you can s
 - [Install and Manage](#install-and-manage)
 - [Package Sources](#package-sources)
 - [Creating a Pi Package](#creating-a-pi-package)
+- [Lazy Extensions](#lazy-extensions)
 - [Package Structure](#package-structure)
 - [Dependencies](#dependencies)
 - [Package Filtering](#package-filtering)
@@ -131,6 +132,32 @@ Add a `pi` manifest to `package.json` or use conventional directories. Include t
 ```
 
 Paths are relative to the package root. Arrays support glob patterns and `!exclusions`.
+
+## Lazy Extensions
+
+Packages can advertise optional extensions without importing their modules at startup. Pi exposes a compact `capability` tool that can search these descriptors and activate a selected extension on demand:
+
+```json
+{
+  "name": "my-package",
+  "pi": {
+    "lazyExtensions": [
+      {
+        "id": "browser-tools",
+        "path": "./dist/browser-extension.js",
+        "description": "Inspect and automate web pages with a local browser.",
+        "keywords": ["browser", "playwright", "web"]
+      }
+    ]
+  }
+}
+```
+
+`id` must use lowercase letters, numbers, `.`, `_`, or `-`, starting with a letter or number. IDs must be unique across discovered lazy extensions. `path` is relative to the package root.
+
+A lazy extension is not imported until `capability` loads its ID. Concurrent loads are coalesced, failed activation remains failed until an explicit retry, and reload returns the descriptor to its dormant state. Lazy activation intentionally rejects provider registration, CLI flags, and `project_trust` handlers because those capabilities must be established during normal startup. Package and project trust rules still apply before a descriptor becomes visible.
+
+Extension filters apply to lazy extensions through the package's `extensions` filter. `pi.extensions` remains eager and unchanged.
 
 ### Gallery Metadata
 

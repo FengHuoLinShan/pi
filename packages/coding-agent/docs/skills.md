@@ -70,6 +70,16 @@ For project-level Claude Code skills, add to `.pi/settings.json`:
 
 This is progressive disclosure: only descriptions are always in context, full instructions load on-demand.
 
+For a large skill catalog, enable capability-based discovery:
+
+```json
+{
+  "skillLoading": "on-demand"
+}
+```
+
+In this mode, startup still reads bounded frontmatter metadata for discovery, but skill names and descriptions are omitted from the system prompt. The model uses the ordinary `capability` tool to search metadata and load the selected `SKILL.md` body. `/skill:name` commands continue to work. The default `"prompt"` mode preserves the existing Agent Skills integration.
+
 ## Skill Commands
 
 Skills register as `/skill:name` commands:

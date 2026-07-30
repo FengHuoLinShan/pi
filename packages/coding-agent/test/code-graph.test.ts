@@ -275,7 +275,10 @@ describe("IncrementalCodeGraph", () => {
 
 		const snapshot = graph.snapshot();
 		snapshot.nodes[0].name = "mutated";
+		const listedNodes = graph.listNodes();
+		listedNodes[0].name = "also mutated";
 		expect(graph.getNode("a")?.name).toBe("a");
+		expect(graph.getCounts()).toEqual({ fileCount: 1, nodeCount: 3, edgeCount: 2 });
 		expect(graph.findForwardDependencies("a", { maxPaths: 1 })).toEqual({
 			paths: [{ nodeIds: ["a", "b"], edgeIds: ["a-b"] }],
 			truncated: true,
@@ -283,6 +286,59 @@ describe("IncrementalCodeGraph", () => {
 		expect(() => graph.findForwardDependencies("a", { maxDepth: 0 })).toThrowError(CodeGraphError);
 		expect(() => graph.findForwardDependencies("a", { maxDepth: 65 })).toThrowError(/must not exceed 64/);
 		expect(() => graph.findForwardDependencies("a", { maxPaths: 10_001 })).toThrowError(/must not exceed 10000/);
+	});
+
+	it("validates, snapshots, and defensively copies edge source ranges", () => {
+		const graph = new IncrementalCodeGraph();
+		graph.upsertFile({
+			path: "src/a.ts",
+			previousRevision: null,
+			revision: revision("a"),
+			extraction: {
+				nodes: [
+					{ id: "a", kind: "symbol", name: "a" },
+					{ id: "b", kind: "symbol", name: "b" },
+				],
+				edges: [
+					{
+						id: "a-b",
+						kind: "depends_on",
+						from: "a",
+						to: "b",
+						range: { start: { line: 4, column: 2 }, end: { line: 4, column: 9 } },
+					},
+				],
+			},
+		});
+
+		const snapshot = graph.snapshot();
+		expect(snapshot.edges[0].range).toEqual({
+			start: { line: 4, column: 2 },
+			end: { line: 4, column: 9 },
+		});
+		(snapshot.edges[0].range as { start: { line: number } }).start.line = 99;
+		expect(graph.getEdge("a-b")?.range?.start.line).toBe(4);
+		expect(IncrementalCodeGraph.fromJSON(graph.toJSON()).getEdge("a-b")?.range?.end.column).toBe(9);
+
+		expect(() =>
+			graph.upsertFile({
+				path: "src/a.ts",
+				previousRevision: revision("a"),
+				revision: revision("invalid"),
+				extraction: {
+					nodes: [{ id: "a", kind: "symbol", name: "a" }],
+					edges: [
+						{
+							id: "invalid",
+							kind: "depends_on",
+							from: "a",
+							to: "b",
+							range: { start: { line: 5, column: 0 }, end: { line: 4, column: 0 } },
+						},
+					],
+				},
+			}),
+		).toThrowError(/must not precede/);
 	});
 
 	it("normalizes portable file paths and fails atomically when generation is exhausted", () => {

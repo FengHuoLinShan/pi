@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "drivers": {
+    "playwright-mcp-smoke": {
+      "kind": "browser-jsonl-command",
+      "spec": {
+        "command": "node",
+        "args": [
+          "../fixtures/playwright-mcp-probe.mjs",
+          "{{fixtureUrl}}"
+        ],
+        "inheritEnvironment": true
+      }
+    },
+    "playwright-cli-smoke": {
+      "kind": "browser-jsonl-command",
+      "spec": {
+        "command": "node",
+        "args": [
+          "../fixtures/playwright-cli-probe.mjs",
+          "{{fixtureUrl}}"
+        ],
+        "inheritEnvironment": true
+      }
+    },
+    "adapter-proxy": {
+      "kind": "browser-jsonl-command",
+      "spec": {
+        "command": "node",
+        "args": [
+          "../fixtures/live-pi-candidate.mjs",
+          "adapter-proxy",
+          "{{task}}",
+          "{{fixtureUrl}}",
+          "{{scenario}}",
+          "{{attempt}}"
+        ],
+        "inheritEnvironment": true,
+        "maxOutputBytes": 20971520
+      }
+    },
+    "adapter-hybrid": {
+      "kind": "browser-jsonl-command",
+      "spec": {
+        "command": "node",
+        "args": [
+          "../fixtures/live-pi-candidate.mjs",
+          "adapter-hybrid",
+          "{{task}}",
+          "{{fixtureUrl}}",
+          "{{scenario}}",
+          "{{attempt}}"
+        ],
+        "inheritEnvironment": true,
+        "maxOutputBytes": 20971520
+      }
+    },
+    "adapter-direct": {
+      "kind": "browser-jsonl-command",
+      "spec": {
+        "command": "node",
+        "args": [
+          "../fixtures/live-pi-candidate.mjs",
+          "adapter-direct",
+          "{{task}}",
+          "{{fixtureUrl}}",
+          "{{scenario}}",
+          "{{attempt}}"
+        ],
+        "inheritEnvironment": true,
+        "maxOutputBytes": 20971520
+      }
+    },
+    "playwright-cli-skill": {
+      "kind": "browser-jsonl-command",
+      "spec": {
+        "command": "node",
+        "args": [
+          "../fixtures/live-pi-candidate.mjs",
+          "playwright-cli-skill",
+          "{{task}}",
+          "{{fixtureUrl}}",
+          "{{scenario}}",
+          "{{attempt}}"
+        ],
+        "inheritEnvironment": true,
+        "maxOutputBytes": 20971520
+      }
+    }
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "name": "capability-offline-v1",
+  "defaults": {
+    "budgets": {
+      "maxWallTimeMs": 30000,
+      "maxModelRequests": 0,
+      "maxToolCalls": 8,
+      "maxTotalTokens": 0
+    },
+    "attempts": {
+      "count": 1,
+      "minimumPassing": 1
+    }
+  },
+  "scenarios": [
+    {
+      "version": 1,
+      "id": "mock-mcp-stdio",
+      "description": "MCP stdio initialization, pagination, success, tool error, and lifecycle cleanup",
+      "layer": "offline",
+      "task": "Probe the deterministic MCP stdio fixture",
+      "driver": {
+        "id": "mock-mcp-stdio"
+      },
+      "verifiers": [
+        {
+          "type": "output",
+          "operator": "equals",
+          "expected": "stdio MCP probe completed"
+        },
+        {
+          "type": "trace_order",
+          "expected": [
+            "mcp:initialized",
+            "mcp:tools_page_1",
+            "mcp:tools_page_2",
+            "mcp:echo_called",
+            "mcp:error_returned",
+            "mcp:process_exited"
+          ]
+        },
+        {
+          "type": "lifecycle_order",
+          "expected": [
+            "server.started",
+            "request.received",
+            "server.stopped"
+          ]
+        },
+        {
+          "type": "metric",
+          "metric": "orphanProcesses",
+          "operator": "equals",
+          "expected": 0
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "id": "mock-mcp-http",
+      "description": "MCP HTTP initialization, pagination, and structured tool result",
+      "layer": "offline",
+      "task": "Probe the deterministic MCP HTTP fixture",
+      "driver": {
+        "id": "mock-mcp-http"
+      },
+      "verifiers": [
+        {
+          "type": "output",
+          "operator": "equals",
+          "expected": "HTTP MCP probe completed"
+        },
+        {
+          "type": "trace_order",
+          "expected": [
+            "mcp:initialized",
+            "mcp:tools_page_1",
+            "mcp:tools_page_2",
+            "mcp:echo_called"
+          ]
+        },
+        {
+          "type": "metric",
+          "metric": "orphanProcesses",
+          "operator": "equals",
+          "expected": 0
+        }
+      ]
+    }
+  ]
+}

@@ -60,6 +60,16 @@ npm test                          # Run all tests
 npm test -- test/specific.test.ts # Run specific test
 ```
 
+MCP and browser integration changes also have layered capability evaluations:
+
+```bash
+npm run eval:capabilities:offline
+npm run eval:capabilities:browser
+RUN_PI_LIVE_CAPABILITY_EVALS=1 npm run eval:capabilities:live
+```
+
+See [Capability Evaluations](capability-evals.md) for the candidate matrix, isolation rules, and report format.
+
 ## Project Structure
 
 ```
@@ -68,4 +78,5 @@ packages/
   agent/        # Agent loop and message types  
   tui/          # Terminal UI components
   coding-agent/ # CLI and interactive mode
+  codegraph/    # Optional on-demand TypeScript/JavaScript code graph
 ```

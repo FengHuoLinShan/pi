@@ -16,7 +16,12 @@ import {
 	loadExtensionsCached,
 } from "./extensions/loader.ts";
 import type { Extension, ExtensionRuntime, InlineExtension, LoadExtensionsResult } from "./extensions/types.ts";
-import { DefaultPackageManager, type PathMetadata, type ResolvedResource } from "./package-manager.ts";
+import {
+	DefaultPackageManager,
+	type PathMetadata,
+	type ResolvedLazyExtension,
+	type ResolvedResource,
+} from "./package-manager.ts";
 import type { PromptTemplate } from "./prompt-templates.ts";
 import { loadPromptTemplates } from "./prompt-templates.ts";
 import { SettingsManager } from "./settings-manager.ts";
@@ -35,6 +40,24 @@ export interface ResourceLoaderReloadOptions {
 	resolveProjectTrust?: (input: { extensionsResult: LoadExtensionsResult }) => Promise<boolean>;
 }
 
+export type LazyExtensionStatus = "dormant" | "loading" | "active" | "failed";
+
+export interface LazyExtensionInfo {
+	id: string;
+	path: string;
+	description: string;
+	keywords?: string[];
+	status: LazyExtensionStatus;
+	error?: string;
+	sourceInfo: SourceInfo;
+}
+
+export interface LazyExtensionActivationResult {
+	info: LazyExtensionInfo;
+	extension?: Extension;
+	activated: boolean;
+}
+
 export interface ResourceLoader {
 	getExtensions(): LoadExtensionsResult;
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
@@ -43,6 +66,8 @@ export interface ResourceLoader {
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
 	getSystemPrompt(): string | undefined;
 	getAppendSystemPrompt(): string[];
+	getLazyExtensions?(): LazyExtensionInfo[];
+	activateExtension?(id: string, options?: { retry?: boolean }): Promise<LazyExtensionActivationResult>;
 	extendResources(paths: ResourceExtensionPaths): void;
 	reload(options?: ResourceLoaderReloadOptions): Promise<void>;
 }
@@ -210,6 +235,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private lastPromptPaths: string[];
 	private lastThemePaths: string[];
 	private loaded: boolean;
+	private lazyExtensions: Map<string, LazyExtensionInfo>;
+	private lazyExtensionActivations: Map<string, Promise<LazyExtensionActivationResult>>;
+	private lazyExtensionGeneration: number;
+	private lazyExtensionReloading: boolean;
 
 	constructor(options: DefaultResourceLoaderOptions) {
 		this.cwd = resolvePath(options.cwd);
@@ -257,6 +286,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.lastPromptPaths = [];
 		this.lastThemePaths = [];
 		this.loaded = false;
+		this.lazyExtensions = new Map();
+		this.lazyExtensionActivations = new Map();
+		this.lazyExtensionGeneration = 0;
+		this.lazyExtensionReloading = false;
 	}
 
 	getExtensions(): LoadExtensionsResult {
@@ -285,6 +318,152 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	getAppendSystemPrompt(): string[] {
 		return this.appendSystemPrompt;
+	}
+
+	getLazyExtensions(): LazyExtensionInfo[] {
+		return Array.from(this.lazyExtensions.values()).map((info) => ({
+			...info,
+			keywords: info.keywords ? [...info.keywords] : undefined,
+			sourceInfo: { ...info.sourceInfo },
+		}));
+	}
+
+	async activateExtension(id: string, options?: { retry?: boolean }): Promise<LazyExtensionActivationResult> {
+		if (this.lazyExtensionReloading) {
+			throw new Error("Lazy extensions cannot be activated while resources are reloading");
+		}
+		const info = this.lazyExtensions.get(id);
+		if (!info) {
+			throw new Error(`Unknown lazy extension: ${id}`);
+		}
+		if (info.status === "active") {
+			const extension = this.extensionsResult.extensions.find(
+				(candidate) => candidate.resolvedPath === this.resolveExtensionLoadPath(info.path),
+			);
+			return { info: { ...info }, extension, activated: false };
+		}
+		if (info.status === "failed" && !options?.retry) {
+			return { info: { ...info }, activated: false };
+		}
+
+		const activeRequest = this.lazyExtensionActivations.get(id);
+		if (activeRequest) return activeRequest;
+
+		info.status = "loading";
+		info.error = undefined;
+		const generation = this.lazyExtensionGeneration;
+		const request = this.activateLazyExtension(info, generation).finally(() => {
+			if (this.lazyExtensionActivations.get(id) === request) {
+				this.lazyExtensionActivations.delete(id);
+			}
+		});
+		this.lazyExtensionActivations.set(id, request);
+		return request;
+	}
+
+	private async activateLazyExtension(
+		info: LazyExtensionInfo,
+		generation: number,
+	): Promise<LazyExtensionActivationResult> {
+		let extension: Extension | undefined;
+		try {
+			const activationRuntime = createExtensionRuntime();
+			activationRuntime.lazyRegistrationRestrictions = true;
+			const result = await loadExtensionsCached([info.path], this.cwd, this.eventBus, activationRuntime);
+			const loadError = result.errors[0];
+			extension = result.extensions[0];
+			if (loadError || !extension) {
+				throw new Error(loadError?.error ?? "Extension did not produce a valid runtime");
+			}
+			if (
+				extension.flags.size > 0 ||
+				extension.handlers.has("project_trust") ||
+				activationRuntime.pendingProviderRegistrations.length > 0 ||
+				activationRuntime.pendingNativeProviderRegistrations.length > 0
+			) {
+				throw new Error("Lazy extensions cannot register CLI flags, project_trust handlers, or providers");
+			}
+
+			extension.sourceInfo = info.sourceInfo;
+			for (const command of extension.commands.values()) command.sourceInfo = info.sourceInfo;
+			for (const tool of extension.tools.values()) tool.sourceInfo = info.sourceInfo;
+
+			const extensionPath = extension.path;
+			const conflicts = this.detectExtensionConflicts([...this.extensionsResult.extensions, extension]).filter(
+				(conflict) => conflict.path === extensionPath,
+			);
+			if (conflicts.length > 0) {
+				throw new Error(conflicts.map((conflict) => conflict.message).join("; "));
+			}
+			if (
+				generation !== this.lazyExtensionGeneration ||
+				this.lazyExtensionReloading ||
+				this.lazyExtensions.get(info.id) !== info
+			) {
+				throw new Error("Lazy extension activation was invalidated by a resource reload");
+			}
+
+			this.adoptLazyExtensionRuntime(activationRuntime);
+			this.commitLazyExtension(extension);
+			info.status = "active";
+			return { info: { ...info }, extension, activated: true };
+		} catch (error) {
+			const disposable = extension?.disposable;
+			if (disposable) {
+				try {
+					await disposable.dispose();
+				} catch {}
+				if (extension) extension.disposable = undefined;
+			}
+			info.status = "failed";
+			info.error = error instanceof Error ? error.message : String(error);
+			return { info: { ...info }, activated: false };
+		}
+	}
+
+	private commitLazyExtension(extension: Extension): void {
+		const current = this.extensionsResult;
+		const proposed: LoadExtensionsResult = {
+			extensions: [...current.extensions, extension],
+			errors: [...current.errors],
+			runtime: current.runtime,
+		};
+		const accepted = this.extensionsOverride ? this.extensionsOverride(proposed) : proposed;
+		const preservesCurrentExtensions = current.extensions.every(
+			(existing, index) => accepted.extensions[index] === existing,
+		);
+		if (
+			accepted.runtime !== current.runtime ||
+			!preservesCurrentExtensions ||
+			accepted.extensions.length !== current.extensions.length + 1 ||
+			accepted.extensions.at(-1) !== extension
+		) {
+			throw new Error("Lazy extension activation was rejected by the configured extensions override");
+		}
+		this.extensionsResult = accepted;
+	}
+
+	private adoptLazyExtensionRuntime(runtime: ExtensionRuntime): void {
+		const parent = this.extensionsResult.runtime;
+		runtime.sendMessage = parent.sendMessage;
+		runtime.sendUserMessage = parent.sendUserMessage;
+		runtime.appendEntry = parent.appendEntry;
+		runtime.setSessionName = parent.setSessionName;
+		runtime.getSessionName = parent.getSessionName;
+		runtime.setLabel = parent.setLabel;
+		runtime.getActiveTools = parent.getActiveTools;
+		runtime.getAllTools = parent.getAllTools;
+		runtime.setActiveTools = parent.setActiveTools;
+		runtime.refreshTools = parent.refreshTools;
+		runtime.getCommands = parent.getCommands;
+		runtime.setModel = parent.setModel;
+		runtime.getThinkingLevel = parent.getThinkingLevel;
+		runtime.setThinkingLevel = parent.setThinkingLevel;
+		runtime.flagValues = parent.flagValues;
+		runtime.assertActive = parent.assertActive;
+		runtime.invalidate = parent.invalidate;
+		// Lazy extensions stay provider-neutral for their entire lifetime. The
+		// restricted runtime methods installed during loading remain in place.
 	}
 
 	extendResources(paths: ResourceExtensionPaths): void {
@@ -337,7 +516,18 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	async reload(options?: ResourceLoaderReloadOptions): Promise<void> {
 		resetTimings("extensions");
+		this.lazyExtensionReloading = true;
+		this.lazyExtensionGeneration++;
+		this.lazyExtensions = new Map();
+		this.lazyExtensionActivations.clear();
+		try {
+			await this.reloadResources(options);
+		} finally {
+			this.lazyExtensionReloading = false;
+		}
+	}
 
+	private async reloadResources(options?: ResourceLoaderReloadOptions): Promise<void> {
 		if (this.loaded) {
 			clearExtensionCache();
 		}
@@ -396,6 +586,13 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const cliEnabledSkills = getEnabledPaths(cliExtensionPaths.skills);
 		const cliEnabledPrompts = getEnabledPaths(cliExtensionPaths.prompts);
 		const cliEnabledThemes = getEnabledPaths(cliExtensionPaths.themes);
+		const lazyExtensionResources = this.noExtensions
+			? (cliExtensionPaths.lazyExtensions ?? []).filter((entry) => entry.enabled)
+			: [
+					...(cliExtensionPaths.lazyExtensions ?? []).filter((entry) => entry.enabled),
+					...(resolvedPaths.lazyExtensions ?? []).filter((entry) => entry.enabled),
+				];
+		this.updateLazyExtensions(lazyExtensionResources);
 
 		const extensionPaths = this.noExtensions
 			? cliEnabledExtensions
@@ -596,6 +793,27 @@ export class DefaultResourceLoader implements ResourceLoader {
 			return skillFile;
 		}
 		return resource.path;
+	}
+
+	private updateLazyExtensions(resources: ResolvedLazyExtension[]): void {
+		this.lazyExtensions = new Map();
+		for (const resource of resources) {
+			if (
+				this.lazyExtensions.has(resource.id) ||
+				!/^[a-z0-9][a-z0-9._-]*$/.test(resource.id) ||
+				resource.description.trim().length === 0
+			) {
+				continue;
+			}
+			this.lazyExtensions.set(resource.id, {
+				id: resource.id,
+				path: resource.path,
+				description: resource.description,
+				keywords: resource.keywords ? [...resource.keywords] : undefined,
+				status: "dormant",
+				sourceInfo: createSourceInfo(resource.path, resource.metadata),
+			});
+		}
 	}
 
 	private normalizeExtensionPaths(

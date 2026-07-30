@@ -191,11 +191,15 @@ export async function emitSessionShutdownEvent(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
 ): Promise<boolean> {
-	if (extensionRunner.hasHandlers("session_shutdown")) {
-		await extensionRunner.emit(event);
-		return true;
+	const hadHandlers = extensionRunner.hasHandlers("session_shutdown");
+	try {
+		if (hadHandlers) {
+			await extensionRunner.emit(event);
+		}
+	} finally {
+		await extensionRunner.disposeExtensions();
 	}
-	return false;
+	return hadHandlers;
 }
 
 export async function emitProjectTrustEvent(
@@ -300,7 +304,7 @@ export class ExtensionRunner {
 		sessionManager: SessionManager,
 		modelRegistry: ModelRegistry,
 	) {
-		this.extensions = extensions;
+		this.extensions = [...extensions];
 		this.runtime = runtime;
 		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
@@ -441,6 +445,51 @@ export class ExtensionRunner {
 
 	getExtensionPaths(): string[] {
 		return this.extensions.map((e) => e.path);
+	}
+
+	/** Add a fully initialized extension to the live runner. */
+	addExtension(extension: Extension): boolean {
+		this.assertActive();
+		if (this.extensions.some((existing) => existing.resolvedPath === extension.resolvedPath)) {
+			return false;
+		}
+		this.extensions.push(extension);
+		return true;
+	}
+
+	/** Emit activation startup only to the newly activated extension. */
+	async emitActivationStart(extension: Extension): Promise<void> {
+		const ctx = this.createContext();
+		for (const handler of extension.handlers.get("session_start") ?? []) {
+			try {
+				await handler({ type: "session_start", reason: "activation" }, ctx);
+			} catch (error) {
+				this.emitError({
+					extensionPath: extension.path,
+					event: "session_start",
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+			}
+		}
+	}
+
+	async disposeExtensions(): Promise<void> {
+		for (const extension of [...this.extensions].reverse()) {
+			const disposable = extension.disposable;
+			if (!disposable) continue;
+			extension.disposable = undefined;
+			try {
+				await disposable.dispose();
+			} catch (error) {
+				this.emitError({
+					extensionPath: extension.path,
+					event: "dispose",
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+			}
+		}
 	}
 
 	/** Get all registered tools from all extensions (first registration per name wins). */
@@ -1125,6 +1174,7 @@ export class ExtensionRunner {
 	async emitResourcesDiscover(
 		cwd: string,
 		reason: ResourcesDiscoverEvent["reason"],
+		extensions: Extension[] = this.extensions,
 	): Promise<{
 		skillPaths: Array<{ path: string; extensionPath: string }>;
 		promptPaths: Array<{ path: string; extensionPath: string }>;
@@ -1135,7 +1185,7 @@ export class ExtensionRunner {
 		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
 		const themePaths: Array<{ path: string; extensionPath: string }> = [];
 
-		for (const ext of this.extensions) {
+		for (const ext of extensions) {
 			const handlers = ext.handlers.get("resources_discover");
 			if (!handlers || handlers.length === 0) continue;
 

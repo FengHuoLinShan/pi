@@ -4,6 +4,10 @@
 
 ### Added
 
+- Added a responsive model sidebar for quickly selecting recent or scoped models and supported reasoning effort with the keyboard.
+- Added capability search and activation, on-demand skill loading, and package-declared lazy extensions with reload-safe lifecycle handling.
+- Added versioned offline, browser, and live capability evaluations for MCP and pinned Playwright integration candidates.
+- Added per-agent and per-task provider, model, and thinking configuration, personal runtime overrides, live state events, and isolated cancellation to the subagent extension example.
 - Added built-in llama.cpp router support with `/login` connection setup and `/llama` Hugging Face model search and downloads, explicit loading, unloading, and live progress. See [llama.cpp](docs/llama-cpp.md).
 - Added extension registration for complete pi-ai providers, including native authentication, model refresh, filtering, and streaming behavior.
 - Added SHA-256 revision preconditions and mutation evidence, opt-in canonical allowed-root enforcement, and atomic local commits for the built-in `read`, `edit`, and `write` tools.

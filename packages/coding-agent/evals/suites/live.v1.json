@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "name": "capability-live-v1",
+  "defaults": {
+    "budgets": {
+      "maxWallTimeMs": 240000,
+      "maxModelRequests": 20,
+      "maxToolCalls": 30,
+      "maxTotalTokens": 100000
+    },
+    "attempts": {
+      "count": 3,
+      "minimumPassing": 2
+    }
+  },
+  "scenarios": [
+    {
+      "version": 1,
+      "id": "adapter-proxy",
+      "description": "pi-mcp-adapter proxy discovery and invocation with safe Playwright MCP configuration",
+      "layer": "live",
+      "task": "Navigate to the todo page, add a todo named capability matrix, complete it, verify it is complete, and return EVAL_OK.",
+      "driver": {
+        "id": "adapter-proxy"
+      },
+      "budgets": {
+        "maxModelRequests": 30,
+        "maxToolCalls": 30,
+        "maxTotalTokens": 200000
+      },
+      "verifiers": [
+        {
+          "type": "output",
+          "operator": "matches",
+          "expected": "(?:^|\\n)EVAL_OK\\s*$"
+        },
+        {
+          "type": "artifact_json",
+          "path": "fixture-state.json",
+          "pointer": "/todos",
+          "expected": [
+            {
+              "text": "capability matrix",
+              "completed": true
+            }
+          ]
+        },
+        {
+          "type": "metric",
+          "metric": "orphanProcesses",
+          "operator": "equals",
+          "expected": 0
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "id": "adapter-hybrid",
+      "description": "pi-mcp-adapter with a small direct safe-tool allowlist plus the discovery proxy",
+      "layer": "live",
+      "task": "Navigate to the todo page, add a todo named capability matrix, complete it, verify it is complete, and return EVAL_OK.",
+      "driver": {
+        "id": "adapter-hybrid"
+      },
+      "verifiers": [
+        {
+          "type": "output",
+          "operator": "matches",
+          "expected": "(?:^|\\n)EVAL_OK\\s*$"
+        },
+        {
+          "type": "artifact_json",
+          "path": "fixture-state.json",
+          "pointer": "/todos",
+          "expected": [
+            {
+              "text": "capability matrix",
+              "completed": true
+            }
+          ]
+        },
+        {
+          "type": "metric",
+          "metric": "orphanProcesses",
+          "operator": "equals",
+          "expected": 0
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "id": "adapter-direct",
+      "description": "pi-mcp-adapter direct safe tools with the discovery proxy disabled",
+      "layer": "live",
+      "task": "Navigate to the todo page, add a todo named capability matrix, complete it, verify it is complete, and return EVAL_OK.",
+      "driver": {
+        "id": "adapter-direct"
+      },
+      "verifiers": [
+        {
+          "type": "output",
+          "operator": "matches",
+          "expected": "(?:^|\\n)EVAL_OK\\s*$"
+        },
+        {
+          "type": "artifact_json",
+          "path": "fixture-state.json",
+          "pointer": "/todos",
+          "expected": [
+            {
+              "text": "capability matrix",
+              "completed": true
+            }
+          ]
+        },
+        {
+          "type": "metric",
+          "metric": "orphanProcesses",
+          "operator": "equals",
+          "expected": 0
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "id": "playwright-cli-skill",
+      "description": "Playwright CLI driven through its pinned skill with only Pi's bash tool enabled",
+      "layer": "live",
+      "task": "Navigate to the todo page, add a todo named capability matrix, complete it, verify it is complete, and return EVAL_OK.",
+      "driver": {
+        "id": "playwright-cli-skill"
+      },
+      "budgets": {
+        "maxWallTimeMs": 150000,
+        "maxModelRequests": 24,
+        "maxToolCalls": 24,
+        "maxTotalTokens": 130000
+      },
+      "verifiers": [
+        {
+          "type": "output",
+          "operator": "matches",
+          "expected": "(?:^|\\n)EVAL_OK\\s*$"
+        },
+        {
+          "type": "artifact_json",
+          "path": "fixture-state.json",
+          "pointer": "/todos",
+          "expected": [
+            {
+              "text": "capability matrix",
+              "completed": true
+            }
+          ]
+        },
+        {
+          "type": "metric",
+          "metric": "orphanProcesses",
+          "operator": "equals",
+          "expected": 0
+        }
+      ]
+    }
+  ]
+}
