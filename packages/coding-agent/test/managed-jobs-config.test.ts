@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -148,5 +148,26 @@ describe("managed jobs config", () => {
 		await rm(configPath);
 		await writeFile(configPath, " ".repeat(256 * 1024 + 1), "utf8");
 		await expect(loadManagedJobsConfig(workspace)).rejects.toThrow("exceeds 262144 bytes");
+	});
+
+	it("rejects a regular config replaced after path validation", async () => {
+		const workspace = await createWorkspace();
+		const configPath = join(workspace, MANAGED_JOBS_CONFIG_PATH);
+		const originalPath = join(workspace, ".pi", "managed-jobs.original.json");
+		await writeFile(configPath, JSON.stringify(validConfig()), "utf8");
+
+		await expect(
+			loadManagedJobsConfig(workspace, {
+				openFile: async (path, flags) => {
+					await rename(configPath, originalPath);
+					await writeFile(
+						configPath,
+						JSON.stringify({ version: 1, recipes: [{ id: "replacement", command: "node" }] }),
+						"utf8",
+					);
+					return open(path, flags);
+				},
+			}),
+		).rejects.toThrow("changed while being loaded; retry");
 	});
 });

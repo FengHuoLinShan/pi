@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { type FileHandle, lstat, open, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { captureFilePathSnapshot, revalidateFilePathSnapshot } from "../../core/tools/file-transaction.ts";
 
@@ -36,6 +37,10 @@ export interface ManagedJobsConfig {
 export interface LoadedManagedJobsConfig {
 	config: ManagedJobsConfig;
 	revision: string;
+}
+
+interface ManagedJobsConfigLoadOptions {
+	openFile?: (path: string, flags: number) => Promise<FileHandle>;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -137,7 +142,32 @@ export function parseManagedJobsConfig(value: unknown): ManagedJobsConfig {
 	return { version: MANAGED_JOBS_CONFIG_VERSION, recipes };
 }
 
-export async function loadManagedJobsConfig(cwd: string): Promise<LoadedManagedJobsConfig> {
+function sameFileSnapshot(expected: Stats, actual: Stats): boolean {
+	return (
+		expected.dev === actual.dev &&
+		expected.ino === actual.ino &&
+		expected.mode === actual.mode &&
+		expected.size === actual.size &&
+		expected.mtimeMs === actual.mtimeMs &&
+		expected.ctimeMs === actual.ctimeMs
+	);
+}
+
+async function readBoundedConfigFile(handle: FileHandle): Promise<Buffer> {
+	const buffer = Buffer.alloc(MAX_CONFIG_BYTES + 1);
+	let offset = 0;
+	while (offset < buffer.byteLength) {
+		const { bytesRead } = await handle.read(buffer, offset, buffer.byteLength - offset, offset);
+		if (bytesRead === 0) break;
+		offset += bytesRead;
+	}
+	return buffer.subarray(0, offset);
+}
+
+export async function loadManagedJobsConfig(
+	cwd: string,
+	options: ManagedJobsConfigLoadOptions = {},
+): Promise<LoadedManagedJobsConfig> {
 	const path = join(cwd, MANAGED_JOBS_CONFIG_PATH);
 	const info = await lstat(path);
 	if (!info.isFile() || info.isSymbolicLink()) {
@@ -148,7 +178,21 @@ export async function loadManagedJobsConfig(cwd: string): Promise<LoadedManagedJ
 	}
 	const snapshot = await captureFilePathSnapshot(path, MANAGED_JOBS_CONFIG_PATH, [cwd], realpath, true);
 	await revalidateFilePathSnapshot(snapshot, MANAGED_JOBS_CONFIG_PATH, [cwd], realpath);
-	const source = await readFile(snapshot.targetPath);
+	const handle = await (options.openFile ?? open)(snapshot.targetPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+	let source: Buffer;
+	try {
+		const openedInfo = await handle.stat();
+		if (!openedInfo.isFile() || !sameFileSnapshot(info, openedInfo)) {
+			throw new Error(`${MANAGED_JOBS_CONFIG_PATH} changed while being loaded; retry`);
+		}
+		source = await readBoundedConfigFile(handle);
+		const finalInfo = await handle.stat();
+		if (!sameFileSnapshot(openedInfo, finalInfo)) {
+			throw new Error(`${MANAGED_JOBS_CONFIG_PATH} changed while being loaded; retry`);
+		}
+	} finally {
+		await handle.close();
+	}
 	await revalidateFilePathSnapshot(snapshot, MANAGED_JOBS_CONFIG_PATH, [cwd], realpath);
 	if (source.byteLength > MAX_CONFIG_BYTES) {
 		throw new Error(`${MANAGED_JOBS_CONFIG_PATH} exceeds ${MAX_CONFIG_BYTES} bytes`);

@@ -44,6 +44,7 @@
 
 ### Fixed
 
+- Fixed managed-job recipe loading races by opening configs without following final symlinks, verifying file identity, and bounding reads through the verified handle.
 - Fixed managed-job agent-control failures leaking host operation details while retaining errors for explicit local status inspection.
 - Fixed dynamically registered extension tools bypassing the execution-boundary host-process prohibition, with rejected registrations rolled back atomically.
 - Fixed SDK execution-boundary search tools to enforce readable roots and delegate grep to the backend instead of starting host search binaries.
