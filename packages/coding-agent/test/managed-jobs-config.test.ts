@@ -35,6 +35,7 @@ function validConfig(): unknown {
 				maxAgentStarts: 3,
 				maxRuntimeSeconds: 3_600,
 				requireApproval: true,
+				allowAgentOutput: true,
 				readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 10 },
 			},
 		],
@@ -227,6 +228,21 @@ describe("managed jobs config", () => {
 				recipes: [{ id: "deploy", command: "deploy", requireApproval: "always" }],
 			}),
 		).toThrow("requireApproval must be a boolean");
+	});
+
+	it("accepts only boolean agent output grants", () => {
+		expect(
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "check", command: "npm", allowAgentOutput: true }],
+			}).recipes[0]?.allowAgentOutput,
+		).toBe(true);
+		expect(() =>
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "check", command: "npm", allowAgentOutput: "stdout" }],
+			}),
+		).toThrow("allowAgentOutput must be a boolean");
 	});
 
 	it("loads a bounded regular project config with a stable source revision", async () => {

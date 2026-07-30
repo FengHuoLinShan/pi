@@ -560,6 +560,7 @@ describe("managed jobs built-in extension", () => {
 						maxAgentStarts: 2,
 						maxRuntimeSeconds: 60,
 						requireApproval: true,
+						allowAgentOutput: true,
 						readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 5 },
 					},
 				],
@@ -583,6 +584,7 @@ describe("managed jobs built-in extension", () => {
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("agentStarts<=2"), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("runtime<=60s"), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("approval=always"), "info");
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("agentOutput=allowed"), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.not.stringContaining("x".repeat(1_100)), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("..."), "info");
 	});

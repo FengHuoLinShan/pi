@@ -106,9 +106,10 @@ function formatRecipe(recipe: ManagedJobRecipeConfig): string {
 	const budget = recipe.maxAgentStarts === undefined ? "" : ` agentStarts<=${recipe.maxAgentStarts}`;
 	const runtime = recipe.maxRuntimeSeconds === undefined ? "" : ` runtime<=${recipe.maxRuntimeSeconds}s`;
 	const approval = recipe.requireApproval ? " approval=always" : "";
+	const agentOutput = recipe.allowAgentOutput ? " agentOutput=allowed" : "";
 	const description =
 		recipe.description === undefined ? "" : ` description=${JSON.stringify(displayText(recipe.description))}`;
-	return `${displayText(recipe.id)}${description}${readiness}${environment}${budget}${runtime}${approval}\n  ${boundedCommand}`;
+	return `${displayText(recipe.id)}${description}${readiness}${environment}${budget}${runtime}${approval}${agentOutput}\n  ${boundedCommand}`;
 }
 
 function agentRecordSnapshot(record: ProcessSessionRecord) {
@@ -457,7 +458,7 @@ export default function managedJobsExtension(pi: ExtensionAPI, options: ManagedJ
 			return;
 		}
 		const controlRule = agentControlToolRegistered
-			? "managed_job_control can inspect its frozen recipe budgets and active ownership, start only the fixed trusted-project recipes in its tool description, and wait on or stop only jobs it started. It cannot accept arbitrary commands, arguments, working directories, or environment overrides. Ask the user to use /job for any other state change."
+			? "managed_job_control can inspect its frozen recipe budgets and active ownership, start only the fixed trusted-project recipes in its tool description, read bounded output only when that recipe explicitly allows it, and wait on or stop only jobs it started. It cannot accept arbitrary commands, arguments, working directories, or environment overrides. Ask the user to use /job for any other state change."
 			: "You cannot control managed jobs directly; ask the user to use /job when another action is needed.";
 		return {
 			systemPrompt: `${event.systemPrompt}

@@ -36,6 +36,7 @@ export interface ManagedJobRecipeConfig {
 	maxAgentStarts?: number;
 	maxRuntimeSeconds?: number;
 	requireApproval?: boolean;
+	allowAgentOutput?: boolean;
 	readiness?: ManagedJobReadinessConfig;
 }
 
@@ -127,6 +128,7 @@ function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 			"maxAgentStarts",
 			"maxRuntimeSeconds",
 			"requireApproval",
+			"allowAgentOutput",
 			"readiness",
 		],
 		label,
@@ -194,6 +196,9 @@ function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 	if (value.requireApproval !== undefined && typeof value.requireApproval !== "boolean") {
 		throw new Error(`${label}.requireApproval must be a boolean`);
 	}
+	if (value.allowAgentOutput !== undefined && typeof value.allowAgentOutput !== "boolean") {
+		throw new Error(`${label}.allowAgentOutput must be a boolean`);
+	}
 	return {
 		id,
 		...(description === undefined ? {} : { description }),
@@ -203,6 +208,7 @@ function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 		...(value.maxAgentStarts === undefined ? {} : { maxAgentStarts: value.maxAgentStarts as number }),
 		...(value.maxRuntimeSeconds === undefined ? {} : { maxRuntimeSeconds: value.maxRuntimeSeconds as number }),
 		...(value.requireApproval === undefined ? {} : { requireApproval: value.requireApproval }),
+		...(value.allowAgentOutput === undefined ? {} : { allowAgentOutput: value.allowAgentOutput }),
 		...(value.readiness === undefined ? {} : { readiness: parseReadiness(value.readiness, index) }),
 	};
 }
