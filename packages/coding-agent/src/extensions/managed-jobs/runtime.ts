@@ -3,7 +3,9 @@ import { join, resolve } from "node:path";
 import { getAgentDir } from "../../config.ts";
 import { ArtifactStore, type ArtifactStoreRecoveryReport } from "../../core/artifact-store.ts";
 import {
+	type ProcessOutputStream,
 	ProcessSessionManager,
+	type ProcessSessionRecord,
 	type ProcessSessionRecoveryReport,
 	type ProcessSessionState,
 } from "../../core/process-session.ts";
@@ -11,6 +13,7 @@ import {
 export const MANAGED_JOBS_MAX_ACTIVE = 4;
 export const MANAGED_JOBS_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 export const MANAGED_JOBS_OUTPUT_TAIL_BYTES = 16 * 1024;
+export const MANAGED_JOBS_WAIT_TAIL_BYTES = 64 * 1024;
 
 export interface ManagedJobsRecoveryReport {
 	artifacts: ArtifactStoreRecoveryReport;
@@ -29,10 +32,26 @@ export interface OpenManagedJobsRuntimeOptions {
 	maxOutputBytesPerSession?: number;
 }
 
+export interface WaitForManagedJobOutputOptions {
+	contains: string;
+	stream?: ProcessOutputStream;
+	timeoutMs: number;
+	signal?: AbortSignal;
+}
+
+export interface WaitForManagedJobOutputResult {
+	status: "matched" | "terminal" | "timeout" | "aborted";
+	record: ProcessSessionRecord;
+}
+
 const runtimes = new Map<string, Promise<ManagedJobsRuntime>>();
 
 export function isActiveManagedJobState(state: ProcessSessionState): boolean {
 	return state === "created" || state === "running" || state === "terminating";
+}
+
+function isTerminalManagedJobState(state: ProcessSessionState): boolean {
+	return state === "exited" || state === "terminated" || state === "failed" || state === "interrupted";
 }
 
 export function getManagedJobsRoot(cwd: string, agentDir = getAgentDir()): string {
@@ -123,4 +142,84 @@ export async function openManagedJobsRuntime(options: OpenManagedJobsRuntimeOpti
 		runtimes.delete(root);
 		throw error;
 	}
+}
+
+export async function waitForManagedJobOutput(
+	runtime: ManagedJobsRuntime,
+	id: string,
+	options: WaitForManagedJobOutputOptions,
+): Promise<WaitForManagedJobOutputResult> {
+	if (!options.contains) throw new Error("Managed job wait text must not be empty");
+	if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0) {
+		throw new Error("Managed job wait timeout must be a positive safe integer");
+	}
+	const manager = runtime.manager;
+	manager.status(id);
+
+	return new Promise((resolvePromise, rejectPromise) => {
+		let settled = false;
+		let checking = false;
+		let pendingCheck = false;
+		let unsubscribe = () => {};
+		const finish = (status: WaitForManagedJobOutputResult["status"], record: ProcessSessionRecord): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", abort);
+			unsubscribe();
+			resolvePromise({ status, record });
+		};
+		const check = async (): Promise<void> => {
+			if (settled) return;
+			if (checking) {
+				pendingCheck = true;
+				return;
+			}
+			checking = true;
+			try {
+				const record = manager.status(id);
+				const output = await manager.readOutputTail(id, {
+					stream: options.stream,
+					maxBytes: MANAGED_JOBS_WAIT_TAIL_BYTES,
+				});
+				if (output.toString("utf8").includes(options.contains)) {
+					finish("matched", record);
+				} else if (isTerminalManagedJobState(record.state)) {
+					finish("terminal", record);
+				}
+			} catch (error) {
+				if (!settled) {
+					settled = true;
+					clearTimeout(timer);
+					options.signal?.removeEventListener("abort", abort);
+					unsubscribe();
+					rejectPromise(error);
+				}
+			} finally {
+				checking = false;
+				if (pendingCheck && !settled) {
+					pendingCheck = false;
+					void check();
+				}
+			}
+		};
+		const abort = (): void => finish("aborted", manager.status(id));
+		const timer = setTimeout(() => finish("timeout", manager.status(id)), options.timeoutMs);
+		unsubscribe = manager.subscribe((record, event) => {
+			if (
+				record.id === id &&
+				(event.type === "process_output" ||
+					event.type === "process_exited" ||
+					event.type === "process_failed" ||
+					event.type === "process_interrupted")
+			) {
+				void check();
+			}
+		});
+		if (options.signal?.aborted) abort();
+		else {
+			options.signal?.addEventListener("abort", abort, { once: true });
+			void check();
+		}
+	});
 }

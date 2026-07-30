@@ -9,12 +9,16 @@ import {
 	type ManagedJobsRuntime,
 	openManagedJobsRuntime,
 	parseManagedJobCommand,
+	waitForManagedJobOutput,
 } from "./runtime.ts";
 
 export const MANAGED_JOBS_FLAG = "managed-jobs";
 const STATUS_KEY = "managed-jobs";
 const DISPLAY_JOB_LIMIT = 20;
 const MANAGED_JOB_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const MANAGED_JOB_WAIT_DEFAULT_SECONDS = 30;
+const MANAGED_JOB_WAIT_MAX_SECONDS = 120;
+const MANAGED_JOB_WAIT_MAX_TEXT_LENGTH = 512;
 
 export interface ManagedJobsExtensionOptions {
 	openRuntime?: (cwd: string) => Promise<ManagedJobsRuntime>;
@@ -311,6 +315,71 @@ The user may attach bounded process output through custom messages of type manag
 					);
 					return;
 				}
+				if (action === "wait") {
+					const record = resolveRecord(opened, args.shift() ?? "");
+					let contains: string | undefined;
+					let stream: ProcessOutputStream | undefined;
+					let timeoutSeconds = MANAGED_JOB_WAIT_DEFAULT_SECONDS;
+					while (args.length > 0) {
+						const option = args.shift();
+						const value = args.shift();
+						if (option === "--contains" && value !== undefined) {
+							contains = value;
+						} else if (option === "--stream" && (value === "stdout" || value === "stderr" || value === "all")) {
+							stream = value === "all" ? undefined : value;
+						} else if (option === "--timeout" && value && /^\d+$/.test(value)) {
+							timeoutSeconds = Number(value);
+						} else {
+							ctx.ui.notify(
+								"Usage: /job wait <id> --contains <text> [--stream stdout|stderr|all] [--timeout 1-120]",
+								"warning",
+							);
+							return;
+						}
+					}
+					if (
+						!contains ||
+						contains.length > MANAGED_JOB_WAIT_MAX_TEXT_LENGTH ||
+						timeoutSeconds < 1 ||
+						timeoutSeconds > MANAGED_JOB_WAIT_MAX_SECONDS
+					) {
+						ctx.ui.notify(
+							"Wait text must contain 1-512 characters and timeout must be between 1 and 120 seconds",
+							"warning",
+						);
+						return;
+					}
+					ctx.ui.setStatus(`${STATUS_KEY}-wait`, `waiting for ${displayJobId(record)}`);
+					try {
+						const result = await waitForManagedJobOutput(opened, record.id, {
+							contains,
+							stream,
+							timeoutMs: timeoutSeconds * 1000,
+							signal: ctx.signal,
+						});
+						if (result.status === "matched") {
+							ctx.ui.notify(
+								`Managed job ${displayJobId(result.record)} output matched ${JSON.stringify(displayText(contains))}`,
+								"info",
+							);
+						} else if (result.status === "terminal") {
+							ctx.ui.notify(
+								`Managed job ${displayJobId(result.record)} became ${result.record.state} before output matched`,
+								"warning",
+							);
+						} else if (result.status === "timeout") {
+							ctx.ui.notify(
+								`Timed out after ${timeoutSeconds}s waiting for managed job ${displayJobId(result.record)}`,
+								"warning",
+							);
+						} else {
+							ctx.ui.notify(`Stopped waiting for managed job ${displayJobId(result.record)}`, "info");
+						}
+					} finally {
+						ctx.ui.setStatus(`${STATUS_KEY}-wait`, undefined);
+					}
+					return;
+				}
 				if (action === "stop") {
 					const record = resolveRecord(opened, args[0] ?? "");
 					if (!isActiveManagedJobState(record.state)) {
@@ -330,7 +399,7 @@ The user may attach bounded process output through custom messages of type manag
 			}
 
 			ctx.ui.notify(
-				"Usage: /job [list|start [--name <name>] <command> [args...]|status <id>|output <id>|send <id>|stop <id>]",
+				"Usage: /job [list|start [--name <name>] <command> [args...]|status <id>|output <id>|send <id>|wait <id> --contains <text>|stop <id>]",
 				"warning",
 			);
 		},

@@ -19,6 +19,7 @@ import {
 	type ManagedJobsRuntime,
 	openManagedJobsRuntime,
 	parseManagedJobCommand,
+	waitForManagedJobOutput,
 } from "../src/extensions/managed-jobs/runtime.ts";
 
 type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void>;
@@ -152,6 +153,39 @@ describe("managed jobs runtime", () => {
 			invalidLines: [],
 		});
 	});
+
+	it("waits for a literal in durable output without executing another command", async () => {
+		const runtime = await createRuntime();
+		const started = await runtime.manager.start({
+			command: process.execPath,
+			args: ["-e", "setTimeout(() => process.stdout.write('server ready'), 20)"],
+		});
+
+		const result = await waitForManagedJobOutput(runtime, started.id, {
+			contains: "server ready",
+			stream: "stdout",
+			timeoutMs: 1000,
+		});
+
+		expect(result.status).toBe("matched");
+		expect(result.record.id).toBe(started.id);
+	});
+
+	it("bounds readiness waits with an explicit timeout result", async () => {
+		const runtime = await createRuntime();
+		const started = await runtime.manager.start({
+			command: process.execPath,
+			args: ["-e", "setInterval(() => {}, 1000)"],
+		});
+
+		const result = await waitForManagedJobOutput(runtime, started.id, {
+			contains: "never emitted",
+			timeoutMs: 20,
+		});
+
+		expect(result.status).toBe("timeout");
+		expect(result.record.state).toBe("running");
+	});
 });
 
 describe("managed jobs built-in extension", () => {
@@ -246,6 +280,21 @@ describe("managed jobs built-in extension", () => {
 		await streamingExtension.sessionStart();
 		await streamingExtension.command(`send ${started.id.slice(0, 8)} stdout`, streamingExtension.ctx);
 		expect(streamingExtension.sendMessage).toHaveBeenCalledWith(expect.anything(), { deliverAs: "nextTurn" });
+	});
+
+	it("waits for bounded readiness text and clears its transient status", async () => {
+		const runtime = await createRuntime();
+		const extension = setupExtension(runtime);
+		await extension.sessionStart();
+		await extension.command(
+			`start --name api ${quoteArgument(process.execPath)} -e ${quoteArgument("setTimeout(() => process.stdout.write('listening on 3000'), 20)")}`,
+			extension.ctx,
+		);
+
+		await extension.command('wait api --contains "listening on 3000" --stream stdout --timeout 1', extension.ctx);
+
+		expect(extension.notify).toHaveBeenLastCalledWith('Managed job api output matched "listening on 3000"', "info");
+		expect(extension.setStatus).toHaveBeenLastCalledWith("managed-jobs-wait", undefined);
 	});
 
 	it("terminates active jobs during a clean application quit", async () => {
