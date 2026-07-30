@@ -53,6 +53,7 @@
 
 ### Fixed
 
+- Fixed edit and write revision guidance to require copying the complete `sha256:` token, avoiding invalid bare-digest tool retries.
 - Fixed unqualified CLI model patterns to prefer matching providers with configured authentication while preserving explicit `provider/model` selection.
 - Fixed managed-job recipe loading races by opening configs without following final symlinks, verifying file identity, and bounding reads through the verified handle.
 - Fixed managed-job agent-control failures leaking host operation details while retaining errors for explicit local status inspection.

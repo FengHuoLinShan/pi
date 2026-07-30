@@ -61,7 +61,7 @@ const editSchema = Type.Object(
 		expectedRevision: Type.Optional(
 			Type.String({
 				description:
-					'SHA-256 revision returned by read/edit/write. Use "missing" only when the target must not exist.',
+					'Exact revision token returned by read/edit/write. Copy the complete "sha256:<64 lowercase hex>" value, including the "sha256:" prefix. Use "missing" only when the target must not exist.',
 			}),
 		),
 	},
@@ -323,7 +323,7 @@ export function createEditToolDefinition(
 			"When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
 			"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
 			"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
-			"When edit follows read, pass the revision from read as expectedRevision so external changes are detected.",
+			'When edit follows read, copy the complete revision token from read as expectedRevision, including its "sha256:" prefix, so external changes are detected.',
 		],
 		parameters: editSchema,
 		renderShell: "self",

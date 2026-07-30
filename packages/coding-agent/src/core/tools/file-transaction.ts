@@ -140,7 +140,7 @@ export function assertExpectedRevision(
 	if (expectedRevision === undefined) return;
 	if (expectedRevision !== "missing" && !/^sha256:[0-9a-f]{64}$/.test(expectedRevision)) {
 		throw new Error(
-			`Invalid expected revision for ${displayPath}: use "missing" or a sha256 revision returned by read, edit, or write.`,
+			`Invalid expected revision for ${displayPath}: use "missing" or copy the complete sha256:<64 lowercase hex> token, including the "sha256:" prefix, returned by read, edit, or write.`,
 		);
 	}
 	if (expectedRevision === actualRevision) return;

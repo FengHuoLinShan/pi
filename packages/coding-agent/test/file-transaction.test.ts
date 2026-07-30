@@ -3,11 +3,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { applyPatch } from "diff";
 import { afterEach, describe, expect, it } from "vitest";
-import { createEditTool } from "../src/core/tools/edit.ts";
+import { createEditTool, createEditToolDefinition } from "../src/core/tools/edit.ts";
 import { computeEditsDiff } from "../src/core/tools/edit-diff.ts";
 import { atomicWriteFile, computeFileRevision } from "../src/core/tools/file-transaction.ts";
 import { createReadTool } from "../src/core/tools/read.ts";
-import { createWriteTool } from "../src/core/tools/write.ts";
+import { createWriteTool, createWriteToolDefinition } from "../src/core/tools/write.ts";
 
 const tempDirs: string[] = [];
 
@@ -22,6 +22,20 @@ afterEach(async () => {
 });
 
 describe("file revisions", () => {
+	it("tells models to preserve the sha256 prefix in edit and write preconditions", () => {
+		const edit = createEditToolDefinition(process.cwd());
+		const write = createWriteToolDefinition(process.cwd());
+
+		expect(edit.parameters.properties.expectedRevision).toMatchObject({
+			description: expect.stringContaining('including the "sha256:" prefix'),
+		});
+		expect(write.parameters.properties.expectedRevision).toMatchObject({
+			description: expect.stringContaining('including the "sha256:" prefix'),
+		});
+		expect(edit.promptGuidelines).toContainEqual(expect.stringContaining('including its "sha256:" prefix'));
+		expect(write.promptGuidelines).toContainEqual(expect.stringContaining('including its "sha256:" prefix'));
+	});
+
 	it("makes read revisions model-visible and accepts them as edit preconditions", async () => {
 		const directory = await createTempDir();
 		const filePath = join(directory, "revision.txt");
@@ -44,6 +58,22 @@ describe("file revisions", () => {
 		expect(editResult.details?.beforeRevision).toBe(revision);
 		expect(editResult.details?.afterRevision).toBe(computeFileRevision("after\n"));
 		expect(applyPatch(original, editResult.details?.patch ?? "")).toBe("after\n");
+	});
+
+	it("rejects a bare digest with explicit prefix recovery guidance", async () => {
+		const directory = await createTempDir();
+		const filePath = join(directory, "revision.txt");
+		const original = "before\n";
+		await writeFile(filePath, original, "utf8");
+
+		await expect(
+			createEditTool(directory).execute("edit", {
+				path: "revision.txt",
+				expectedRevision: computeFileRevision(original).slice("sha256:".length),
+				edits: [{ oldText: "before", newText: "after" }],
+			}),
+		).rejects.toThrow('including the "sha256:" prefix');
+		expect(await readFile(filePath, "utf8")).toBe(original);
 	});
 
 	it("rejects stale edit and write revisions without changing the file", async () => {

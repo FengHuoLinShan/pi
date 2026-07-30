@@ -29,7 +29,8 @@ const writeSchema = Type.Object({
 	content: Type.String({ description: "Content to write to the file" }),
 	expectedRevision: Type.Optional(
 		Type.String({
-			description: 'SHA-256 revision returned by read/edit/write. Use "missing" to require creation of a new file.',
+			description:
+				'Exact revision token returned by read/edit/write. Copy the complete "sha256:<64 lowercase hex>" value, including the "sha256:" prefix. Use "missing" to require creation of a new file.',
 		}),
 	),
 });
@@ -227,7 +228,7 @@ export function createWriteToolDefinition(
 		promptSnippet: "Create or overwrite files",
 		promptGuidelines: [
 			"Use write only for new files or complete rewrites.",
-			"When write follows read, pass the revision from read as expectedRevision; use expectedRevision=missing when creating a file that must not already exist.",
+			'When write follows read, copy the complete revision token from read as expectedRevision, including its "sha256:" prefix; use expectedRevision=missing when creating a file that must not already exist.',
 		],
 		parameters: writeSchema,
 		async execute(
