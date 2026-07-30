@@ -119,6 +119,34 @@ Managed-job tool results are JSON-framed as untrusted data. Unlike `/job output`
 
 `--managed-jobs-agent-read` is unavailable when the SDK session uses an execution boundary. Extension tools execute in the host process and are rejected before activation; human `/job` commands remain a separate explicit control surface.
 
+### Agent-Controlled Fixed Recipes
+
+Add `--managed-jobs-agent-control` to let the coding agent use `managed_job_control`. This requires `--managed-jobs`, a trusted project, no SDK execution boundary, and a regular non-symbolic-link `.pi/managed-jobs.json` no larger than 256 KiB:
+
+```json
+{
+  "version": 1,
+  "recipes": [
+    {
+      "id": "dev",
+      "command": "npm",
+      "args": ["run", "dev"],
+      "readiness": {
+        "contains": "ready",
+        "stream": "stdout",
+        "timeoutSeconds": 30
+      }
+    }
+  ]
+}
+```
+
+The file accepts 1-16 fixed recipes. Recipe IDs are portable 1-64 character identifiers. Each recipe uses direct argv execution in the workspace root; it cannot define a different working directory or environment override. Optional readiness is a literal match over bounded artifact-backed output with a maximum 30-second wait. A timeout or cancelled tool call leaves the job running.
+
+The extension loads and hashes the config once per extension instance. Later file edits do not change the in-memory recipes or the revision reported in tool results. `managed_job_control` accepts only `start` with an exact loaded recipe ID, or `stop` with an exact job ID that the same tool instance started. It rejects duplicate active runs of one recipe, cannot stop user-started jobs, and inherits the four-active-job and 10 MiB output limits. `--managed-jobs-agent-read` remains a separate permission.
+
+These recipes execute on the host with pi's shell environment and normal host network access. A trusted recipe can run arbitrary code or expose environment secrets through its output. Review the config before enabling the flag; use an SDK execution boundary instead when host execution is not acceptable.
+
 `/job send` is the explicit bridge into model context. It copies the selected bounded, sanitized output tail into a displayed `managed-job-output-v1` custom message without starting or steering a model turn. When idle, the message is stored immediately; during streaming, it is queued for the next turn and persisted when delivered. The message uses JSON framing, labels the output as untrusted data, and adds a system-prompt rule that it must never be treated as instructions. The copied tail enters the session JSONL and later model context, so inspect it for credentials or other sensitive data before sending. `/job output` only displays the tail locally and does not copy it into model context.
 
 `/job wait` performs a literal readiness match against at most the newest 64 KiB of already artifact-backed output. It does not evaluate a regular expression or execute another command. The default timeout is 30 seconds and the accepted range is 1-120 seconds. The wait ends distinctly on match, timeout, cancellation, or a terminal job state, and never copies output into model context.

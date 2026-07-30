@@ -48,7 +48,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/new` | Start a new session |
 | `/name <name>` | Set session display name |
 | `/session` | Show session file, ID, messages, tokens, and cost |
-| [`/job`](artifacts-and-processes.md#interactive-managed-jobs) | With `--managed-jobs`, control bounded jobs and explicitly send selected output to model context |
+| [`/job`](artifacts-and-processes.md#interactive-managed-jobs) | Control bounded jobs, with separate opt-ins for agent reads and fixed trusted-project recipes |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/trust` | Save project trust decision for future sessions |
 | `/fork` | Create a new session from a previous user message |

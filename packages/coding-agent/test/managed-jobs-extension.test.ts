@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -14,7 +14,10 @@ import type {
 } from "../src/core/extensions/index.ts";
 import type { ProcessSessionRecord } from "../src/core/process-session.ts";
 import { builtInExtensions } from "../src/extensions/index.ts";
+import { MANAGED_JOBS_CONFIG_PATH } from "../src/extensions/managed-jobs/config.ts";
 import managedJobsExtension, {
+	MANAGED_JOBS_AGENT_CONTROL_FLAG,
+	MANAGED_JOBS_AGENT_CONTROL_TOOL,
 	MANAGED_JOBS_AGENT_READ_FLAG,
 	MANAGED_JOBS_AGENT_READ_TOOL,
 	MANAGED_JOBS_FLAG,
@@ -75,6 +78,8 @@ function setupExtension(
 	hasUI = true,
 	agentRead = false,
 	hasExecutionBoundary = false,
+	agentControl = false,
+	projectTrusted = true,
 ) {
 	const commands = new Map<string, CommandHandler>();
 	const tools = new Map<string, ToolDefinition>();
@@ -86,6 +91,7 @@ function setupExtension(
 		getFlag(name: string) {
 			if (name === MANAGED_JOBS_FLAG) return enabled;
 			if (name === MANAGED_JOBS_AGENT_READ_FLAG) return agentRead;
+			if (name === MANAGED_JOBS_AGENT_CONTROL_FLAG) return agentControl;
 			return undefined;
 		},
 		registerFlag: vi.fn(),
@@ -110,6 +116,7 @@ function setupExtension(
 		hasExecutionBoundary,
 		hasUI,
 		isIdle: () => idle,
+		isProjectTrusted: () => projectTrusted,
 		ui: { confirm, notify, setStatus },
 	} as unknown as ExtensionCommandContext;
 	const openRuntime = vi.fn(async () => runtime);
@@ -439,16 +446,19 @@ describe("managed jobs built-in extension", () => {
 		await extension.sessionStart();
 
 		expect(extension.tool(MANAGED_JOBS_AGENT_READ_TOOL)).toBeUndefined();
+		expect(extension.tool(MANAGED_JOBS_AGENT_CONTROL_TOOL)).toBeUndefined();
 	});
 
-	it("rejects the agent-read flag unless managed jobs are enabled", async () => {
+	it("rejects agent capability flags unless managed jobs are enabled", async () => {
 		const runtime = await createRuntime();
-		const extension = setupExtension(runtime, false, true, true, true);
+		const extension = setupExtension(runtime, false, true, true, true, false, true);
 
 		await extension.sessionStart();
 
 		expect(extension.tool(MANAGED_JOBS_AGENT_READ_TOOL)).toBeUndefined();
-		expect(extension.notify).toHaveBeenLastCalledWith("--managed-jobs-agent-read requires --managed-jobs", "error");
+		expect(extension.tool(MANAGED_JOBS_AGENT_CONTROL_TOOL)).toBeUndefined();
+		expect(extension.notify).toHaveBeenCalledWith("--managed-jobs-agent-read requires --managed-jobs", "error");
+		expect(extension.notify).toHaveBeenCalledWith("--managed-jobs-agent-control requires --managed-jobs", "error");
 	});
 
 	it("does not register the agent read tool across an execution boundary", async () => {
@@ -460,6 +470,50 @@ describe("managed jobs built-in extension", () => {
 		expect(extension.tool(MANAGED_JOBS_AGENT_READ_TOOL)).toBeUndefined();
 		expect(extension.notify).toHaveBeenCalledWith(
 			"--managed-jobs-agent-read cannot be enabled with an execution boundary",
+			"error",
+		);
+	});
+
+	it("loads fixed agent-control recipes only behind the explicit flag", async () => {
+		const runtime = await createRuntime();
+		const cwd = temporaryDirectories.at(-1)!;
+		await mkdir(join(cwd, ".pi"));
+		await writeFile(
+			join(cwd, MANAGED_JOBS_CONFIG_PATH),
+			JSON.stringify({
+				version: 1,
+				recipes: [{ id: "api", command: process.execPath, args: ["-e", ""] }],
+			}),
+			"utf8",
+		);
+		const extension = setupExtension(runtime, true, true, true, false, false, true);
+
+		await extension.sessionStart();
+
+		const tool = extension.tool(MANAGED_JOBS_AGENT_CONTROL_TOOL);
+		if (!tool) throw new Error("Expected managed job control tool");
+		expect(extension.notify).toHaveBeenCalledWith(
+			expect.stringContaining("Agent managed-job control loaded 1 fixed recipe(s)"),
+			"warning",
+		);
+		await tool.execute("start-call", { action: "start", recipe: "api" }, undefined, undefined, extension.ctx);
+		const prompt = await extension.beforeAgentStart();
+		expect(prompt?.systemPrompt).toContain("managed_job_control can start only the fixed trusted-project recipes");
+		expect(prompt?.systemPrompt).not.toContain("You cannot control managed jobs directly");
+	});
+
+	it("rejects agent control for untrusted or execution-bounded projects", async () => {
+		const runtime = await createRuntime();
+		const untrusted = setupExtension(runtime, true, true, true, false, false, true, false);
+		await untrusted.sessionStart();
+		expect(untrusted.tool(MANAGED_JOBS_AGENT_CONTROL_TOOL)).toBeUndefined();
+		expect(untrusted.notify).toHaveBeenCalledWith(expect.stringContaining("requires a trusted project"), "error");
+
+		const bounded = setupExtension(runtime, true, true, true, false, true, true);
+		await bounded.sessionStart();
+		expect(bounded.tool(MANAGED_JOBS_AGENT_CONTROL_TOOL)).toBeUndefined();
+		expect(bounded.notify).toHaveBeenCalledWith(
+			"--managed-jobs-agent-control cannot be enabled with an execution boundary",
 			"error",
 		);
 	});
