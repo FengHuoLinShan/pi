@@ -424,9 +424,10 @@ export function resolveCliModel(options: {
 	// This handles models whose IDs naturally contain slashes (e.g. OpenRouter-style IDs).
 	if (!provider) {
 		const lower = cliModel.toLowerCase();
-		const exact = availableModels.find(
+		const exactMatches = availableModels.filter(
 			(m) => m.id.toLowerCase() === lower || `${m.provider}/${m.id}`.toLowerCase() === lower,
 		);
+		const exact = exactMatches.find((model) => modelRuntime.hasConfiguredAuth(model.provider)) ?? exactMatches[0];
 		if (exact) {
 			return { model: exact, warning: undefined, thinkingLevel: undefined, error: undefined };
 		}
@@ -441,9 +442,17 @@ export function resolveCliModel(options: {
 	}
 
 	const candidates = provider ? availableModels.filter((m) => m.provider === provider) : availableModels;
-	const { model, thinkingLevel, warning } = parseModelPattern(pattern, candidates, {
+	const parseOptions = {
 		allowInvalidThinkingLevelFallback: false,
-	});
+	};
+	const configuredCandidates = provider
+		? []
+		: candidates.filter((model) => modelRuntime.hasConfiguredAuth(model.provider));
+	const configuredMatch =
+		configuredCandidates.length > 0 ? parseModelPattern(pattern, configuredCandidates, parseOptions) : undefined;
+	const { model, thinkingLevel, warning } = configuredMatch?.model
+		? configuredMatch
+		: parseModelPattern(pattern, candidates, parseOptions);
 
 	if (model) {
 		// If provider inference matched an unauthenticated provider/model pair, prefer

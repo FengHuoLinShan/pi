@@ -292,6 +292,7 @@ describe("resolveCliModel", () => {
 	test("supports --model <pattern>:<thinking> (without explicit --thinking)", () => {
 		const registry = {
 			getModels: () => allModels,
+			hasConfiguredAuth: () => false,
 		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRuntime"];
 
 		const result = resolveCliModel({
@@ -302,6 +303,84 @@ describe("resolveCliModel", () => {
 		expect(result.error).toBeUndefined();
 		expect(result.model?.id).toBe("claude-sonnet-4-5");
 		expect(result.thinkingLevel).toBe("high");
+	});
+
+	test("prefers an authenticated provider for an unqualified exact model id", () => {
+		const openRouterLuna: Model<"anthropic-messages"> = {
+			...mockModels[1],
+			id: "gpt-5.6-luna",
+			name: "GPT-5.6 Luna",
+			provider: "openrouter",
+		};
+		const codexLuna: Model<"anthropic-messages"> = {
+			...openRouterLuna,
+			provider: "openai-codex",
+		};
+		const registry = {
+			getModels: () => [openRouterLuna, codexLuna],
+			hasConfiguredAuth: (provider: string) => provider === "openai-codex",
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRuntime"];
+
+		const result = resolveCliModel({
+			cliModel: "gpt-5.6-luna",
+			modelRuntime: registry,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.provider).toBe("openai-codex");
+		expect(result.model?.id).toBe("gpt-5.6-luna");
+	});
+
+	test("prefers an authenticated provider for an unqualified fuzzy model pattern", () => {
+		const openRouterLuna: Model<"anthropic-messages"> = {
+			...mockModels[1],
+			id: "gpt-5.6-luna",
+			name: "GPT-5.6 Luna",
+			provider: "openrouter",
+		};
+		const codexLuna: Model<"anthropic-messages"> = {
+			...openRouterLuna,
+			provider: "openai-codex",
+		};
+		const registry = {
+			getModels: () => [openRouterLuna, codexLuna],
+			hasConfiguredAuth: (provider: string) => provider === "openai-codex",
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRuntime"];
+
+		const result = resolveCliModel({
+			cliModel: "luna",
+			modelRuntime: registry,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.provider).toBe("openai-codex");
+		expect(result.model?.id).toBe("gpt-5.6-luna");
+	});
+
+	test("keeps an explicit provider even when another matching provider is authenticated", () => {
+		const openRouterLuna: Model<"anthropic-messages"> = {
+			...mockModels[1],
+			id: "gpt-5.6-luna",
+			name: "GPT-5.6 Luna",
+			provider: "openrouter",
+		};
+		const codexLuna: Model<"anthropic-messages"> = {
+			...openRouterLuna,
+			provider: "openai-codex",
+		};
+		const registry = {
+			getModels: () => [openRouterLuna, codexLuna],
+			hasConfiguredAuth: (provider: string) => provider === "openai-codex",
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRuntime"];
+
+		const result = resolveCliModel({
+			cliModel: "openrouter/gpt-5.6-luna",
+			modelRuntime: registry,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.provider).toBe("openrouter");
+		expect(result.model?.id).toBe("gpt-5.6-luna");
 	});
 
 	test("prefers exact model id match over provider inference (OpenRouter-style ids)", () => {
