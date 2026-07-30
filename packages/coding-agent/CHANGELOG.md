@@ -4,6 +4,12 @@
 
 ### Added
 
+- Added `ctx.workspace` and `AgentSession.workspace` descriptors for the logical filesystem, revision, mounts, and execution target used by built-in tools.
+- Added a shared local process runtime for foreground bash, extension commands, verification checks, and durable process-session backends.
+- Added revision-locked `.pi/goal.json` completion gates that require configured checks to pass before `/goal` can complete.
+- Added a durable work-graph core with dependency-aware lifecycle transitions, per-node budgets, read/write leases, recovery, immutable evidence references, and optimistic session persistence.
+- Added repository-aware impact verification that maps changed paths through CodeGraph, selects explicit `.pi/checks.json` checks, fails closed on uncovered changes, and emits content-addressed evidence bundles.
+- Added revision-aware working sets with session persistence and WorkspaceView source hashing so stale facts fail closed while objectives, decisions, attempts, and evidence survive context compaction.
 - Added built-in `/goal` mode with branch-persistent objectives, explicit agent progress/completion/blocking, autonomous continuations, visible status, pause/resume/stop controls, and bounded activation batches.
 - Added a global live subagent progress panel that aggregates tasks from simultaneous single, parallel, and chain tool calls.
 - Added a responsive model sidebar for quickly selecting recent or scoped models and supported reasoning effort with the keyboard.

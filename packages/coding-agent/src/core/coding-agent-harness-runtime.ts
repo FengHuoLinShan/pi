@@ -190,12 +190,13 @@ export class CodingAgentHarnessRuntime extends Agent {
 			loopDetection: this.loopDetection,
 			toolPolicy: this.toolPolicy,
 		});
-		this.harnessRuntime = restored.harness;
 		const runtimeEvents = restored.harness.runtimeEvents;
 		if (!runtimeEvents) {
 			throw new Error("Restored AgentHarness is missing its runtime event store");
 		}
-		this.recoveryReport = createCodingAgentRecoveryReport(restored.recovery, runtimeEvents.getState());
+		const recoveryReport = createCodingAgentRecoveryReport(restored.recovery, runtimeEvents.getState());
+		this.harnessRuntime = restored.harness;
+		this.recoveryReport = recoveryReport;
 		setCodingAgentRecoveryReport(this.sessionManager, this.recoveryReport);
 		this.state.model = this.harness.getModel();
 		this.state.thinkingLevel = this.harness.getThinkingLevel();

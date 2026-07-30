@@ -1,3 +1,4 @@
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -34,8 +35,9 @@ function setup(options: {
 	hasUI?: boolean;
 	confirm?: boolean;
 	select?: string;
+	repositoryRoot?: string;
 }) {
-	const repositoryRoot = join(tmpdir(), "pi-dirty-guard-repo");
+	const repositoryRoot = options.repositoryRoot ?? join(tmpdir(), "pi-dirty-guard-repo");
 	const handlers: {
 		sessionStart?: SessionStartHandler;
 		beforeAgentStart?: BeforeAgentStartHandler;
@@ -150,6 +152,29 @@ describe("dirty-repo-guard example extension", () => {
 		await expect(fixture.edit("src/user.ts")).resolves.toBeUndefined();
 		await expect(fixture.edit("src/user.ts")).resolves.toBeUndefined();
 		expect(fixture.confirm).toHaveBeenCalledTimes(1);
+	});
+
+	it("guards a dirty path reached through a symlink alias", async () => {
+		const repositoryRoot = mkdtempSync(join(tmpdir(), "pi-dirty-guard-symlink-"));
+		try {
+			const sourceDirectory = join(repositoryRoot, "packages", "app", "src");
+			mkdirSync(sourceDirectory, { recursive: true });
+			writeFileSync(join(sourceDirectory, "user.ts"), "user change\n");
+			symlinkSync("user.ts", join(sourceDirectory, "alias.ts"));
+			const fixture = setup({
+				repositoryRoot,
+				status: ok(" M packages/app/src/user.ts\0"),
+			});
+			await fixture.start();
+
+			await expect(fixture.edit("src/alias.ts")).resolves.toEqual({
+				block: true,
+				reason:
+					'Blocked modification of pre-existing change "packages/app/src/user.ts" because approval UI is unavailable',
+			});
+		} finally {
+			rmSync(repositoryRoot, { recursive: true, force: true });
+		}
 	});
 
 	it("fails closed when a repository baseline cannot be captured", async () => {

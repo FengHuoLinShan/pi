@@ -161,6 +161,14 @@ export async function waitForManagedJobOutput(
 		let checking = false;
 		let pendingCheck = false;
 		let unsubscribe = () => {};
+		const fail = (error: unknown): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", abort);
+			unsubscribe();
+			rejectPromise(error);
+		};
 		const finish = (status: WaitForManagedJobOutputResult["status"], record: ProcessSessionRecord): void => {
 			if (settled) return;
 			settled = true;
@@ -168,6 +176,13 @@ export async function waitForManagedJobOutput(
 			options.signal?.removeEventListener("abort", abort);
 			unsubscribe();
 			resolvePromise({ status, record });
+		};
+		const finishWithCurrentRecord = (status: WaitForManagedJobOutputResult["status"]): void => {
+			try {
+				finish(status, manager.status(id));
+			} catch (error) {
+				fail(error);
+			}
 		};
 		const check = async (): Promise<void> => {
 			if (settled) return;
@@ -188,13 +203,7 @@ export async function waitForManagedJobOutput(
 					finish("terminal", record);
 				}
 			} catch (error) {
-				if (!settled) {
-					settled = true;
-					clearTimeout(timer);
-					options.signal?.removeEventListener("abort", abort);
-					unsubscribe();
-					rejectPromise(error);
-				}
+				fail(error);
 			} finally {
 				checking = false;
 				if (pendingCheck && !settled) {
@@ -203,8 +212,8 @@ export async function waitForManagedJobOutput(
 				}
 			}
 		};
-		const abort = (): void => finish("aborted", manager.status(id));
-		const timer = setTimeout(() => finish("timeout", manager.status(id)), options.timeoutMs);
+		const abort = (): void => finishWithCurrentRecord("aborted");
+		const timer = setTimeout(() => finishWithCurrentRecord("timeout"), options.timeoutMs);
 		unsubscribe = manager.subscribe((record, event) => {
 			if (
 				record.id === id &&

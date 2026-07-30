@@ -11,6 +11,7 @@ import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { SessionManager } from "../session-manager.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
+import { createWorkspaceView, type WorkspaceView } from "../workspace-view.ts";
 import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
@@ -280,6 +281,7 @@ export class ExtensionRunner {
 	private isIdleFn: () => boolean = () => true;
 	private isProjectTrustedFn: () => boolean = () => true;
 	private hasExecutionBoundaryFn: () => boolean = () => false;
+	private getWorkspaceViewFn: () => WorkspaceView;
 	private getSignalFn: () => AbortSignal | undefined = () => undefined;
 	private waitForIdleFn: () => Promise<void> = async () => {};
 	private abortFn: () => void = () => {};
@@ -311,6 +313,7 @@ export class ExtensionRunner {
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
+		this.getWorkspaceViewFn = () => createWorkspaceView(this.cwd);
 	}
 
 	bindCore(
@@ -343,6 +346,7 @@ export class ExtensionRunner {
 		this.isIdleFn = contextActions.isIdle;
 		this.isProjectTrustedFn = contextActions.isProjectTrusted;
 		this.hasExecutionBoundaryFn = contextActions.hasExecutionBoundary ?? (() => false);
+		this.getWorkspaceViewFn = contextActions.getWorkspaceView ?? (() => createWorkspaceView(this.cwd));
 		this.getSignalFn = contextActions.getSignal;
 		this.abortFn = contextActions.abort;
 		this.hasPendingMessagesFn = contextActions.hasPendingMessages;
@@ -736,6 +740,10 @@ export class ExtensionRunner {
 			get cwd() {
 				runner.assertActive();
 				return runner.cwd;
+			},
+			get workspace() {
+				runner.assertActive();
+				return runner.getWorkspaceViewFn();
 			},
 			get sessionManager() {
 				runner.assertActive();

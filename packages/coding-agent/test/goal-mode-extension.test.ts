@@ -1,6 +1,10 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExecOptions, ExecResult } from "../src/core/exec.ts";
 import type {
 	AgentEndEvent,
 	AgentSettledEvent,
@@ -14,7 +18,10 @@ import type {
 	SessionTreeEvent,
 } from "../src/core/extensions/index.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
-import goalModeExtension, { findGoalState, type GoalState } from "../src/extensions/goal-mode/index.ts";
+import { findWorkGraph } from "../src/core/work-graph-session.ts";
+import { findWorkingSet } from "../src/core/working-set-session.ts";
+import { createWorkspaceView, type WorkspaceView } from "../src/core/workspace-view.ts";
+import goalModeExtension, { findGoalState, type GoalState, parseGoalState } from "../src/extensions/goal-mode/index.ts";
 import { builtInExtensions } from "../src/extensions/index.ts";
 import { createHarness, getAssistantTexts } from "./suite/harness.ts";
 
@@ -44,7 +51,33 @@ interface GoalTool {
 	): Promise<AgentToolResult<{ state: GoalState | undefined }>>;
 }
 
-function setupExtension(sessionManager = SessionManager.inMemory()) {
+interface SetupOptions {
+	cwd?: string;
+	workspace?: WorkspaceView;
+	exec?: (command: string, args: string[], options?: ExecOptions) => Promise<ExecResult>;
+	projectTrusted?: boolean;
+}
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+	await Promise.all(
+		temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+	);
+});
+
+async function createTemporaryDirectory(prefix: string): Promise<string> {
+	const directory = await mkdtemp(join(tmpdir(), prefix));
+	temporaryDirectories.push(directory);
+	return directory;
+}
+
+async function writeGoalConfig(root: string, checks: unknown[]): Promise<void> {
+	await mkdir(join(root, ".pi"), { recursive: true });
+	await writeFile(join(root, ".pi", "goal.json"), JSON.stringify({ version: 1, checks }));
+}
+
+function setupExtension(sessionManager = SessionManager.inMemory(), options: SetupOptions = {}) {
 	const commands = new Map<string, CommandHandler>();
 	let goalTool: GoalTool | undefined;
 	let agentStart: AgentStartHandler | undefined;
@@ -57,8 +90,17 @@ function setupExtension(sessionManager = SessionManager.inMemory()) {
 	const appendEntry = vi.fn((customType: string, data?: unknown) => {
 		sessionManager.appendCustomEntry(customType, data);
 	});
+	const execute =
+		options.exec ??
+		(async () => ({
+			stdout: "",
+			stderr: "",
+			code: 0,
+			killed: false,
+		}));
 	const api = {
 		appendEntry,
+		exec: execute,
 		getActiveTools: () => ["goal", "read", "bash", "edit", "write"],
 		registerCommand(name: string, options: { handler: CommandHandler }) {
 			commands.set(name, options.handler);
@@ -80,12 +122,16 @@ function setupExtension(sessionManager = SessionManager.inMemory()) {
 	const setStatus = vi.fn();
 	const setWidget = vi.fn();
 	const abort = vi.fn();
+	const cwd = options.cwd ?? process.cwd();
 	const ctx = {
 		abort,
+		cwd,
 		hasPendingMessages: () => false,
 		isIdle: () => true,
+		isProjectTrusted: () => options.projectTrusted ?? true,
 		sessionManager,
 		ui: { notify, setStatus, setWidget },
+		workspace: options.workspace ?? createWorkspaceView(cwd),
 	} as unknown as ExtensionCommandContext;
 	goalModeExtension(api);
 	return {
@@ -139,10 +185,19 @@ describe("goal mode built-in extension", () => {
 		});
 		expect(extension.sendMessage).toHaveBeenCalledTimes(1);
 		expect(extension.setStatus).toHaveBeenLastCalledWith("goal-mode", "goal 0/25");
+		expect(findWorkingSet(extension.sessionManager.getBranch(), initialState!.id)?.entries).toEqual([
+			expect.objectContaining({
+				id: "goal:objective",
+				kind: "objective",
+				content: "implement and verify the feature",
+				required: true,
+			}),
+		]);
 
 		const promptUpdate = await extension.beforeAgentStart();
 		expect(promptUpdate?.systemPrompt).toContain("implement and verify the feature");
 		expect(promptUpdate?.systemPrompt).toContain('goal tool with action "complete"');
+		expect(promptUpdate?.systemPrompt).toContain("## Durable working set");
 
 		await extension.agentStart();
 		await extension.agentEnd([fauxAssistantMessage("more work remains")]);
@@ -164,6 +219,11 @@ describe("goal mode built-in extension", () => {
 			status: "active",
 			note: "implementation done; verification remains",
 		});
+		expect(
+			findWorkingSet(extension.sessionManager.getBranch(), initialState!.id)?.entries.some(
+				(entry) => entry.kind === "attempt" && entry.content === "implementation done; verification remains",
+			),
+		).toBe(true);
 
 		const completion = await extension.goalTool.execute(
 			"goal-2",
@@ -176,14 +236,203 @@ describe("goal mode built-in extension", () => {
 			type: "text",
 			text: "Goal completed: targeted verification passed",
 		});
-		expect(findGoalState(extension.sessionManager.getBranch())).toMatchObject({
+		const completedState = findGoalState(extension.sessionManager.getBranch());
+		expect(completedState).toMatchObject({
 			status: "completed",
 			note: "targeted verification passed",
 		});
+		expect(findWorkGraph(extension.sessionManager.getBranch(), completedState!.id)?.nodes).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "work", status: "succeeded" }),
+				expect.objectContaining({ id: "complete", status: "succeeded" }),
+			]),
+		);
 		expect(extension.setStatus).toHaveBeenLastCalledWith("goal-mode", undefined);
 
 		await extension.agentEnd([fauxAssistantMessage("done")]);
 		expect(extension.sendMessage).toHaveBeenCalledTimes(2);
+	});
+
+	it("requires a revision-locked completion gate to pass in the logical workspace", async () => {
+		const sourceRoot = await createTemporaryDirectory("pi-goal-source-");
+		const logicalRoot = await createTemporaryDirectory("pi-goal-logical-");
+		await writeGoalConfig(sourceRoot, [
+			{ id: "targeted-test", command: "node", args: ["verify.mjs"], timeoutMs: 5_000 },
+		]);
+		const execute = vi
+			.fn<(command: string, args: string[], options?: ExecOptions) => Promise<ExecResult>>()
+			.mockResolvedValueOnce({
+				stdout: "",
+				stderr: "expected value did not match",
+				code: 1,
+				killed: false,
+			})
+			.mockResolvedValueOnce({ stdout: "ok", stderr: "", code: 0, killed: false });
+		const extension = setupExtension(SessionManager.inMemory(), {
+			cwd: sourceRoot,
+			exec: execute,
+			workspace: {
+				...createWorkspaceView(sourceRoot),
+				kind: "overlay",
+				logicalRoot,
+				revision: { kind: "overlay-base", value: "test-base" },
+			},
+		});
+
+		await extension.command("finish only after verification", extension.ctx);
+		expect(findGoalState(extension.sessionManager.getBranch())?.verification).toMatchObject({
+			status: "pending",
+			checkIds: ["targeted-test"],
+		});
+
+		const failed = await extension.goalTool.execute(
+			"goal-fail",
+			{ action: "complete", note: "implementation appears complete" },
+			undefined,
+			undefined,
+			extension.ctx,
+		);
+		expect(failed.content[0]).toEqual(
+			expect.objectContaining({ type: "text", text: expect.stringContaining("expected value did not match") }),
+		);
+		const failedState = findGoalState(extension.sessionManager.getBranch());
+		expect(failedState).toMatchObject({
+			status: "active",
+			verification: {
+				status: "fail",
+				checks: [{ id: "targeted-test", status: "fail", exitCode: 1, killed: false }],
+			},
+		});
+		expect(JSON.stringify(failedState)).not.toContain("expected value did not match");
+		const failedGraph = findWorkGraph(extension.sessionManager.getBranch(), failedState!.id)!;
+		expect(failedGraph.nodes).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "work", status: "running" }),
+				expect.objectContaining({
+					id: "verify:targeted-test",
+					status: "pending",
+					evidence: [expect.objectContaining({ kind: "process" })],
+				}),
+			]),
+		);
+		expect(failedGraph.events.some((event) => event.nodeId === "verify:targeted-test" && event.to === "failed")).toBe(
+			true,
+		);
+		expect(execute).toHaveBeenNthCalledWith(
+			1,
+			"node",
+			["verify.mjs"],
+			expect.objectContaining({ cwd: logicalRoot, timeout: 5_000 }),
+		);
+
+		const completed = await extension.goalTool.execute(
+			"goal-pass",
+			{ action: "complete", note: "completion gate passed" },
+			undefined,
+			undefined,
+			extension.ctx,
+		);
+		expect(completed.content[0]).toEqual({
+			type: "text",
+			text: "Goal completed after the completion gate passed: completion gate passed",
+		});
+		const completedState = findGoalState(extension.sessionManager.getBranch());
+		expect(completedState).toMatchObject({
+			status: "completed",
+			note: "completion gate passed",
+			verification: { status: "pass" },
+		});
+		expect(findWorkGraph(extension.sessionManager.getBranch(), completedState!.id)?.nodes).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "verify:targeted-test", status: "succeeded" }),
+				expect.objectContaining({ id: "complete", status: "succeeded" }),
+			]),
+		);
+	});
+
+	it("blocks completion when the frozen gate configuration drifts", async () => {
+		const sourceRoot = await createTemporaryDirectory("pi-goal-drift-");
+		await writeGoalConfig(sourceRoot, [{ id: "check", command: "node", args: ["first.mjs"] }]);
+		const execute = vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false }));
+		const extension = setupExtension(SessionManager.inMemory(), { cwd: sourceRoot, exec: execute });
+
+		await extension.command("guard configuration drift", extension.ctx);
+		await writeGoalConfig(sourceRoot, [{ id: "check", command: "node", args: ["changed.mjs"] }]);
+		const result = await extension.goalTool.execute(
+			"goal-drift",
+			{ action: "complete", note: "done" },
+			undefined,
+			undefined,
+			extension.ctx,
+		);
+
+		expect(result.content[0]).toEqual({
+			type: "text",
+			text: "Goal blocked: Completion gate configuration changed after the goal started.",
+		});
+		expect(findGoalState(extension.sessionManager.getBranch())).toMatchObject({
+			status: "blocked",
+			verification: { status: "blocked" },
+		});
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("rejects host-only completion gates in an execution-boundary workspace", async () => {
+		const sourceRoot = await createTemporaryDirectory("pi-goal-boundary-");
+		await writeGoalConfig(sourceRoot, [{ id: "check", command: "node", args: ["verify.mjs"] }]);
+		const execute = vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false }));
+		const hostWorkspace = createWorkspaceView(sourceRoot);
+		const boundaryWorkspace: WorkspaceView = {
+			...hostWorkspace,
+			kind: "execution-boundary",
+			logicalRoot: "/sandbox/project",
+			revision: { kind: "boundary-profile", value: "test-profile" },
+			execution: { target: "boundary", process: "isolated", network: "deny" },
+		};
+		const extension = setupExtension(SessionManager.inMemory(), {
+			cwd: sourceRoot,
+			exec: execute,
+			workspace: boundaryWorkspace,
+		});
+
+		await extension.command("verify inside the boundary", extension.ctx);
+
+		expect(findGoalState(extension.sessionManager.getBranch())).toBeUndefined();
+		expect(extension.notify).toHaveBeenCalledWith(
+			"Goal could not be started because its completion gate cannot run through an execution boundary.",
+			"error",
+		);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("rejects sparse verification state arrays", () => {
+		const checkIds = new Array<string>(1);
+		const checks = [
+			{
+				id: undefined,
+				status: "pending",
+				exitCode: null,
+				killed: false,
+			},
+		];
+		expect(
+			parseGoalState({
+				version: 1,
+				id: "goal",
+				objective: "reject corrupted state",
+				status: "active",
+				turns: 0,
+				turnLimit: 25,
+				createdAt: "2026-07-30T00:00:00.000Z",
+				updatedAt: "2026-07-30T00:00:00.000Z",
+				verification: {
+					configRevision: `sha256:${"a".repeat(64)}`,
+					checkIds,
+					status: "pending",
+					checks,
+				},
+			}),
+		).toBeUndefined();
 	});
 
 	it("restores branch state without spending tokens and pauses an interrupted run", async () => {

@@ -1804,6 +1804,7 @@ export class InteractiveMode {
 			hasUI: true,
 			hasExecutionBoundary: this.session.hasExecutionBoundary,
 			cwd: this.sessionManager.getCwd(),
+			workspace: this.session.workspace,
 			sessionManager: this.sessionManager,
 			modelRegistry: extensionRunner.getModelRegistry(),
 			model: this.session.model,

@@ -127,6 +127,13 @@ describe("scoped-instructions example extension", () => {
 		]);
 	});
 
+	it("fails closed when an applicable instruction path cannot be read", () => {
+		const cwd = createWorkspace();
+		mkdirSync(join(cwd, "packages", "app", "AGENTS.md"));
+
+		expect(() => discoverScopedInstructionFiles(cwd, "packages/app/src/index.ts")).toThrow();
+	});
+
 	it("treats cwd and ancestor instructions as loaded but blocks on nested instructions", async () => {
 		const cwd = createWorkspace();
 		const fixture = setup(cwd);

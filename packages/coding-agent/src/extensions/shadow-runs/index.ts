@@ -348,6 +348,13 @@ async function runCandidates(
 		);
 		return;
 	}
+	if (ctx.hasExecutionBoundary) {
+		ctx.ui.notify(
+			"Shadow runs cannot use an execution boundary because candidate sessions run in host-process workspace overlays",
+			"error",
+		);
+		return;
+	}
 	if (!ctx.model) {
 		ctx.ui.notify("Shadow runs require an active model", "error");
 		return;

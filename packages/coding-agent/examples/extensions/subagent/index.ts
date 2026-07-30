@@ -12,7 +12,6 @@
  * Uses JSON mode to capture structured output from subagents.
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -25,6 +24,8 @@ import {
 	type ExtensionContext,
 	getAgentDir,
 	getMarkdownTheme,
+	localProcessRuntime,
+	type ThemeColor,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
@@ -46,6 +47,14 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isMessage(value: unknown): value is Message {
+	return isRecord(value) && (value.role === "user" || value.role === "assistant" || value.role === "toolResult");
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -89,7 +98,7 @@ function formatResolvedRuntime(result: Pick<SingleResult, "provider" | "model" |
 function formatToolCall(
 	toolName: string,
 	args: Record<string, unknown>,
-	themeFg: (color: any, text: string) => string,
+	themeFg: (color: ThemeColor, text: string) => string,
 ): string {
 	const shortenPath = (p: string) => {
 		const home = os.homedir();
@@ -313,7 +322,7 @@ function truncateParallelOutput(output: string): string {
 	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
 }
 
-type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
+type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, unknown> };
 
 function getDisplayItems(messages: Message[]): DisplayItem[] {
 	const items: DisplayItem[] = [];
@@ -534,97 +543,78 @@ async function runSingleAgent(
 		emitUpdate();
 		let abortSource: "parent" | "task" | undefined;
 
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
-				detached: process.platform !== "win32",
-				env: invocation.env,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
-			let buffer = "";
-			const abortBinding = bindProcessAbort(
-				{
-					kill: (childSignal) => {
-						if (process.platform !== "win32" && proc.pid) {
-							try {
-								process.kill(-proc.pid, childSignal);
-								return true;
-							} catch {
-								// Fall back to the direct child if its process group has already exited.
-							}
-						}
-						return proc.kill(childSignal);
-					},
-				},
-				signal,
-				taskSignal,
-			);
+		const invocation = getPiInvocation(args);
+		let buffer = "";
+		const processLine = (line: string) => {
+			if (!line.trim()) return;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line) as unknown;
+			} catch {
+				return;
+			}
+			if (!isRecord(parsed) || !isMessage(parsed.message)) return;
 
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
+			if (parsed.type === "message_end") {
+				const msg = parsed.message;
+				currentResult.messages.push(msg);
+
+				if (msg.role === "assistant") {
+					currentResult.usage.turns++;
+					const usage = msg.usage;
+					if (usage) {
+						currentResult.usage.input += usage.input || 0;
+						currentResult.usage.output += usage.output || 0;
+						currentResult.usage.cacheRead += usage.cacheRead || 0;
+						currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+						currentResult.usage.cost += usage.cost?.total || 0;
+						currentResult.usage.contextTokens = usage.totalTokens || 0;
+					}
+					if (!currentResult.model && msg.model) currentResult.model = msg.model;
+					if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+					if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+				}
+				emitUpdate();
+			}
+
+			if (parsed.type === "tool_result_end") {
+				currentResult.messages.push(parsed.message);
+				emitUpdate();
+			}
+		};
+		const processHandle = localProcessRuntime.start({
+			command: invocation.command,
+			args: invocation.args,
+			cwd: cwd ?? defaultCwd,
+			env: invocation.env,
+			onOutput: (stream, data) => {
+				if (stream === "stderr") {
+					currentResult.stderr += data.toString();
 					return;
 				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-					}
-					emitUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
 				buffer += data.toString();
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
 				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code) => {
-				abortSource = abortBinding.getSource();
-				abortBinding.close();
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", (error) => {
-				abortSource = abortBinding.getSource();
-				abortBinding.close();
-				currentResult.errorMessage = error.message;
-				currentResult.stderr += `${error.message}\n`;
-				resolve(1);
-			});
+			},
 		});
+		const abortBinding = bindProcessAbort(
+			{
+				kill: (childSignal) => processHandle.terminate("aborted", childSignal),
+			},
+			signal,
+			taskSignal,
+		);
+		const processExit = await processHandle.wait();
+		abortSource = abortBinding.getSource();
+		abortBinding.close();
+		if (buffer.trim()) processLine(buffer);
+		if (processExit.reason === "failed") {
+			const errorMessage = processExit.error ?? "Subagent process failed";
+			currentResult.errorMessage = errorMessage;
+			currentResult.stderr += `${errorMessage}\n`;
+		}
+		const exitCode = processExit.exitCode ?? (processExit.reason === "failed" ? 1 : 0);
 
 		currentResult.exitCode = exitCode;
 		if (abortSource) {

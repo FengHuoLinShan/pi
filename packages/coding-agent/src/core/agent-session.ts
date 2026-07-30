@@ -127,6 +127,7 @@ import {
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import type { WorkspaceOverlay } from "./workspace-overlay.ts";
+import { createWorkspaceView, type WorkspaceView } from "./workspace-view.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -462,6 +463,13 @@ export class AgentSession {
 
 	get hasExecutionBoundary(): boolean {
 		return this._executionBoundary !== undefined;
+	}
+
+	get workspace(): WorkspaceView {
+		return createWorkspaceView(this._cwd, {
+			executionBoundary: this._executionBoundary,
+			workspaceOverlay: this._workspaceOverlay,
+		});
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -2910,6 +2918,7 @@ export class AgentSession {
 				isIdle: () => this.isIdle,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 				hasExecutionBoundary: () => this.hasExecutionBoundary,
+				getWorkspaceView: () => this.workspace,
 				getSignal: () => this.agent.signal,
 				abort: () => {
 					if (this._extensionAbortHandler) {

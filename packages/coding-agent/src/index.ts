@@ -189,6 +189,7 @@ export {
 } from "./core/extensions/index.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
+export * from "./core/goal-completion.ts";
 export {
 	CODING_AGENT_RECOVERY_REPORT_VERSION,
 	type CodingAgentRecoveryOperation,
@@ -197,6 +198,7 @@ export {
 	type CodingAgentRecoveryToolCall,
 	getCodingAgentRecoveryReport,
 } from "./core/harness-recovery-report.ts";
+export * from "./core/impact-verification.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
@@ -223,6 +225,7 @@ export type {
 	ResolvedResource,
 } from "./core/package-manager.ts";
 export { DefaultPackageManager } from "./core/package-manager.ts";
+export * from "./core/process-runtime.ts";
 export * from "./core/process-session.ts";
 export * from "./core/process-session-verifier.ts";
 export type {
@@ -382,8 +385,23 @@ export {
 	type ProjectTrustStoreEntry,
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
+export * from "./core/work-graph.ts";
+export * from "./core/work-graph-session.ts";
+export * from "./core/working-set-session.ts";
 export * from "./core/workspace-change-discipline-verifier.ts";
 export * from "./core/workspace-overlay.ts";
+export {
+	createWorkspaceView,
+	type WorkspaceExecutionTarget,
+	type WorkspaceNetworkMode,
+	type WorkspaceProcessMode,
+	type WorkspaceView,
+	type WorkspaceViewKind,
+	type WorkspaceViewMount,
+	type WorkspaceViewOptions,
+	type WorkspaceViewRevision,
+	type WorkspaceViewState,
+} from "./core/workspace-view.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
 // Run modes for programmatic SDK usage

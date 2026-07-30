@@ -42,7 +42,10 @@ function readInstructionFile(directory: string): InstructionFile | undefined {
 		try {
 			const content = readFileSync(path);
 			return { path, revision: computeFileRevision(content) };
-		} catch {}
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+		}
 	}
 	return undefined;
 }

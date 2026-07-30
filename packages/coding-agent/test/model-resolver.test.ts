@@ -357,6 +357,34 @@ describe("resolveCliModel", () => {
 		expect(result.model?.id).toBe("gpt-5.6-luna");
 	});
 
+	test("keeps an exact model match ahead of an authenticated fuzzy match with a thinking suffix", () => {
+		const exactLuna: Model<"anthropic-messages"> = {
+			...mockModels[1],
+			id: "gpt-5.6-luna",
+			name: "GPT-5.6 Luna",
+			provider: "openrouter",
+		};
+		const fuzzyCodexLuna: Model<"anthropic-messages"> = {
+			...exactLuna,
+			id: "gpt-5.6-luna-codex",
+			provider: "openai-codex",
+		};
+		const registry = {
+			getModels: () => [exactLuna, fuzzyCodexLuna],
+			hasConfiguredAuth: (provider: string) => provider === "openai-codex",
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRuntime"];
+
+		const result = resolveCliModel({
+			cliModel: "gpt-5.6-luna:high",
+			modelRuntime: registry,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.provider).toBe("openrouter");
+		expect(result.model?.id).toBe("gpt-5.6-luna");
+		expect(result.thinkingLevel).toBe("high");
+	});
+
 	test("keeps an explicit provider even when another matching provider is authenticated", () => {
 		const openRouterLuna: Model<"anthropic-messages"> = {
 			...mockModels[1],

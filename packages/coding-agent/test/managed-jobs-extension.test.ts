@@ -216,6 +216,31 @@ describe("managed jobs runtime", () => {
 		expect(result.status).toBe("timeout");
 		expect(result.record.state).toBe("running");
 	});
+
+	it("rejects instead of throwing from a timeout callback when the job was pruned", async () => {
+		const record = { id: "pruned", state: "running" } as ProcessSessionRecord;
+		const status = vi
+			.fn()
+			.mockReturnValueOnce(record)
+			.mockReturnValueOnce(record)
+			.mockImplementation(() => {
+				throw new Error("Unknown process session: pruned");
+			});
+		const runtime = {
+			manager: {
+				status,
+				readOutputTail: vi.fn(async () => Buffer.alloc(0)),
+				subscribe: vi.fn(() => () => {}),
+			},
+		} as unknown as ManagedJobsRuntime;
+
+		await expect(
+			waitForManagedJobOutput(runtime, record.id, {
+				contains: "never emitted",
+				timeoutMs: 10,
+			}),
+		).rejects.toThrow("Unknown process session: pruned");
+	});
 });
 
 describe("managed jobs built-in extension", () => {

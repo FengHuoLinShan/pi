@@ -80,6 +80,7 @@ import type {
 	ReadToolInput,
 	WriteToolInput,
 } from "../tools/index.ts";
+import type { WorkspaceView } from "../workspace-view.ts";
 
 export type { ExecOptions, ExecResult } from "../exec.ts";
 export type { BuildSystemPromptOptions } from "../system-prompt.ts";
@@ -324,8 +325,10 @@ export interface ExtensionContext {
 	hasUI: boolean;
 	/** Whether built-in tools are routed through an attested execution boundary. */
 	hasExecutionBoundary: boolean;
-	/** Current working directory */
+	/** Original host working directory used to create the session. */
 	cwd: string;
+	/** Filesystem and execution namespace currently visible to built-in tools. */
+	workspace: WorkspaceView;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
 	/** Model registry for API key resolution */
@@ -1631,6 +1634,7 @@ export interface ExtensionContextActions {
 	isIdle: () => boolean;
 	isProjectTrusted: () => boolean;
 	hasExecutionBoundary?: () => boolean;
+	getWorkspaceView?: () => WorkspaceView;
 	getSignal: () => AbortSignal | undefined;
 	abort: () => void;
 	hasPendingMessages: () => boolean;

@@ -106,4 +106,20 @@ describe("subagent progress display", () => {
 		expect(lines).toContain("  … 5 more tasks");
 		expect(lines.some((line) => line.includes("scout spoof · running · Inspect status"))).toBe(true);
 	});
+
+	it("bounds call groups when many tool calls are active", () => {
+		const display = new SubagentProgressDisplay();
+		for (let index = 0; index < 10; index++) {
+			const toolCallId = `call-${index}`;
+			display.begin(toolCallId, "single", 1);
+			display.update(
+				event(toolCallId, "single", [task(`${toolCallId}:0`, `worker-${index}`, "running", `Task ${index}`)]),
+			);
+		}
+
+		const lines = display.getLines()!;
+		expect(lines).toHaveLength(14);
+		expect(lines.filter((line) => line.startsWith("#"))).toHaveLength(6);
+		expect(lines).toContain("  … 4 more calls · 4 more tasks");
+	});
 });

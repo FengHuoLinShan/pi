@@ -121,7 +121,7 @@ Run `/agent-config` to edit personal runtime overrides without changing agent Ma
 - Groups single, parallel, and chain calls while showing queued, running, completed, failed, and cancelled siblings together
 - Shows the latest activity, redacted task summary, runtime, turns, tokens, and cost for each task
 - Disappears after all active calls finish; completed tool results remain in the transcript
-- Displays up to 12 task rows at once and reports the number of additional tasks
+- Displays up to 6 call groups and 12 task rows at once, then reports omitted calls and tasks
 
 **Collapsed view** (default):
 - Status icon (✓/✗/⏳) and agent name
@@ -215,4 +215,4 @@ Personal runtime overrides are stored separately with private file permissions:
 - Parallel model-visible output is capped at 50 KB per task; full results remain in tool details
 - Agents discovered fresh on each invocation (allows editing mid-session)
 - Parallel mode limited to 8 tasks, 4 concurrent
-- Global progress panel displays at most 12 task rows at once
+- Global progress panel displays at most 6 call groups and 12 task rows at once

@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import triggerCompactExtension from "../examples/extensions/trigger-compact.ts";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../src/core/extensions/index.ts";
+import { createWorkspaceView } from "../src/core/workspace-view.ts";
 
 function createContext(tokens: number | null, compact = vi.fn()): ExtensionContext {
 	return {
@@ -9,6 +10,7 @@ function createContext(tokens: number | null, compact = vi.fn()): ExtensionConte
 		hasExecutionBoundary: false,
 		ui: {} as ExtensionContext["ui"],
 		cwd: process.cwd(),
+		workspace: createWorkspaceView(process.cwd()),
 		sessionManager: {} as ExtensionContext["sessionManager"],
 		modelRegistry: {} as ExtensionContext["modelRegistry"],
 		model: undefined,

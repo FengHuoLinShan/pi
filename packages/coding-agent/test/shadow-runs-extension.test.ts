@@ -84,6 +84,7 @@ function setupExtension(
 		flagEnabled?: boolean;
 		projectTrusted?: boolean;
 		failingCandidate?: string;
+		hasExecutionBoundary?: boolean;
 	} = {},
 ) {
 	const commands = new Map<string, CommandHandler>();
@@ -118,6 +119,7 @@ function setupExtension(
 		cwd: workspace,
 		mode: "rpc",
 		hasUI: true,
+		hasExecutionBoundary: options.hasExecutionBoundary ?? false,
 		model: fauxModel,
 		modelRegistry: {},
 		sessionManager: { getSessionId: () => sessionId },
@@ -388,6 +390,20 @@ describe("shadow runs built-in extension", () => {
 		await untrusted.command("run Never start", untrusted.ctx);
 		expect(untrusted.createCandidateRunner).not.toHaveBeenCalled();
 		expect(untrusted.notify).toHaveBeenCalledWith(expect.stringContaining("require a trusted project"), "error");
+	});
+
+	it("refuses to downgrade an execution-boundary session to host-process candidate overlays", async () => {
+		const workspace = createWorkspace();
+		writeConfig(workspace, createConfig());
+		const extension = setupExtension(workspace, { hasExecutionBoundary: true });
+
+		await extension.command("run Never start", extension.ctx);
+
+		expect(extension.createCandidateRunner).not.toHaveBeenCalled();
+		expect(extension.notify).toHaveBeenCalledWith(
+			"Shadow runs cannot use an execution boundary because candidate sessions run in host-process workspace overlays",
+			"error",
+		);
 	});
 
 	it("rejects malformed config before creating a candidate runner", async () => {

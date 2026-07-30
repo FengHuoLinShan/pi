@@ -240,11 +240,16 @@ export async function runShadowCandidateAgent(
 		loopDetection: { maxConsecutiveToolCalls: 4, includeToolResult: true },
 	});
 	let abortPromise: Promise<void> | undefined;
+	let abortStarted = false;
 	const abortCandidate = () => {
+		if (abortStarted) return;
+		abortStarted = true;
 		abortPromise = created.session.abort();
 	};
 	context.signal.addEventListener("abort", abortCandidate, { once: true });
+	if (context.signal.aborted) abortCandidate();
 	try {
+		if (context.signal.aborted) throw new Error(`Shadow run candidate ${context.candidate.id} was aborted`);
 		await created.session.prompt(options.objective);
 		const assistant = getLastAssistantMessage(created.session.messages);
 		if (!assistant) throw new Error(`Shadow run candidate ${context.candidate.id} returned no assistant message`);

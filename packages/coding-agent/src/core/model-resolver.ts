@@ -350,6 +350,19 @@ export interface ResolveCliModelResult {
 	error: string | undefined;
 }
 
+function patternExactlyReferencesModel(pattern: string, model: Model<Api>): boolean {
+	const normalizedPattern = pattern.trim().toLowerCase();
+	if (
+		normalizedPattern === model.id.toLowerCase() ||
+		normalizedPattern === `${model.provider}/${model.id}`.toLowerCase()
+	) {
+		return true;
+	}
+	const colonIndex = pattern.lastIndexOf(":");
+	if (colonIndex === -1 || !isValidThinkingLevel(pattern.substring(colonIndex + 1))) return false;
+	return patternExactlyReferencesModel(pattern.substring(0, colonIndex), model);
+}
+
 /**
  * Resolve a single model from CLI flags.
  *
@@ -450,9 +463,13 @@ export function resolveCliModel(options: {
 		: candidates.filter((model) => modelRuntime.hasConfiguredAuth(model.provider));
 	const configuredMatch =
 		configuredCandidates.length > 0 ? parseModelPattern(pattern, configuredCandidates, parseOptions) : undefined;
-	const { model, thinkingLevel, warning } = configuredMatch?.model
-		? configuredMatch
-		: parseModelPattern(pattern, candidates, parseOptions);
+	const availableMatch = parseModelPattern(pattern, candidates, parseOptions);
+	const availableMatchIsExact =
+		availableMatch.model !== undefined && patternExactlyReferencesModel(pattern, availableMatch.model);
+	const configuredMatchIsExact =
+		configuredMatch?.model !== undefined && patternExactlyReferencesModel(pattern, configuredMatch.model);
+	const { model, thinkingLevel, warning } =
+		configuredMatch?.model && (!availableMatchIsExact || configuredMatchIsExact) ? configuredMatch : availableMatch;
 
 	if (model) {
 		// If provider inference matched an unauthenticated provider/model pair, prefer

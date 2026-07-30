@@ -36,6 +36,7 @@ interface ActiveCall {
 }
 
 const MAX_VISIBLE_TASKS = 12;
+const MAX_VISIBLE_CALLS = 6;
 const MAX_AGENT_LENGTH = 40;
 const MAX_ACTIVITY_LENGTH = 40;
 const MAX_SUMMARY_LENGTH = 100;
@@ -151,7 +152,8 @@ export class SubagentProgressDisplay {
 
 		const lines = [headerParts.join(" · ")];
 		let visibleTasks = 0;
-		for (let callIndex = 0; callIndex < calls.length; callIndex++) {
+		const visibleCalls = calls.slice(0, MAX_VISIBLE_CALLS);
+		for (let callIndex = 0; callIndex < visibleCalls.length; callIndex++) {
 			const call = calls[callIndex]!;
 			const tasks = [...call.tasks.values()].sort((left, right) => {
 				const leftRank = left.status === "running" ? 0 : left.status === "queued" ? 1 : 2;
@@ -174,7 +176,15 @@ export class SubagentProgressDisplay {
 			}
 			if (tasks.length === 0) lines.push("  ○ starting...");
 		}
-		if (allTasks.length > visibleTasks) lines.push(`  … ${allTasks.length - visibleTasks} more tasks`);
+		const hiddenCalls = calls.length - visibleCalls.length;
+		const hiddenTasks = allTasks.length - visibleTasks;
+		if (hiddenCalls > 0) {
+			lines.push(
+				`  … ${plural(hiddenCalls, "more call")}${hiddenTasks > 0 ? ` · ${plural(hiddenTasks, "more task")}` : ""}`,
+			);
+		} else if (hiddenTasks > 0) {
+			lines.push(`  … ${plural(hiddenTasks, "more task")}`);
+		}
 		return lines;
 	}
 }

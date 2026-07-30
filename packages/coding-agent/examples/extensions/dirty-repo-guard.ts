@@ -8,7 +8,8 @@
  * prompt guidance telling the agent not to bypass the guard with bash.
  */
 
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, isToolCallEventType } from "@earendil-works/pi-coding-agent";
 
 interface ReadyBaseline {
@@ -19,6 +20,8 @@ interface ReadyBaseline {
 }
 
 type RepoBaseline = ReadyBaseline | { kind: "not_repository" } | { kind: "unavailable"; reason: string };
+
+type RepositoryPath = { kind: "inside"; path: string } | { kind: "outside" } | { kind: "unavailable"; reason: string };
 
 function removeTrailingLineBreak(value: string): string {
 	return value.endsWith("\r\n") ? value.slice(0, -2) : value.endsWith("\n") ? value.slice(0, -1) : value;
@@ -56,14 +59,43 @@ export function parsePorcelainV1Z(output: string): Set<string> {
 	return paths;
 }
 
-function toRepositoryRelativePath(repositoryRoot: string, cwd: string, inputPath: string): string | undefined {
-	const absolutePath = isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath);
+function canonicalizeExistingOrPlannedPath(path: string): string {
+	let existingPath = resolve(path);
+	const missingSegments: string[] = [];
+
+	while (true) {
+		try {
+			return resolve(realpathSync(existingPath), ...missingSegments);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+			const parent = dirname(existingPath);
+			if (parent === existingPath) throw error;
+			missingSegments.unshift(basename(existingPath));
+			existingPath = parent;
+		}
+	}
+}
+
+function toRepositoryRelativePath(repositoryRoot: string, cwd: string, inputPath: string): RepositoryPath {
+	let absolutePath: string;
+	try {
+		absolutePath = canonicalizeExistingOrPlannedPath(
+			isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath),
+		);
+	} catch (error) {
+		return {
+			kind: "unavailable",
+			reason: error instanceof Error ? error.message : "the target path could not be resolved",
+		};
+	}
+
 	const relativePath = relative(repositoryRoot, absolutePath);
 	if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${sep}`)) {
-		return undefined;
+		return { kind: "outside" };
 	}
-	if (isAbsolute(relativePath)) return undefined;
-	return relativePath.replaceAll("\\", "/");
+	if (isAbsolute(relativePath)) return { kind: "outside" };
+	return { kind: "inside", path: relativePath.replaceAll("\\", "/") };
 }
 
 async function captureBaseline(pi: ExtensionAPI, ctx: ExtensionContext): Promise<RepoBaseline> {
@@ -80,7 +112,15 @@ async function captureBaseline(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 	if (!rootOutput) {
 		return { kind: "unavailable", reason: "git returned an empty repository root" };
 	}
-	const repositoryRoot = resolve(ctx.cwd, rootOutput);
+	let repositoryRoot: string;
+	try {
+		repositoryRoot = canonicalizeExistingOrPlannedPath(resolve(ctx.cwd, rootOutput));
+	} catch (error) {
+		return {
+			kind: "unavailable",
+			reason: error instanceof Error ? error.message : "the repository root could not be resolved",
+		};
+	}
 	const statusResult = await pi.exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
 		cwd: repositoryRoot,
 		timeout: 5_000,
@@ -183,8 +223,16 @@ This session started with ${baseline.dirtyPaths.size} pre-existing Git-changed p
 			};
 		}
 
-		const path = toRepositoryRelativePath(baseline.repositoryRoot, ctx.cwd, event.input.path);
-		if (!path || !baseline.dirtyPaths.has(path) || baseline.approvedPaths.has(path)) return;
+		const resolvedPath = toRepositoryRelativePath(baseline.repositoryRoot, ctx.cwd, event.input.path);
+		if (resolvedPath.kind === "unavailable") {
+			return {
+				block: true,
+				reason: `Cannot safely resolve the target path: ${resolvedPath.reason}`,
+			};
+		}
+		if (resolvedPath.kind === "outside") return;
+		const { path } = resolvedPath;
+		if (!baseline.dirtyPaths.has(path) || baseline.approvedPaths.has(path)) return;
 
 		if (!ctx.hasUI) {
 			return {

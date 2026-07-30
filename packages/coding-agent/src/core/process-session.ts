@@ -1,9 +1,6 @@
-import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, realpath, rename, rm, truncate } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { spawnProcess, waitForChildProcess } from "../utils/child-process.ts";
-import { killProcessTree, trackDetachedChildPid, untrackDetachedChildPid } from "../utils/shell.ts";
 import type { ArtifactRef, ArtifactStore, ArtifactStorePruneReport } from "./artifact-store.ts";
 import {
 	createBoundaryProfileDigest,
@@ -11,6 +8,7 @@ import {
 	filterBoundaryEnvironment,
 	resolveExecutionBoundary,
 } from "./execution-boundary.ts";
+import { localProcessRuntime, type ProcessRuntimeHandle } from "./process-runtime.ts";
 import { captureFilePathSnapshot, revalidateFilePathSnapshot } from "./tools/file-transaction.ts";
 
 export type ProcessOutputStream = "stdout" | "stderr";
@@ -299,7 +297,7 @@ function isProcessSessionEvent(value: unknown): value is ProcessSessionEvent {
 }
 
 interface NodeLiveProcess {
-	child: ChildProcess;
+	handle: ProcessRuntimeHandle;
 	callbacks: ProcessBackendCallbacks;
 	status: ProcessBackendStatus;
 }
@@ -314,39 +312,25 @@ export class NodeProcessSessionBackend implements ProcessSessionBackend {
 	private readonly live = new Map<string, NodeLiveProcess>();
 
 	async start(request: ProcessBackendStartRequest, callbacks: ProcessBackendCallbacks): Promise<ProcessBackendHandle> {
-		const backendProcessId = randomUUID();
-		const child = spawnProcess(request.command, [...request.args], {
+		const handle = localProcessRuntime.start({
+			command: request.command,
+			args: request.args,
 			cwd: request.cwd,
-			detached: process.platform !== "win32",
 			env: request.env,
-			stdio: ["ignore", "pipe", "pipe"],
-			windowsHide: true,
+			onOutput: (stream, chunk) => live.callbacks.onOutput(stream, chunk),
 		});
-		const live: NodeLiveProcess = { child, callbacks, status: { state: "running" } };
-		this.live.set(backendProcessId, live);
-		child.stdout?.on("data", (chunk: Buffer) => live.callbacks.onOutput("stdout", Buffer.from(chunk)));
-		child.stderr?.on("data", (chunk: Buffer) => live.callbacks.onOutput("stderr", Buffer.from(chunk)));
-		if (child.pid) trackDetachedChildPid(child.pid);
-		let exitSignal: string | undefined;
-		child.once("exit", (_code, signal) => {
-			exitSignal = signal ?? undefined;
+		const live: NodeLiveProcess = { handle, callbacks, status: { state: "running" } };
+		this.live.set(handle.id, live);
+		void handle.wait().then((result) => {
+			const exit: ProcessBackendExit = {
+				exitCode: result.exitCode,
+				signal: result.signal,
+				error: result.reason === "failed" ? result.error : undefined,
+			};
+			live.status = { state: "exited", exit };
+			live.callbacks.onExit(exit);
 		});
-		void waitForChildProcess(child).then(
-			(exitCode) => {
-				if (child.pid) untrackDetachedChildPid(child.pid);
-				const exit: ProcessBackendExit = { exitCode, signal: exitSignal };
-				live.status = { state: "exited", exit };
-				live.callbacks.onExit(exit);
-			},
-			(error: unknown) => {
-				if (child.pid) untrackDetachedChildPid(child.pid);
-				const message = error instanceof Error ? error.message : String(error);
-				const exit: ProcessBackendExit = { exitCode: null, error: message };
-				live.status = { state: "exited", exit };
-				live.callbacks.onExit(exit);
-			},
-		);
-		return { id: backendProcessId, pid: child.pid };
+		return { id: handle.id, pid: handle.pid };
 	}
 
 	async attach(handle: ProcessBackendHandle, callbacks: ProcessBackendCallbacks): Promise<boolean> {
@@ -363,8 +347,7 @@ export class NodeProcessSessionBackend implements ProcessSessionBackend {
 	async terminate(handle: ProcessBackendHandle): Promise<void> {
 		const live = this.live.get(handle.id);
 		if (!live || live.status.state !== "running") throw new Error(`Process handle is unavailable: ${handle.id}`);
-		if (live.child.pid) killProcessTree(live.child.pid);
-		else live.child.kill("SIGKILL");
+		live.handle.terminate();
 	}
 }
 
