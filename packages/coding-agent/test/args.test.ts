@@ -1,5 +1,5 @@
-import { describe, expect, test } from "vitest";
-import { parseArgs } from "../src/cli/args.ts";
+import { describe, expect, test, vi } from "vitest";
+import { parseArgs, printHelp } from "../src/cli/args.ts";
 
 describe("parseArgs", () => {
 	describe("--version flag", () => {
@@ -437,5 +437,38 @@ describe("parseArgs", () => {
 			expect(result.fileArgs).toEqual(["prompt.md"]);
 			expect(result.messages).toEqual(["Do the task"]);
 		});
+	});
+});
+
+describe("printHelp", () => {
+	test("aligns descriptions after the longest extension flag", () => {
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			printHelp([
+				{
+					name: "short",
+					type: "boolean",
+					description: "Short description",
+					extensionPath: "test",
+				},
+				{
+					name: "managed-jobs-agent-control",
+					type: "boolean",
+					description: "Control description",
+					extensionPath: "test",
+				},
+			]);
+
+			const output = String(log.mock.calls[0]?.[0]);
+			const shortLine = output.split("\n").find((line) => line.includes("--short"));
+			const longLine = output.split("\n").find((line) => line.includes("--managed-jobs-agent-control"));
+
+			expect(shortLine).toBeDefined();
+			expect(longLine).toBeDefined();
+			expect(shortLine?.indexOf("Short description")).toBe(longLine?.indexOf("Control description"));
+			expect(longLine).toContain("--managed-jobs-agent-control  Control description");
+		} finally {
+			log.mockRestore();
+		}
 	});
 });
