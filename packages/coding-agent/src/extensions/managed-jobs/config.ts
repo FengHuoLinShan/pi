@@ -9,6 +9,7 @@ export const MANAGED_JOBS_CONFIG_PATH = ".pi/managed-jobs.json";
 
 const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_RECIPES = 16;
+const MAX_DESCRIPTION_LENGTH = 256;
 const MAX_COMMAND_LENGTH = 4_096;
 const MAX_ARGUMENTS = 64;
 const MAX_ARGUMENT_BYTES = 8_192;
@@ -28,6 +29,7 @@ export interface ManagedJobReadinessConfig {
 
 export interface ManagedJobRecipeConfig {
 	id: string;
+	description?: string;
 	command: string;
 	args: string[];
 	inheritEnv?: string[];
@@ -77,6 +79,14 @@ function parseText(value: unknown, label: string, maximumLength: number): string
 	return value;
 }
 
+function parseDescription(value: unknown, label: string): string {
+	const description = parseText(value, label, MAX_DESCRIPTION_LENGTH);
+	if (/[\u0000-\u001f\u007f\u2028\u2029]/.test(description)) {
+		throw new Error(`${label} must be a single line without control characters`);
+	}
+	return description;
+}
+
 function assertDenseArray(value: readonly unknown[], label: string): void {
 	for (let index = 0; index < value.length; index++) {
 		if (!(index in value)) throw new Error(`${label} must not contain sparse entries`);
@@ -108,10 +118,22 @@ function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 	if (!isPlainObject(value)) throw new Error(`${label} must be an object`);
 	rejectUnknownFields(
 		value,
-		["id", "command", "args", "inheritEnv", "maxAgentStarts", "maxRuntimeSeconds", "requireApproval", "readiness"],
+		[
+			"id",
+			"description",
+			"command",
+			"args",
+			"inheritEnv",
+			"maxAgentStarts",
+			"maxRuntimeSeconds",
+			"requireApproval",
+			"readiness",
+		],
 		label,
 	);
 	const id = parsePortableId(value.id, `${label}.id`);
+	const description =
+		value.description === undefined ? undefined : parseDescription(value.description, `${label}.description`);
 	const command = parseText(value.command, `${label}.command`, MAX_COMMAND_LENGTH);
 	const rawArguments = value.args ?? [];
 	if (!Array.isArray(rawArguments) || rawArguments.length > MAX_ARGUMENTS) {
@@ -174,6 +196,7 @@ function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 	}
 	return {
 		id,
+		...(description === undefined ? {} : { description }),
 		command,
 		args,
 		...(inheritEnv === undefined ? {} : { inheritEnv }),

@@ -552,6 +552,7 @@ describe("managed jobs built-in extension", () => {
 				recipes: [
 					{
 						id: "check",
+						description: "Run repository checks",
 						command: "npm",
 						args: ["run", "check", "x".repeat(2_000)],
 						inheritEnv: [],
@@ -571,6 +572,10 @@ describe("managed jobs built-in extension", () => {
 
 		expect(extension.tool(MANAGED_JOBS_AGENT_CONTROL_TOOL)).toBeUndefined();
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("Managed-job recipe preview"), "info");
+		expect(extension.notify).toHaveBeenLastCalledWith(
+			expect.stringContaining('description="Run repository checks"'),
+			"info",
+		);
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("npm run check"), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining('readiness=stdout:"ready"/5s'), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("env=minimal"), "info");

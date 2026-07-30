@@ -28,6 +28,7 @@ function validConfig(): unknown {
 		recipes: [
 			{
 				id: "dev-server",
+				description: "Start the reviewed local development server",
 				command: "npm",
 				args: ["run", "dev"],
 				inheritEnv: ["PORT", "DATABASE_URL"],
@@ -95,6 +96,27 @@ describe("managed jobs config", () => {
 				recipes: [{ id: "../dev", command: "npm" }],
 			}),
 		).toThrow("portable identifier");
+	});
+
+	it("accepts bounded single-line descriptions", () => {
+		expect(
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "check", description: "Run local checks", command: "npm" }],
+			}).recipes[0]?.description,
+		).toBe("Run local checks");
+		expect(() =>
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "check", description: "line one\nline two", command: "npm" }],
+			}),
+		).toThrow("must be a single line without control characters");
+		expect(() =>
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "check", description: "x".repeat(257), command: "npm" }],
+			}),
+		).toThrow("exceeds 256 characters");
 	});
 
 	it("rejects sparse arrays, NUL bytes, and unbounded readiness", () => {

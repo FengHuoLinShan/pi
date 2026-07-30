@@ -68,6 +68,7 @@ function createLoadedConfig(): LoadedManagedJobsConfig {
 			recipes: [
 				{
 					id: "api",
+					description: "Start the local API",
 					command: process.execPath,
 					args: ["-e", "process.stdout.write('ready'); setInterval(() => {}, 1000)"],
 					inheritEnv: ["PI_MANAGED_JOBS_ALLOWED"],
@@ -100,12 +101,15 @@ describe("managed job agent control", () => {
 		loaded.config.recipes[0]!.command = "unapproved-after-load";
 		loaded.config.recipes[0]!.args = ["unapproved-after-load"];
 		loaded.config.recipes[0]!.inheritEnv = ["PI_MANAGED_JOBS_BLOCKED"];
+		loaded.config.recipes[0]!.description = "Unapproved description";
 
 		const started = await tool.execute("start-call", { action: "start", recipe: "api" }, undefined, undefined, ctx);
 		const startDetails = started.details as ManagedJobControlStartDetails;
 		const record = runtime.manager.status(startDetails.jobId);
 
 		expect(tool.name).toBe(MANAGED_JOBS_AGENT_CONTROL_TOOL);
+		expect(tool.description).toContain("Start the local API");
+		expect(tool.description).not.toContain("Unapproved description");
 		expect(startDetails).toMatchObject({
 			action: "start",
 			configRevision: loaded.revision,
@@ -293,6 +297,7 @@ describe("managed job agent control", () => {
 				recipes: [
 					{
 						id: "deploy",
+						description: "Deploy the reviewed build",
 						command: process.execPath,
 						args: ["-e", "setInterval(() => {}, 1000)", "x".repeat(5_000)],
 						maxAgentStarts: 1,
@@ -337,6 +342,10 @@ describe("managed job agent control", () => {
 		expect(confirm).toHaveBeenLastCalledWith(
 			"Run agent-managed job recipe?",
 			expect.stringContaining(process.execPath),
+		);
+		expect(confirm).toHaveBeenLastCalledWith(
+			"Run agent-managed job recipe?",
+			expect.stringContaining("Deploy the reviewed build"),
 		);
 		const approvalMessage = confirm.mock.calls.at(-1)?.[1] ?? "";
 		expect(approvalMessage).not.toContain("x".repeat(4_100));
