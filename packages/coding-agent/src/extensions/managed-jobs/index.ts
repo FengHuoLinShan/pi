@@ -192,7 +192,7 @@ The user may attach bounded process output through custom messages of type manag
 	});
 
 	pi.registerCommand("job", {
-		description: "Start, list, inspect, read, or stop bounded background jobs",
+		description: "Start, list, inspect, read, stop, or prune bounded background jobs",
 		handler: async (rawArgs, ctx) => {
 			const opened = await requireRuntime(ctx);
 			if (!opened) return;
@@ -393,13 +393,70 @@ The user may attach bounded process output through custom messages of type manag
 					ctx.ui.notify(`Managed job ${displayJobId(stopped)} is ${stopped.state}`, "info");
 					return;
 				}
+				if (action === "prune") {
+					const pruneAll = args.length === 1 && args[0] === "--all";
+					if ((!pruneAll && args.length !== 1) || (args[0] === "--all" && !pruneAll)) {
+						ctx.ui.notify("Usage: /job prune <id>|--all", "warning");
+						return;
+					}
+					if (!ctx.hasUI) {
+						ctx.ui.notify("Pruning managed job history requires approval UI", "error");
+						return;
+					}
+					const records = opened.manager.list();
+					const activeCount = records.filter((record) => isActiveManagedJobState(record.state)).length;
+					let targets: ProcessSessionRecord[];
+					if (pruneAll) {
+						targets = records.filter((record) => !isActiveManagedJobState(record.state));
+					} else {
+						const record = resolveRecord(opened, args[0]!);
+						if (isActiveManagedJobState(record.state)) {
+							ctx.ui.notify(
+								`Managed job ${displayJobId(record)} must be terminal before pruning (currently ${record.state})`,
+								"warning",
+							);
+							return;
+						}
+						targets = [record];
+					}
+					if (targets.length === 0) {
+						ctx.ui.notify(
+							pruneAll && activeCount > 0
+								? `No terminal managed jobs to prune; ${activeCount} active job(s) were kept`
+								: "No terminal managed jobs to prune",
+							"warning",
+						);
+						return;
+					}
+					const activeDetail = pruneAll && activeCount > 0 ? ` ${activeCount} active job(s) will be kept.` : "";
+					const approved = await ctx.ui.confirm(
+						"Prune managed job history?",
+						`Permanently remove ${targets.length} terminal job(s), including their process journal entries, stored commands and arguments, and output provenance? Unshared artifact objects are deleted; shared objects and unknown sidecars are retained.${activeDetail}`,
+					);
+					if (!approved) return;
+
+					const result = await opened.manager.pruneTerminalSessions(targets.map((record) => record.id));
+					setJobsStatus(ctx, opened);
+					if (result.artifactCleanupError) {
+						ctx.ui.notify(
+							`Pruned ${result.processSessionIds.length} process journal record(s), but artifact cleanup is incomplete: ${displayText(result.artifactCleanupError)}`,
+							"warning",
+						);
+						return;
+					}
+					ctx.ui.notify(
+						`Pruned ${result.processSessionIds.length} terminal job(s); removed ${result.artifacts?.metadataRecordsRemoved ?? 0} provenance record(s) and ${result.artifacts?.artifactsRemoved ?? 0} unshared artifact object(s)`,
+						"info",
+					);
+					return;
+				}
 			} catch (error) {
 				ctx.ui.notify(error instanceof Error ? displayText(error.message) : displayText(String(error)), "error");
 				return;
 			}
 
 			ctx.ui.notify(
-				"Usage: /job [list|start [--name <name>] <command> [args...]|status <id>|output <id>|send <id>|wait <id> --contains <text>|stop <id>]",
+				"Usage: /job [list|start [--name <name>] <command> [args...]|status <id>|output <id>|send <id>|wait <id> --contains <text>|stop <id>|prune <id>|prune --all]",
 				"warning",
 			);
 		},

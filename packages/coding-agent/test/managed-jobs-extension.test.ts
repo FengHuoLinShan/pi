@@ -63,7 +63,7 @@ function quoteArgument(value: string): string {
 	return JSON.stringify(value);
 }
 
-function setupExtension(runtime: ManagedJobsRuntime, enabled = true, idle = true) {
+function setupExtension(runtime: ManagedJobsRuntime, enabled = true, idle = true, hasUI = true) {
 	const commands = new Map<string, CommandHandler>();
 	let sessionStart: SessionStartHandler | undefined;
 	let sessionShutdown: SessionShutdownHandler | undefined;
@@ -86,10 +86,12 @@ function setupExtension(runtime: ManagedJobsRuntime, enabled = true, idle = true
 	} as unknown as ExtensionAPI;
 	const notify = vi.fn();
 	const setStatus = vi.fn();
+	const confirm = vi.fn(async () => true);
 	const ctx = {
 		cwd: runtime.manager.list()[0]?.cwd ?? temporaryDirectories.at(-1)!,
+		hasUI,
 		isIdle: () => idle,
-		ui: { notify, setStatus },
+		ui: { confirm, notify, setStatus },
 	} as unknown as ExtensionCommandContext;
 	const openRuntime = vi.fn(async () => runtime);
 	managedJobsExtension(api, { openRuntime });
@@ -106,6 +108,7 @@ function setupExtension(runtime: ManagedJobsRuntime, enabled = true, idle = true
 				ctx,
 			),
 		command: commands.get("job")!,
+		confirm,
 		ctx,
 		notify,
 		openRuntime,
@@ -310,6 +313,78 @@ describe("managed jobs built-in extension", () => {
 		await extension.sessionShutdown("quit");
 
 		expect(runtime.manager.status(started.id).state).toBe("terminated");
+	});
+
+	it("requires confirmation before pruning terminal job history", async () => {
+		const runtime = await createRuntime();
+		const extension = setupExtension(runtime);
+		await extension.sessionStart();
+		await extension.command(
+			`start --name completed ${quoteArgument(process.execPath)} -e ${quoteArgument("process.stdout.write('done')")}`,
+			extension.ctx,
+		);
+		await runtime.manager.waitForExit("completed");
+		await runtime.manager.flush();
+
+		extension.confirm.mockResolvedValueOnce(false);
+		await extension.command("prune completed", extension.ctx);
+		expect(runtime.manager.get("completed")).toBeDefined();
+
+		extension.confirm.mockResolvedValueOnce(true);
+		await extension.command("prune completed", extension.ctx);
+
+		expect(extension.confirm).toHaveBeenLastCalledWith(
+			"Prune managed job history?",
+			expect.stringContaining("stored commands and arguments"),
+		);
+		expect(runtime.manager.get("completed")).toBeUndefined();
+		expect(extension.notify).toHaveBeenLastCalledWith(
+			"Pruned 1 terminal job(s); removed 1 provenance record(s) and 1 unshared artifact object(s)",
+			"info",
+		);
+	});
+
+	it("prunes all terminal jobs while explicitly retaining active jobs", async () => {
+		const runtime = await createRuntime();
+		const extension = setupExtension(runtime);
+		await extension.sessionStart();
+		await extension.command(
+			`start --name active ${quoteArgument(process.execPath)} -e ${quoteArgument("setInterval(() => {}, 1000)")}`,
+			extension.ctx,
+		);
+		await extension.command(
+			`start --name completed ${quoteArgument(process.execPath)} -e ${quoteArgument("process.stdout.write('done')")}`,
+			extension.ctx,
+		);
+		await runtime.manager.waitForExit("completed");
+		await runtime.manager.flush();
+
+		await extension.command("prune --all", extension.ctx);
+
+		expect(extension.confirm).toHaveBeenLastCalledWith(
+			"Prune managed job history?",
+			expect.stringContaining("1 active job(s) will be kept"),
+		);
+		expect(runtime.manager.get("completed")).toBeUndefined();
+		expect(runtime.manager.status("active").state).toBe("running");
+	});
+
+	it("refuses pruning without approval-capable UI", async () => {
+		const runtime = await createRuntime();
+		const extension = setupExtension(runtime, true, true, false);
+		await runtime.manager.start({
+			id: "completed",
+			command: process.execPath,
+			args: ["-e", ""],
+		});
+		await runtime.manager.waitForExit("completed");
+		await runtime.manager.flush();
+
+		await extension.command("prune completed", extension.ctx);
+
+		expect(extension.confirm).not.toHaveBeenCalled();
+		expect(runtime.manager.get("completed")).toBeDefined();
+		expect(extension.notify).toHaveBeenLastCalledWith("Pruning managed job history requires approval UI", "error");
 	});
 
 	it("does not open or run jobs without the explicit CLI flag", async () => {
