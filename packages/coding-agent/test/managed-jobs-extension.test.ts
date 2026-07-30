@@ -554,6 +554,7 @@ describe("managed jobs built-in extension", () => {
 						id: "check",
 						command: "npm",
 						args: ["run", "check", "x".repeat(2_000)],
+						inheritEnv: [],
 						readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 5 },
 					},
 				],
@@ -569,6 +570,7 @@ describe("managed jobs built-in extension", () => {
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("Managed-job recipe preview"), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("npm run check"), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining('readiness=stdout:"ready"/5s'), "info");
+		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("env=minimal"), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.not.stringContaining("x".repeat(1_100)), "info");
 		expect(extension.notify).toHaveBeenLastCalledWith(expect.stringContaining("..."), "info");
 	});

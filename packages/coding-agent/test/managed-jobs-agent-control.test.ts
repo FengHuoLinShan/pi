@@ -37,6 +37,7 @@ async function stopActiveJobs(runtime: ManagedJobsRuntime): Promise<void> {
 afterEach(async () => {
 	await Promise.all(openedRuntimes.splice(0).map(stopActiveJobs));
 	await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+	vi.unstubAllEnvs();
 });
 
 function createContext(cwd: string, options?: { trusted?: boolean; boundary?: boolean }): ExtensionContext {
@@ -57,6 +58,7 @@ function createLoadedConfig(): LoadedManagedJobsConfig {
 					id: "api",
 					command: process.execPath,
 					args: ["-e", "process.stdout.write('ready'); setInterval(() => {}, 1000)"],
+					inheritEnv: ["PI_MANAGED_JOBS_ALLOWED"],
 					readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 1 },
 				},
 			],
@@ -80,8 +82,11 @@ describe("managed job agent control", () => {
 		const expectedArguments = [...loaded.config.recipes[0]!.args];
 		const tool = createManagedJobControlTool({ runtime, loaded, cwd: temporaryDirectories.at(-1)! });
 		const ctx = createContext(temporaryDirectories.at(-1)!);
+		vi.stubEnv("PI_MANAGED_JOBS_ALLOWED", "allowed");
+		vi.stubEnv("PI_MANAGED_JOBS_BLOCKED", "blocked");
 		loaded.config.recipes[0]!.command = "unapproved-after-load";
 		loaded.config.recipes[0]!.args = ["unapproved-after-load"];
+		loaded.config.recipes[0]!.inheritEnv = ["PI_MANAGED_JOBS_BLOCKED"];
 
 		const started = await tool.execute("start-call", { action: "start", recipe: "api" }, undefined, undefined, ctx);
 		const startDetails = started.details as ManagedJobControlStartDetails;
@@ -97,6 +102,11 @@ describe("managed job agent control", () => {
 		});
 		expect(record.command).toBe(process.execPath);
 		expect(record.args).toEqual(expectedArguments);
+		const created = runtime.manager.getEvents(record.id).find((event) => event.type === "process_created");
+		if (!created || created.type !== "process_created") throw new Error("Expected process creation event");
+		expect(created.environmentNames).toContain("PI_MANAGED_JOBS_ALLOWED");
+		expect(created.environmentNames).not.toContain("PI_MANAGED_JOBS_BLOCKED");
+		expect(created.environmentNames.some((name) => name.toLowerCase() === "path")).toBe(true);
 		expect(JSON.stringify(started)).not.toContain(process.execPath);
 		await expect(
 			tool.execute("duplicate-call", { action: "start", recipe: "api" }, undefined, undefined, ctx),

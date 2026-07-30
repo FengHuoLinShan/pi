@@ -137,6 +137,7 @@ export function createManagedJobControlTool(options: ManagedJobControlToolOption
 			{
 				...recipe,
 				args: [...recipe.args],
+				inheritEnv: recipe.inheritEnv ? [...recipe.inheritEnv] : undefined,
 				readiness: recipe.readiness ? { ...recipe.readiness } : undefined,
 			},
 		]),

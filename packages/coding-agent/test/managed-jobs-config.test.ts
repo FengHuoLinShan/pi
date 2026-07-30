@@ -30,6 +30,7 @@ function validConfig(): unknown {
 				id: "dev-server",
 				command: "npm",
 				args: ["run", "dev"],
+				inheritEnv: ["PORT", "DATABASE_URL"],
 				readiness: { contains: "ready", stream: "stdout", timeoutSeconds: 10 },
 			},
 		],
@@ -123,6 +124,27 @@ describe("managed jobs config", () => {
 				recipes: [{ id: "dev", command: "npm", readiness: { contains: "ready", timeoutSeconds: 31 } }],
 			}),
 		).toThrow("timeoutSeconds must be a safe integer between 1 and 30");
+	});
+
+	it("accepts explicit minimal environment inheritance and rejects ambiguous names", () => {
+		expect(
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "check", command: "npm", inheritEnv: [] }],
+			}).recipes[0]?.inheritEnv,
+		).toEqual([]);
+		expect(() =>
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "check", command: "npm", inheritEnv: ["API_KEY", "api_key"] }],
+			}),
+		).toThrow("names must be unique ignoring case");
+		expect(() =>
+			parseManagedJobsConfig({
+				version: 1,
+				recipes: [{ id: "check", command: "npm", inheritEnv: ["BAD-NAME"] }],
+			}),
+		).toThrow("portable environment name");
 	});
 
 	it("loads a bounded regular project config with a stable source revision", async () => {

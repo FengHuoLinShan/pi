@@ -99,7 +99,11 @@ function formatRecipe(recipe: ManagedJobRecipeConfig): string {
 	const readiness = recipe.readiness
 		? ` readiness=${recipe.readiness.stream}:${JSON.stringify(displayText(recipe.readiness.contains))}/${recipe.readiness.timeoutSeconds}s`
 		: "";
-	return `${displayText(recipe.id)}${readiness}\n  ${boundedCommand}`;
+	const environment =
+		recipe.inheritEnv === undefined
+			? " env=full"
+			: ` env=minimal${recipe.inheritEnv.length > 0 ? `+${recipe.inheritEnv.map(displayText).join(",")}` : ""}`;
+	return `${displayText(recipe.id)}${readiness}${environment}\n  ${boundedCommand}`;
 }
 
 function agentRecordSnapshot(record: ProcessSessionRecord) {

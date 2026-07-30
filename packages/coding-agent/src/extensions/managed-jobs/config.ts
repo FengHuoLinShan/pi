@@ -13,6 +13,8 @@ const MAX_COMMAND_LENGTH = 4_096;
 const MAX_ARGUMENTS = 64;
 const MAX_ARGUMENT_BYTES = 8_192;
 const MAX_ARGUMENT_BYTES_PER_RECIPE = 65_536;
+const MAX_INHERITED_ENVIRONMENT_NAMES = 32;
+const MAX_ENVIRONMENT_NAME_LENGTH = 128;
 const MAX_READINESS_TEXT_LENGTH = 512;
 const MAX_READINESS_TIMEOUT_SECONDS = 30;
 
@@ -26,6 +28,7 @@ export interface ManagedJobRecipeConfig {
 	id: string;
 	command: string;
 	args: string[];
+	inheritEnv?: string[];
 	readiness?: ManagedJobReadinessConfig;
 }
 
@@ -98,7 +101,7 @@ function parseReadiness(value: unknown, recipeIndex: number): ManagedJobReadines
 function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 	const label = `recipes[${index}]`;
 	if (!isPlainObject(value)) throw new Error(`${label} must be an object`);
-	rejectUnknownFields(value, ["id", "command", "args", "readiness"], label);
+	rejectUnknownFields(value, ["id", "command", "args", "inheritEnv", "readiness"], label);
 	const id = parsePortableId(value.id, `${label}.id`);
 	const command = parseText(value.command, `${label}.command`, MAX_COMMAND_LENGTH);
 	const rawArguments = value.args ?? [];
@@ -117,10 +120,35 @@ function parseRecipe(value: unknown, index: number): ManagedJobRecipeConfig {
 	if (args.reduce((total, argument) => total + Buffer.byteLength(argument), 0) > MAX_ARGUMENT_BYTES_PER_RECIPE) {
 		throw new Error(`${label}.args exceeds ${MAX_ARGUMENT_BYTES_PER_RECIPE} total bytes`);
 	}
+	let inheritEnv: string[] | undefined;
+	if (value.inheritEnv !== undefined) {
+		if (!Array.isArray(value.inheritEnv) || value.inheritEnv.length > MAX_INHERITED_ENVIRONMENT_NAMES) {
+			throw new Error(
+				`${label}.inheritEnv must be an array with at most ${MAX_INHERITED_ENVIRONMENT_NAMES} entries`,
+			);
+		}
+		assertDenseArray(value.inheritEnv, `${label}.inheritEnv`);
+		inheritEnv = value.inheritEnv.map((name, environmentIndex) => {
+			if (
+				typeof name !== "string" ||
+				name.length > MAX_ENVIRONMENT_NAME_LENGTH ||
+				!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)
+			) {
+				throw new Error(
+					`${label}.inheritEnv[${environmentIndex}] must be a portable environment name with 1-${MAX_ENVIRONMENT_NAME_LENGTH} characters`,
+				);
+			}
+			return name;
+		});
+		if (new Set(inheritEnv.map((name) => name.toUpperCase())).size !== inheritEnv.length) {
+			throw new Error(`${label}.inheritEnv names must be unique ignoring case`);
+		}
+	}
 	return {
 		id,
 		command,
 		args,
+		...(inheritEnv === undefined ? {} : { inheritEnv }),
 		...(value.readiness === undefined ? {} : { readiness: parseReadiness(value.readiness, index) }),
 	};
 }

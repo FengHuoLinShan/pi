@@ -3,6 +3,40 @@ import { getShellEnv } from "../../utils/shell.ts";
 import type { ManagedJobRecipeConfig } from "./config.ts";
 import { type ManagedJobsRuntime, type WaitForManagedJobOutputResult, waitForManagedJobOutput } from "./runtime.ts";
 
+const MINIMAL_RECIPE_ENVIRONMENT_NAMES = [
+	"PATH",
+	"HOME",
+	"USER",
+	"LOGNAME",
+	"SHELL",
+	"PWD",
+	"TMPDIR",
+	"TMP",
+	"TEMP",
+	"LANG",
+	"LC_ALL",
+	"LC_CTYPE",
+	"TZ",
+	"TERM",
+	"COLORTERM",
+	"NO_COLOR",
+	"FORCE_COLOR",
+	"CI",
+	"SystemRoot",
+	"WINDIR",
+	"ComSpec",
+	"PATHEXT",
+	"USERPROFILE",
+	"USERNAME",
+	"HOMEDRIVE",
+	"HOMEPATH",
+	"APPDATA",
+	"LOCALAPPDATA",
+	"XDG_CACHE_HOME",
+	"XDG_CONFIG_HOME",
+	"XDG_DATA_HOME",
+] as const;
+
 export type ManagedJobRecipeRunStage = "start" | "readiness check";
 export type ManagedJobRecipeReadinessStatus = "not_configured" | WaitForManagedJobOutputResult["status"];
 
@@ -31,6 +65,18 @@ export interface ManagedJobRecipeRunResult {
 	readinessStatus: ManagedJobRecipeReadinessStatus;
 }
 
+function createRecipeEnvironment(recipe: ManagedJobRecipeConfig, cwd: string): NodeJS.ProcessEnv {
+	const shellEnvironment = getShellEnv();
+	if (recipe.inheritEnv === undefined) return shellEnvironment;
+	const normalizeName = (name: string): string => (process.platform === "win32" ? name.toLowerCase() : name);
+	const inheritedNames = new Set([...MINIMAL_RECIPE_ENVIRONMENT_NAMES, ...recipe.inheritEnv].map(normalizeName));
+	const environment = Object.fromEntries(
+		Object.entries(shellEnvironment).filter(([name]) => inheritedNames.has(normalizeName(name))),
+	);
+	if (process.platform !== "win32") environment.PWD = cwd;
+	return environment;
+}
+
 export async function runManagedJobRecipe(options: RunManagedJobRecipeOptions): Promise<ManagedJobRecipeRunResult> {
 	let started: ProcessSessionRecord;
 	try {
@@ -39,7 +85,7 @@ export async function runManagedJobRecipe(options: RunManagedJobRecipeOptions): 
 			command: options.recipe.command,
 			args: options.recipe.args,
 			cwd: options.cwd,
-			env: getShellEnv(),
+			env: createRecipeEnvironment(options.recipe, options.cwd),
 		});
 	} catch (error) {
 		throw new ManagedJobRecipeRunError("start", options.id, error);

@@ -40,6 +40,7 @@
 
 ### Changed
 
+- Changed fixed managed-job recipes with an explicit `inheritEnv` list to use a minimal development environment plus only the named variables, while omitted lists preserve full inheritance.
 - Changed SDK-created coding sessions with a selected model to run through the durable AgentHarness runtime while preserving the public `Agent` facade and extension lifecycle, with direct run-budget, loop-detection, and tool-policy configuration.
 - Forwarded optional core tool-attempt outcomes through extension `tool_execution_end` events.
 - Changed compaction to use complete calibrated request estimates, reserve estimation and summary headroom, guard every final provider-ready request, validate up to two compact candidates, and fall back to non-persistent safe trimming for automatic overflow recovery.
