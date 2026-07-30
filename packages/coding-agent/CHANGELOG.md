@@ -22,6 +22,7 @@
 - Added an opt-in process-session completion verifier that keeps command output in ArtifactStore and exposes only structured status and opaque evidence references.
 - Added an opt-in workspace-change discipline verifier with synchronous or asynchronous PatchSet capture, path, operation, minimum/maximum file-count, and byte-count gates, and privacy-preserving completion evidence.
 - Added request-only safe context trimming for reproducible tool results and unsigned plaintext thinking, with content-free `context_trim` TUI, JSON, and RPC observability.
+- Added conservative startup recovery reports with low-sensitivity `/recovery` review, durable acknowledgement, and no automatic provider or tool replay.
 
 ### Changed
 

@@ -31,8 +31,17 @@ For the JSONL file format and SessionManager API, see [Session Format](session-f
 | `/fork` | Create a new session from a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
 | `/compact [prompt]` | Summarize older context; see [Compaction](compaction.md) |
+| `/recovery [status\|acknowledge]` | Review or acknowledge interrupted durable work recovered at startup |
 | `/export [file]` | Export session to HTML |
 | `/share` | Upload as private GitHub gist with shareable HTML link |
+
+## Interrupted Work Recovery
+
+When a durable AgentHarness session restarts with incomplete work, pi conservatively marks active operations, turns, provider requests, and tool calls as interrupted. Queued input and pending journal writes are preserved where possible. Interrupted provider requests and tool calls are never replayed automatically.
+
+Pi shows a recovery warning and footer status when review is required. Run `/recovery` to inspect a bounded, low-sensitivity summary containing operation IDs, provider/model names, tool names, queue counts, and retry-policy eligibility. The report excludes messages, tool arguments and results, provider payloads, pending-write payloads, and credentials.
+
+After checking external side effects, run `/recovery acknowledge`. Acknowledgement clears the warning but preserves both the recovery report and acknowledgement as custom session entries that do not enter the LLM context. Retry eligibility is advisory; acknowledgement does not retry anything.
 
 ## Resuming and Deleting Sessions
 

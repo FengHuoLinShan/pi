@@ -189,7 +189,14 @@ export {
 } from "./core/extensions/index.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
-export * from "./core/harness-recovery-report.ts";
+export {
+	CODING_AGENT_RECOVERY_REPORT_VERSION,
+	type CodingAgentRecoveryOperation,
+	type CodingAgentRecoveryProviderRequest,
+	type CodingAgentRecoveryReport,
+	type CodingAgentRecoveryToolCall,
+	getCodingAgentRecoveryReport,
+} from "./core/harness-recovery-report.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
