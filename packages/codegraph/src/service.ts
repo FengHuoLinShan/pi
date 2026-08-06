@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
+import { dirname, extname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import {
 	buildCodeImpactMap,
 	type CodeGraphEdge,
@@ -77,7 +77,7 @@ export interface TypeScriptCodeGraphStatus {
 export interface TypeScriptCodeGraphAdapterStatus {
 	id: string;
 	language: string;
-	precision: "semantic" | "structural";
+	precision: "semantic" | "hybrid" | "structural";
 	fileCount: number;
 }
 
@@ -380,6 +380,24 @@ function expandAffectedFiles(
 	return affected;
 }
 
+function expandGoPackageFiles(
+	knownFiles: Iterable<string>,
+	directlyChanged: ReadonlySet<string>,
+	affected: Set<string>,
+): void {
+	const changedDirectories = new Set(
+		[...directlyChanged]
+			.filter((path) => extname(path).toLowerCase() === ".go")
+			.map((path) => (dirname(path) === "." ? "" : dirname(path))),
+	);
+	if (changedDirectories.size === 0) return;
+	for (const path of knownFiles) {
+		if (extname(path).toLowerCase() !== ".go") continue;
+		const directory = dirname(path) === "." ? "" : dirname(path);
+		if (changedDirectories.has(directory)) affected.add(path);
+	}
+}
+
 export class TypeScriptCodeGraph {
 	readonly workspaceRoot: string;
 	readonly cacheDir: string;
@@ -515,6 +533,11 @@ export class TypeScriptCodeGraph {
 		return buildCodeImpactMap(this.graph.snapshot(), paths, options);
 	}
 
+	snapshot(): CodeGraphSnapshot {
+		this.assertQueryable();
+		return this.graph.snapshot();
+	}
+
 	nodeIdsForFile(path: string): string[] {
 		this.assertQueryable();
 		const absolutePath = isAbsolute(path) ? resolve(path) : resolve(this.workspaceRoot, path);
@@ -613,6 +636,9 @@ export class TypeScriptCodeGraph {
 			const affected = reindexAll
 				? new Set([...cachedRevisions.keys(), ...revisions.keys()])
 				: expandAffectedFiles(previousSnapshot, directlyChanged, addedFiles);
+			if (!reindexAll) {
+				expandGoPackageFiles(new Set([...cachedRevisions.keys(), ...revisions.keys()]), directlyChanged, affected);
+			}
 			const needsCommit = reindexAll || affected.size > 0;
 			let updated = false;
 			let diagnostics = [...configuration.diagnostics];

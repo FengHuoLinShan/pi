@@ -1,8 +1,11 @@
 import {
 	type CodeGraphQueryOptions,
 	type ExtensionAPI,
+	evaluateArchitectureFitness,
+	loadArchitectureFitnessPlan,
 	loadImpactVerificationCatalog,
 	planImpactVerification,
+	registerImpactGraphProvider,
 	verifyImpactPlan,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -21,6 +24,7 @@ const ACTIONS = Type.Union([
 	Type.Literal("dependencies"),
 	Type.Literal("dependents"),
 	Type.Literal("impact"),
+	Type.Literal("fitness"),
 	Type.Literal("plan_verification"),
 	Type.Literal("verify"),
 ]);
@@ -139,16 +143,25 @@ function textResult(value: unknown): {
 export default function codeGraphExtension(pi: ExtensionAPI): void {
 	let service: TypeScriptCodeGraph | undefined;
 	let workspaceRoot: string | undefined;
+	let unregisterImpactProvider: (() => void) | undefined;
 
 	const getService = async (cwd: string): Promise<TypeScriptCodeGraph> => {
 		if (service && workspaceRoot === cwd) return service;
 		const previousService = service;
 		service = undefined;
 		workspaceRoot = undefined;
+		unregisterImpactProvider?.();
+		unregisterImpactProvider = undefined;
 		await previousService?.dispose();
 		const nextService = await openTypeScriptCodeGraph({ workspaceRoot: cwd });
 		service = nextService;
 		workspaceRoot = cwd;
+		unregisterImpactProvider = registerImpactGraphProvider(cwd, {
+			sync: async (options) => {
+				await nextService.sync(options);
+			},
+			impactMap: (paths, options) => nextService.impactMap(paths, options),
+		});
 		return nextService;
 	};
 
@@ -156,12 +169,13 @@ export default function codeGraphExtension(pi: ExtensionAPI): void {
 		name: "code_graph",
 		label: "Code Graph",
 		description:
-			"Index and query TypeScript, JavaScript, Python, Go, and Rust symbols and relationships. Also plans and executes repository-aware checks from .pi/checks.json for supplied PatchSet paths.",
-		promptSnippet: "Search symbols, trace impact paths, or verify a PatchSet with repository-aware checks",
+			"Index and query TypeScript, JavaScript, Python, Go, and Rust symbols and relationships. Also evaluates .pi/architecture.json fitness rules and plans or executes repository-aware checks from .pi/checks.json.",
+		promptSnippet: "Search symbols, trace impact paths, evaluate architecture fitness, or verify a PatchSet",
 		promptGuidelines: [
 			"Use code_graph search before broad repository scans when locating symbols in supported languages.",
-			"Treat Python, Go, and Rust results as structural declarations and imports; confirm semantic call relationships from source.",
+			"Treat Python, Go, and Rust hybrid relationships as conservative static evidence; confirm dynamic dispatch, interfaces, macros, and ambiguous calls from source.",
 			"Use code_graph impact before modifying shared symbols, then confirm evidence by reading the returned file locations.",
+			"Use code_graph fitness to enforce versioned dependency boundaries, acyclicity, and fan-in budgets from .pi/architecture.json.",
 			"Use code_graph plan_verification or verify with the complete changed-path list when .pi/checks.json defines repository checks.",
 		],
 		parameters: CODE_GRAPH_PARAMETERS,
@@ -180,6 +194,12 @@ export default function codeGraphExtension(pi: ExtensionAPI): void {
 			const status = graph.status();
 			if (status.dirty || (status.state !== "ready" && status.state !== "degraded")) {
 				await graph.sync({ signal });
+			}
+			if (params.action === "fitness") {
+				if (!ctx.isProjectTrusted()) throw new Error("Architecture fitness requires a trusted project");
+				const plan = await loadArchitectureFitnessPlan(ctx.workspace.sourceRoot);
+				if (!plan) throw new Error("Architecture fitness requires .pi/architecture.json");
+				return textResult(evaluateArchitectureFitness(plan, graph.snapshot()));
 			}
 			if (params.action === "search") {
 				if (!params.query) throw new Error("query is required for search");
@@ -252,6 +272,8 @@ export default function codeGraphExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		unregisterImpactProvider?.();
+		unregisterImpactProvider = undefined;
 		await service?.dispose();
 		service = undefined;
 		workspaceRoot = undefined;

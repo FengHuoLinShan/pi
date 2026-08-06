@@ -337,6 +337,56 @@ describe("TypeScriptCodeGraph", () => {
 		}
 	});
 
+	it("evaluates trusted architecture fitness rules against the synchronized graph", async () => {
+		const fixture = await createFixture();
+		await mkdir(join(fixture.workspaceRoot, ".pi"));
+		await writeFile(
+			join(fixture.workspaceRoot, ".pi", "architecture.json"),
+			JSON.stringify({
+				version: 1,
+				rules: [
+					{
+						id: "consumer-must-not-use-base",
+						kind: "forbidden-dependency",
+						from: ["consumer.ts"],
+						to: ["base.ts"],
+						edgeKinds: ["imports"],
+					},
+				],
+			}),
+		);
+		let tool: ToolDefinition | undefined;
+		codeGraphExtension({
+			registerTool(definition: ToolDefinition) {
+				tool = definition;
+			},
+			on() {},
+		} as unknown as ExtensionAPI);
+		if (!tool) throw new Error("Code graph extension did not register its tool");
+		const context = {
+			isProjectTrusted: () => true,
+			workspace: {
+				sourceRoot: fixture.workspaceRoot,
+				logicalRoot: fixture.workspaceRoot,
+				execution: { target: "host" },
+			},
+		} as ExtensionContext;
+
+		const result = await tool.execute("fitness", { action: "fitness" } as never, undefined, undefined, context);
+		expect(result.details).toMatchObject({
+			status: "fail",
+			violationCount: 1,
+			rules: [
+				{
+					ruleId: "consumer-must-not-use-base",
+					status: "fail",
+					violationCount: 1,
+					violations: [{ paths: ["consumer.ts", "base.ts"] }],
+				},
+			],
+		});
+	});
+
 	it("updates only changed and transitively affected files", async () => {
 		const fixture = await createFixture();
 		await writeFile(join(fixture.workspaceRoot, "unrelated.ts"), "export const unrelated = 1;\n");
@@ -363,6 +413,27 @@ describe("TypeScriptCodeGraph", () => {
 		);
 		expect(after.files.find((file) => file.path === "consumer.ts")?.revision).toBe(
 			before.files.find((file) => file.path === "consumer.ts")?.revision,
+		);
+		await graph.dispose();
+	});
+
+	it("re-extracts Go package peers when a declaration becomes newly resolvable", async () => {
+		const fixture = await createFixture();
+		await writeFile(join(fixture.workspaceRoot, "caller.go"), "package worker\n\nfunc CallAdded() { Added() }\n");
+		const targetPath = join(fixture.workspaceRoot, "target.go");
+		await writeFile(targetPath, "package worker\n");
+		const graph = await openTypeScriptCodeGraph(fixture);
+		await graph.sync();
+		const callerId = graph.search("CallAdded")[0].node.id;
+		expect(graph.dependencies(callerId, { maxDepth: 1 }).paths).toEqual([]);
+
+		await writeFile(targetPath, "package worker\n\nfunc Added() {}\n");
+		graph.markDirty(["target.go"]);
+		await graph.sync();
+		const addedId = graph.search("Added")[0].node.id;
+
+		expect(graph.dependencies(callerId, { maxDepth: 1 }).paths.some((path) => path.nodes[1]?.id === addedId)).toBe(
+			true,
 		);
 		await graph.dispose();
 	});
@@ -434,9 +505,9 @@ describe("TypeScriptCodeGraph", () => {
 		expect(sync.status.fileCount).toBe(8);
 		expect(sync.status.adapters).toEqual([
 			expect.objectContaining({ id: "typescript-compiler", precision: "semantic", fileCount: 2 }),
-			expect.objectContaining({ id: "python-structural", fileCount: 2 }),
-			expect.objectContaining({ id: "go-structural", fileCount: 2 }),
-			expect.objectContaining({ id: "rust-structural", fileCount: 2 }),
+			expect.objectContaining({ id: "python-hybrid", precision: "hybrid", fileCount: 2 }),
+			expect.objectContaining({ id: "go-hybrid", precision: "hybrid", fileCount: 2 }),
+			expect.objectContaining({ id: "rust-hybrid", precision: "hybrid", fileCount: 2 }),
 		]);
 		expect(graph.search("PyBase")[0]?.node.filePath).toBe("py/base.py");
 		expect(graph.search("Value")[0]?.node.filePath).toBe("internal/lib/value.go");
