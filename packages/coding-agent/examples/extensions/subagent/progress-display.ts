@@ -1,14 +1,21 @@
 export type SubagentProgressMode = "single" | "parallel" | "chain";
-export type SubagentProgressStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type SubagentProgressStatus =
+	| "queued"
+	| "running"
+	| "completed"
+	| "failed"
+	| "cancelled"
+	| "timed_out"
+	| "skipped";
 
 export interface SubagentProgressUsage {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-	contextTokens: number;
-	turns: number;
+	readonly input: number;
+	readonly output: number;
+	readonly cacheRead: number;
+	readonly cacheWrite: number;
+	readonly cost: number;
+	readonly contextTokens: number;
+	readonly turns: number;
 }
 
 export interface SubagentProgressTask {
@@ -17,6 +24,13 @@ export interface SubagentProgressTask {
 	taskSummary: string;
 	status: SubagentProgressStatus;
 	lastActivity?: string;
+	cwd?: string;
+	timeoutMs?: number;
+	activityOutput?: string;
+	lastActivityAt?: number;
+	phase?: string;
+	inactivityMs?: number;
+	inactivityWarning?: string;
 	usage: SubagentProgressUsage;
 	provider?: string;
 	model?: string;
@@ -24,14 +38,17 @@ export interface SubagentProgressTask {
 }
 
 export interface SubagentProgressEvent {
-	toolCallId: string;
-	mode: SubagentProgressMode;
-	results: SubagentProgressTask[];
+	readonly toolCallId: string;
+	readonly mode: SubagentProgressMode;
+	readonly revision: number;
+	readonly expectedTasks: number;
+	readonly results: readonly SubagentProgressTask[];
 }
 
 interface ActiveCall {
 	mode: SubagentProgressMode;
 	expectedTasks: number;
+	revision: number;
 	tasks: Map<string, SubagentProgressTask>;
 }
 
@@ -87,6 +104,10 @@ function taskIcon(status: SubagentProgressStatus): string {
 			return "✗";
 		case "cancelled":
 			return "◼";
+		case "timed_out":
+			return "⌛";
+		case "skipped":
+			return "－";
 	}
 }
 
@@ -105,15 +126,23 @@ export class SubagentProgressDisplay {
 		this.calls.set(toolCallId, {
 			mode,
 			expectedTasks,
+			revision: 0,
 			tasks: new Map(),
 		});
 	}
 
 	update(event: SubagentProgressEvent): void {
 		const call = this.calls.get(event.toolCallId);
-		if (!call) return;
+		if (
+			!call ||
+			event.revision <= call.revision ||
+			event.expectedTasks !== call.expectedTasks ||
+			event.results.length !== event.expectedTasks
+		)
+			return;
 		call.mode = event.mode;
-		for (const task of event.results) call.tasks.set(task.taskId, { ...task, usage: { ...task.usage } });
+		call.revision = event.revision;
+		call.tasks = new Map(event.results.map((task) => [task.taskId, { ...task, usage: { ...task.usage } }]));
 	}
 
 	finish(toolCallId: string): void {

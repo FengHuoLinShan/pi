@@ -37,8 +37,10 @@ function event(
 	toolCallId: string,
 	mode: SubagentProgressEvent["mode"],
 	results: SubagentProgressEvent["results"],
+	revision = 1,
+	expectedTasks = results.length,
 ): SubagentProgressEvent {
-	return { toolCallId, mode, results };
+	return { toolCallId, mode, results, revision, expectedTasks };
 }
 
 describe("subagent progress display", () => {
@@ -66,7 +68,17 @@ describe("subagent progress display", () => {
 			]),
 		);
 
-		display.update(event("call-a", "parallel", [task("call-a:0", "scout", "completed", "Inspect model registry")]));
+		display.update(
+			event(
+				"call-a",
+				"parallel",
+				[
+					task("call-a:0", "scout", "completed", "Inspect model registry"),
+					task("call-a:1", "planner", "queued", "Plan the change"),
+				],
+				2,
+			),
+		);
 		expect(display.getLines()).toEqual(
 			expect.arrayContaining([
 				expect.stringContaining("scout · completed"),
@@ -80,6 +92,63 @@ describe("subagent progress display", () => {
 		display.finish("call-a");
 		expect(display.getStatusText()).toBeUndefined();
 		expect(display.getLines()).toBeUndefined();
+	});
+
+	it("uses revisioned full snapshots without shrinking interleaved task cardinality", () => {
+		const display = new SubagentProgressDisplay();
+		display.begin("call-a", "parallel", 3);
+		const first = [
+			task("call-a:0", "one", "running", "One"),
+			task("call-a:1", "two", "queued", "Two"),
+			task("call-a:2", "three", "queued", "Three"),
+		];
+		display.update(event("call-a", "parallel", first, 1, 3));
+		display.update(event("call-a", "parallel", [first[0], { ...first[1], status: "running" }, first[2]], 2, 3));
+		display.update(
+			event(
+				"call-a",
+				"parallel",
+				[
+					{ ...first[0], status: "completed" },
+					{ ...first[1], status: "running" },
+					{ ...first[2], status: "completed" },
+				],
+				3,
+				3,
+			),
+		);
+		// A delayed child update cannot roll state back or publish a child-only subset.
+		display.update(event("call-a", "parallel", [first[0]], 4, 3));
+		const lines = display.getLines()!;
+		expect(lines).toHaveLength(5);
+		expect(lines[0]).toContain("1 running · 2 done");
+		expect(lines[1]).toContain("2/3 done · 1 active");
+
+		display.update(
+			event(
+				"call-a",
+				"parallel",
+				[
+					{ ...first[0], status: "completed" },
+					{ ...first[1], status: "timed_out" },
+					{ ...first[2], status: "completed" },
+				],
+				5,
+				3,
+			),
+		);
+		expect(display.getLines()?.join("\n")).not.toContain("active");
+		expect(display.getStatusText()).toBe("subagents 1 call");
+	});
+
+	it("keeps concurrent tool call snapshots separate", () => {
+		const display = new SubagentProgressDisplay();
+		display.begin("call-a", "single", 1);
+		display.begin("call-b", "single", 1);
+		display.update(event("call-a", "single", [task("call-a:0", "one", "completed", "One")], 2, 1));
+		display.update(event("call-b", "single", [task("call-b:0", "two", "running", "Two")], 1, 1));
+		expect(display.getLines()?.join("\n")).toContain("one · completed");
+		expect(display.getLines()?.join("\n")).toContain("two · running");
 	});
 
 	it("sanitizes terminal controls and bounds a busy progress panel", () => {

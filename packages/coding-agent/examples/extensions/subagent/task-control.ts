@@ -1,4 +1,4 @@
-export type AbortSource = "parent" | "task";
+export type AbortSource = "parent" | "task" | "timeout";
 
 interface KillableProcess {
 	kill(signal: NodeJS.Signals): boolean;
@@ -9,29 +9,44 @@ export interface ProcessAbortBinding {
 	close(): void;
 }
 
+export function classifyProcessCompletion(
+	exitCode: number,
+	source: AbortSource | undefined,
+): "completed" | "failed" | "cancelled" | "timed_out" {
+	if (source === "timeout") return "timed_out";
+	if (source) return "cancelled";
+	return exitCode === 0 ? "completed" : "failed";
+}
+
 export function bindProcessAbort(
 	process: KillableProcess,
 	parentSignal: AbortSignal | undefined,
 	taskSignal: AbortSignal | undefined,
 	escalationMs = 5000,
+	timeoutMs?: number,
 ): ProcessAbortBinding {
 	let source: AbortSource | undefined;
 	let closed = false;
 	let escalationTimer: ReturnType<typeof setTimeout> | undefined;
+	let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 	const abortParent = () => abort("parent");
 	const abortTask = () => abort("task");
 
-	const cleanup = () => {
+	const cleanupListenersAndDeadline = () => {
 		parentSignal?.removeEventListener("abort", abortParent);
 		taskSignal?.removeEventListener("abort", abortTask);
-		if (escalationTimer) clearTimeout(escalationTimer);
+		if (timeoutTimer) {
+			clearTimeout(timeoutTimer);
+			timeoutTimer = undefined;
+		}
 	};
 	const abort = (nextSource: AbortSource) => {
-		if (source || closed) return;
+		if (source || closed || !process.kill("SIGTERM")) return;
 		source = nextSource;
-		process.kill("SIGTERM");
+		cleanupListenersAndDeadline();
 		escalationTimer = setTimeout(() => {
-			if (!closed) process.kill("SIGKILL");
+			process.kill("SIGKILL");
+			escalationTimer = undefined;
 		}, escalationMs);
 	};
 
@@ -39,12 +54,17 @@ export function bindProcessAbort(
 	else parentSignal?.addEventListener("abort", abortParent, { once: true });
 	if (taskSignal?.aborted) abortTask();
 	else taskSignal?.addEventListener("abort", abortTask, { once: true });
+	if (!source && timeoutMs !== undefined) timeoutTimer = setTimeout(() => abort("timeout"), timeoutMs);
 
 	return {
 		getSource: () => source,
 		close: () => {
 			closed = true;
-			cleanup();
+			cleanupListenersAndDeadline();
+			if (!source && escalationTimer) {
+				clearTimeout(escalationTimer);
+				escalationTimer = undefined;
+			}
 		},
 	};
 }

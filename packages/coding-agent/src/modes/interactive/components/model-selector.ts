@@ -29,6 +29,30 @@ interface ScopedModelItem {
 
 type ModelScope = "all" | "scoped";
 
+export interface ModelSelectionResolution {
+	model?: Model<any>;
+	ambiguousProviders?: string[];
+}
+
+export function resolveModelSelection(
+	models: readonly Model<any>[],
+	query: string,
+	currentProvider: string | undefined,
+	selectedModel: Model<any> | undefined,
+	explicitlyNavigated: boolean,
+): ModelSelectionResolution {
+	if (explicitlyNavigated) return { model: selectedModel };
+	const normalizedQuery = query.trim();
+	if (!normalizedQuery) return { model: selectedModel };
+	const qualifiedMatch = models.find((model) => `${model.provider}/${model.id}` === normalizedQuery);
+	if (qualifiedMatch) return { model: qualifiedMatch };
+	const idMatches = models.filter((model) => model.id === normalizedQuery);
+	if (idMatches.length <= 1) return { model: idMatches[0] ?? selectedModel };
+	const currentProviderMatch = idMatches.find((model) => model.provider === currentProvider);
+	if (currentProviderMatch) return { model: currentProviderMatch };
+	return { ambiguousProviders: idMatches.map((model) => model.provider).sort() };
+}
+
 /**
  * Component that renders a model selector with search
  */
@@ -55,6 +79,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private onSelectCallback: (model: Model<any>) => void;
 	private onCancelCallback: () => void;
 	private errorMessage?: string;
+	private selectionErrorMessage?: string;
+	private selectionWasNavigated = false;
 	private refreshStatusMessage = "Refreshing model catalogs…";
 	private refreshStatusSuccess = false;
 	private tui: TUI;
@@ -108,10 +134,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.searchInput.setValue(initialSearchInput);
 		}
 		this.searchInput.onSubmit = () => {
-			// Enter on search input selects the first filtered item
-			if (this.filteredModels[this.selectedIndex]) {
-				this.handleSelect(this.filteredModels[this.selectedIndex].model);
-			}
+			this.confirmSelection();
 		};
 		this.addChild(this.searchInput);
 
@@ -231,6 +254,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private filterModels(query: string): void {
+		this.selectionErrorMessage = undefined;
+		this.selectionWasNavigated = false;
 		this.filteredModels = query
 			? fuzzyFilter(this.activeModels, query, ({ id, provider, model }) =>
 					getModelSelectorSearchText({ id, provider, name: model.name }),
@@ -282,9 +307,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		}
 
 		// Show error message or "no results" if empty
-		if (this.errorMessage) {
+		const visibleError = this.selectionErrorMessage ?? this.errorMessage;
+		if (visibleError) {
 			// Show error in red
-			const errorLines = this.errorMessage.split("\n");
+			const errorLines = visibleError.split("\n");
 			for (const line of errorLines) {
 				this.listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
 			}
@@ -319,20 +345,21 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		if (kb.matches(keyData, "tui.select.up")) {
 			if (this.filteredModels.length === 0) return;
 			this.selectedIndex = this.selectedIndex === 0 ? this.filteredModels.length - 1 : this.selectedIndex - 1;
+			this.selectionWasNavigated = true;
+			this.selectionErrorMessage = undefined;
 			this.updateList();
 		}
 		// Down arrow - wrap to top when at bottom
 		else if (kb.matches(keyData, "tui.select.down")) {
 			if (this.filteredModels.length === 0) return;
 			this.selectedIndex = this.selectedIndex === this.filteredModels.length - 1 ? 0 : this.selectedIndex + 1;
+			this.selectionWasNavigated = true;
+			this.selectionErrorMessage = undefined;
 			this.updateList();
 		}
 		// Enter
 		else if (kb.matches(keyData, "tui.select.confirm")) {
-			const selectedModel = this.filteredModels[this.selectedIndex];
-			if (selectedModel) {
-				this.handleSelect(selectedModel.model);
-			}
+			this.confirmSelection();
 		}
 		// Escape or Ctrl+C
 		else if (kb.matches(keyData, "tui.select.cancel")) {
@@ -344,6 +371,24 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.searchInput.handleInput(keyData);
 			this.filterModels(this.searchInput.getValue());
 		}
+	}
+
+	private confirmSelection(): void {
+		const selectedModel = this.filteredModels[this.selectedIndex]?.model;
+		const resolution = resolveModelSelection(
+			this.activeModels.map((item) => item.model),
+			this.searchInput.getValue(),
+			this.currentModel?.provider,
+			selectedModel,
+			this.selectionWasNavigated,
+		);
+		if (resolution.ambiguousProviders) {
+			this.selectionErrorMessage = `Model ID is available from multiple providers (${resolution.ambiguousProviders.join(", ")}). Type provider/model or use arrow keys to choose.`;
+			this.updateList();
+			this.tui.requestRender();
+			return;
+		}
+		if (resolution.model) this.handleSelect(resolution.model);
 	}
 
 	private handleSelect(model: Model<any>): void {

@@ -24,6 +24,7 @@ import {
 	type ExtensionContext,
 	getAgentDir,
 	getMarkdownTheme,
+	type LocalProcessRuntime,
 	localProcessRuntime,
 	type ThemeColor,
 	withFileMutationQueue,
@@ -35,25 +36,226 @@ import { SubagentProgressDisplay, type SubagentProgressEvent, type SubagentProgr
 import {
 	type AgentRuntimeConfig,
 	buildRuntimeArgs,
+	createChildRuntimePreflight,
+	formatRuntimeDiagnostic,
 	getRuntimeOverridesPath,
 	loadRuntimeOverrides,
+	MODEL_POLICY_VALUES,
+	type ParentModelSnapshot,
+	type RuntimeDiagnosticCode,
+	type RuntimeModelRegistry,
+	type RuntimeThinkingAdjustment,
+	type RuntimeValidationResult,
+	resolveAgentRuntime,
 	resolveAndValidateAgentRuntime,
 	THINKING_LEVELS,
 	updateRuntimeOverride,
 } from "./runtime-config.ts";
-import { bindProcessAbort, TaskControllerRegistry } from "./task-control.ts";
+import { bindProcessAbort, classifyProcessCompletion, TaskControllerRegistry } from "./task-control.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const PARENT_VISIBLE_ERROR_CAP = 8 * 1024;
+const CHILD_STDERR_CAP = 64 * 1024;
+const MAX_TASK_TIMEOUT_MS = 2_147_483_647;
+export const DEFAULT_TASK_TIMEOUT_MS = 180_000;
+
+type AgentRoleDescriptor = Pick<
+	AgentConfig,
+	"name" | "provider" | "model" | "thinking" | "modelPolicy" | "runtimeErrors"
+>;
+
+interface AgentRoleGuidanceOptions {
+	overrides?: Readonly<Record<string, AgentRuntimeConfig>>;
+	parentModel?: ParentModelSnapshot;
+	parentRegistry?: RuntimeModelRegistry;
+	childRegistry?: RuntimeModelRegistry;
+	preflightErrorCode?: RuntimeDiagnosticCode;
+}
+
+export function formatAvailableAgentRoles(
+	agents: readonly AgentRoleDescriptor[],
+	options: AgentRoleGuidanceOptions = {},
+): string {
+	if (agents.length === 0) return "(none discovered)";
+	return agents
+		.map((agent) => {
+			const configured = resolveAgentRuntime(agent, options.overrides?.[agent.name], {});
+			const validation =
+				options.parentRegistry && options.childRegistry
+					? resolveAndValidateAgentRuntime(
+							agent,
+							options.overrides?.[agent.name],
+							{},
+							agent.runtimeErrors,
+							options.parentRegistry,
+							{
+								parentModel: options.parentModel,
+								childRegistry: options.childRegistry,
+							},
+						)
+					: undefined;
+			const runtime = validation?.runtime ?? configured;
+			const diagnostic = validation?.diagnostic;
+			const providerModel = diagnostic
+				? `${diagnostic.provider}/${diagnostic.model}`
+				: runtime.modelPolicy === "child-default"
+					? "child default (resolved at invocation)"
+					: runtime.provider && runtime.model
+						? `${runtime.provider}/${runtime.model}`
+						: runtime.provider || runtime.model
+							? `resolved at invocation (${runtime.provider ? `provider=${runtime.provider}` : `model=${runtime.model}`})`
+							: "inherit parent (resolved at invocation)";
+			const thinking = diagnostic?.thinking ?? runtime.thinking;
+			const resolvedModel =
+				!diagnostic && runtime.provider && runtime.model
+					? options.childRegistry?.find(runtime.provider, runtime.model)
+					: undefined;
+			const supportedThinking =
+				diagnostic?.supportedThinking ?? (resolvedModel ? getSupportedThinkingLevels(resolvedModel) : undefined);
+			const status = validation?.errorCode ?? options.preflightErrorCode;
+			const adjustment = validation?.adjustment?.message;
+			return `${JSON.stringify(agent.name)} [provider/model=${providerModel}; effort=${thinking ?? "model default (resolved at invocation)"}; supported levels=${supportedThinking?.join(", ") || "resolved at invocation"}${adjustment ? `; adjustment=${adjustment}` : ""}${status ? `; preflight=${status}` : ""}]`;
+		})
+		.join("; ");
+}
+
+export function captureParentModelSnapshot(
+	model: { readonly provider: string; readonly id: string } | undefined,
+): ParentModelSnapshot | undefined {
+	return model ? Object.freeze({ provider: model.provider, id: model.id }) : undefined;
+}
+
+export function normalizeTaskTimeout(timeoutMs: number | undefined): number {
+	const value = timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
+	if (!Number.isFinite(value) || value <= 0 || value > MAX_TASK_TIMEOUT_MS) {
+		throw new Error(`timeoutMs must be a positive finite number no greater than ${MAX_TASK_TIMEOUT_MS}`);
+	}
+	return Math.ceil(value);
+}
+
+export interface SubagentInitialContextOptions {
+	personaPrompt: string;
+	role: string;
+	roleSource: AgentConfig["source"];
+	cwd: string;
+	parentModel: ParentModelSnapshot | undefined;
+	childRuntime: AgentRuntimeConfig;
+	taskId: string;
+	task: string;
+	timeoutMs: number;
+}
+
+export function buildSubagentInitialContext(options: SubagentInitialContextOptions): {
+	systemPrompt: string;
+	userPrompt: string;
+} {
+	const parentModel = options.parentModel
+		? `${options.parentModel.provider}/${options.parentModel.id}`
+		: "(none active)";
+	const childModel = options.childRuntime.model
+		? `${options.childRuntime.provider ? `${options.childRuntime.provider}/` : ""}${options.childRuntime.model}`
+		: options.childRuntime.modelPolicy === "child-default"
+			? "child default"
+			: "(unresolved)";
+	const childRuntime = `${childModel}${options.childRuntime.thinking ? `:${options.childRuntime.thinking}` : ""}`;
+	const contract = [
+		"Delegated execution context:",
+		`- Role: ${JSON.stringify(options.role)} (source=${JSON.stringify(options.roleSource)})`,
+		`- Parent model: ${JSON.stringify(parentModel)}`,
+		`- Child runtime: ${JSON.stringify(childRuntime)}`,
+		`- Canonical cwd: ${JSON.stringify(options.cwd)}`,
+		`- Task id: ${JSON.stringify(options.taskId)}`,
+		`- Configured timeout: ${options.timeoutMs} ms`,
+		"- No parent conversation is included. Use only this role prompt, the task below, applicable instruction files, and evidence you inspect.",
+		"- Treat task-stated scope and explicit paths as hard boundaries. Do not inspect unrelated dirty changes or broaden into repository-wide scans unless the task explicitly requests them.",
+		"- Report a nonexistent task path once, do not search for substitutes outside scope, and continue only with the remaining stated paths.",
+		"- For a narrow verification task, return immediately once its stated acceptance checklist is satisfied.",
+		"- If the task combines multiple independent domains or exhaustive repo, test, and asset review, return a split plan instead of attempting the whole scope.",
+		"- Search before broad reads. For a likely small file, start with one default bounded read; provide offset and limit only when continuing truncated output or retrieving a task-relevant range.",
+		"- For logs and large files, use targeted rg queries before bounded reads. Do not read consecutive ranges to EOF unless the task evidence requires the complete file.",
+		"- If the task is read-only, do not call write, edit, or other mutating tools.",
+		"- Put temporary probes under the OS temporary directory (for example /tmp), and follow applicable AGENTS.md command and test requirements.",
+		"- Do not delegate recursively. Extensions and prompt templates are disabled; task-relevant skills remain available.",
+		"- The first non-empty line of the final answer MUST be exactly one of: RESULT: completed, RESULT: partial, RESULT: blocked.",
+		"- After RESULT, follow the role persona's response format and explicitly include evidence and unresolved issues. If the persona defines no format, use concise SUMMARY:, EVIDENCE:, and OPEN_ISSUES: sections.",
+	].join("\n");
+	return {
+		systemPrompt: `${options.personaPrompt.trim()}\n\n${contract}`.trim(),
+		userPrompt: `Task ${JSON.stringify(options.taskId)} (role ${JSON.stringify(options.role)}):\n${options.task}`,
+	};
+}
+
+export function formatSubagentTimeoutDiagnostic(options: {
+	taskId: string;
+	role: string;
+	elapsedMs: number;
+	timeoutMs: number;
+}): string {
+	return [
+		`Subagent timed out: task=${options.taskId} role=${options.role} elapsed=${Math.max(0, Math.round(options.elapsedMs))}ms configuredTimeout=${options.timeoutMs}ms.`,
+		"Split the work into narrower independent tasks, then retry with an explicit timeoutMs sized for each bounded task.",
+	].join(" ");
+}
+
+export function resolveTaskCwd(workspaceRoot: string, requestedCwd: string | undefined): string {
+	const canonicalRoot = fs.realpathSync(workspaceRoot);
+	const candidate = path.resolve(workspaceRoot, requestedCwd ?? ".");
+	let canonicalCwd: string;
+	try {
+		canonicalCwd = fs.realpathSync(candidate);
+	} catch {
+		throw new Error(`Task cwd must be an existing directory inside workspace: ${candidate}`);
+	}
+	if (!fs.statSync(canonicalCwd).isDirectory()) {
+		throw new Error(`Task cwd must be an existing directory inside workspace: ${candidate}`);
+	}
+	const relative = path.relative(canonicalRoot, canonicalCwd);
+	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+		throw new Error(`Task cwd is outside workspace ${canonicalRoot}: ${canonicalCwd}`);
+	}
+	return canonicalCwd;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isTextContent(value: unknown): boolean {
+	return isRecord(value) && value.type === "text" && typeof value.text === "string";
+}
+
+function isImageContent(value: unknown): boolean {
+	return (
+		isRecord(value) && value.type === "image" && typeof value.data === "string" && typeof value.mimeType === "string"
+	);
+}
+
 function isMessage(value: unknown): value is Message {
-	return isRecord(value) && (value.role === "user" || value.role === "assistant" || value.role === "toolResult");
+	if (!isRecord(value)) return false;
+	if (value.role === "user") {
+		return (
+			typeof value.content === "string" ||
+			(Array.isArray(value.content) && value.content.every((part) => isTextContent(part) || isImageContent(part)))
+		);
+	}
+	if (value.role === "toolResult") {
+		return Array.isArray(value.content) && value.content.every((part) => isTextContent(part) || isImageContent(part));
+	}
+	if (value.role !== "assistant" || !Array.isArray(value.content)) return false;
+	return value.content.every((part) => {
+		if (!isRecord(part)) return false;
+		if (part.type === "text") return typeof part.text === "string";
+		if (part.type === "thinking") return typeof part.thinking === "string";
+		return (
+			part.type === "toolCall" &&
+			typeof part.id === "string" &&
+			typeof part.name === "string" &&
+			isRecord(part.arguments)
+		);
+	});
 }
 
 function formatTokens(count: number): string {
@@ -95,72 +297,52 @@ function formatResolvedRuntime(result: Pick<SingleResult, "provider" | "model" |
 	return `${model ?? "default"}${result.thinking ? `:${result.thinking}` : ""}`;
 }
 
+function formatPreflightFailure(result: SingleResult): string | undefined {
+	if (!result.errorCode) return undefined;
+	const lines = [
+		`Error code: ${result.errorCode}`,
+		`Message: ${result.errorMessage ?? "Subagent runtime preflight failed."}`,
+	];
+	const runtime = formatResolvedRuntime(result);
+	if (runtime) lines.push(`Resolved runtime: ${runtime}`);
+	if (result.supportedThinking) lines.push(`Supported thinking: ${result.supportedThinking.join(", ")}`);
+	if (result.cwd) lines.push(`Canonical cwd: ${result.cwd}`);
+	if (result.timeoutMs !== undefined) lines.push(`Effective timeout: ${result.timeoutMs} ms`);
+	return lines.join("\n");
+}
+
+function getRedactedToolArgumentMetadata(part: unknown): { count?: number } {
+	if (!isRecord(part)) return {};
+	const metadata = part.argumentMetadata;
+	if (
+		isRecord(metadata) &&
+		metadata.visibility === "redacted" &&
+		typeof metadata.count === "number" &&
+		Number.isSafeInteger(metadata.count) &&
+		metadata.count >= 0
+	) {
+		return { count: metadata.count };
+	}
+	const legacyArguments = part.arguments;
+	if (
+		isRecord(legacyArguments) &&
+		legacyArguments.argumentsRedacted === true &&
+		typeof legacyArguments.argumentCount === "number" &&
+		Number.isSafeInteger(legacyArguments.argumentCount) &&
+		legacyArguments.argumentCount >= 0
+	) {
+		return { count: legacyArguments.argumentCount };
+	}
+	return {};
+}
+
 function formatToolCall(
 	toolName: string,
-	args: Record<string, unknown>,
+	argumentCount: number | undefined,
 	themeFg: (color: ThemeColor, text: string) => string,
 ): string {
-	const shortenPath = (p: string) => {
-		const home = os.homedir();
-		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-	};
-
-	switch (toolName) {
-		case "bash": {
-			const command = (args.command as string) || "...";
-			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
-			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
-		}
-		case "read": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const offset = args.offset as number | undefined;
-			const limit = args.limit as number | undefined;
-			let text = themeFg("accent", filePath);
-			if (offset !== undefined || limit !== undefined) {
-				const startLine = offset ?? 1;
-				const endLine = limit !== undefined ? startLine + limit - 1 : "";
-				text += themeFg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
-			}
-			return themeFg("muted", "read ") + text;
-		}
-		case "write": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const content = (args.content || "") as string;
-			const lines = content.split("\n").length;
-			let text = themeFg("muted", "write ") + themeFg("accent", filePath);
-			if (lines > 1) text += themeFg("dim", ` (${lines} lines)`);
-			return text;
-		}
-		case "edit": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			return themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "ls": {
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "ls ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "find": {
-			const pattern = (args.pattern || "*") as string;
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "find ") + themeFg("accent", pattern) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
-		}
-		case "grep": {
-			const pattern = (args.pattern || "") as string;
-			const rawPath = (args.path || ".") as string;
-			return (
-				themeFg("muted", "grep ") +
-				themeFg("accent", `/${pattern}/`) +
-				themeFg("dim", ` in ${shortenPath(rawPath)}`)
-			);
-		}
-		default: {
-			const argsStr = JSON.stringify(args);
-			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
-			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
-		}
-	}
+	const count = argumentCount === undefined ? "count unknown" : `${argumentCount} supplied`;
+	return themeFg("accent", `tool call ${toolName}`) + themeFg("dim", ` — arguments redacted (${count})`);
 }
 
 interface UsageStats {
@@ -173,6 +355,17 @@ interface UsageStats {
 	turns: number;
 }
 
+export type ChildReportedOutcome = "completed" | "partial" | "blocked";
+
+export function parseChildReportedOutcome(output: string): ChildReportedOutcome | undefined {
+	const firstLine = output
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.find((line) => line.length > 0);
+	const outcome = /^RESULT: (completed|partial|blocked)$/.exec(firstLine ?? "")?.[1];
+	return outcome === "completed" || outcome === "partial" || outcome === "blocked" ? outcome : undefined;
+}
+
 export interface SingleResult {
 	taskId: string;
 	agent: string;
@@ -180,35 +373,141 @@ export interface SingleResult {
 	task: string;
 	taskSummary: string;
 	exitCode: number;
-	status: "queued" | "running" | "completed" | "failed" | "cancelled";
+	status: "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out" | "skipped";
+	cwd?: string;
+	timeoutMs?: number;
+	activityOutput?: string;
+	lastActivityAt?: number;
+	phase?: string;
 	messages: Message[];
 	stderr: string;
 	usage: UsageStats;
 	provider?: string;
 	model?: string;
 	thinking?: ThinkingLevel;
+	thinkingAdjustment?: RuntimeThinkingAdjustment;
+	supportedThinking?: readonly ThinkingLevel[];
+	errorCode?: RuntimeDiagnosticCode;
 	stopReason?: string;
 	errorMessage?: string;
+	reportedOutcome?: ChildReportedOutcome;
 	step?: number;
 }
 
 export interface SubagentDetails {
 	toolCallId: string;
 	mode: "single" | "parallel" | "chain";
+	revision: number;
+	expectedTasks: number;
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
 }
 
-export function summarizeTaskForStatus(task: string): string {
-	return task
-		.replace(/\b(Bearer)\s+\S+/gi, "$1 [redacted]")
-		.replace(/\b((?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*)\S+/gi, "$1[redacted]")
+function redactSensitiveText(text: string): string {
+	return text
+		.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+		.replace(
+			/((?:["']?)authorization(?:["']?)\s*[:=]\s*)(?:Bearer\s+)?(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi,
+			"$1[redacted]",
+		)
+		.replace(/\b(Bearer)\s+(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi, "$1 [redacted]")
+		.replace(
+			/((?:["']?)(?:api[_-]?key|token|secret|password)(?:["']?)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi,
+			"$1[redacted]",
+		)
 		.replace(/\b(?:sk|pk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{12,}\b/g, "[redacted]")
-		.replace(/:\/\/[^@\s]+@/g, "://[redacted]@")
-		.replace(/\s+/g, " ")
-		.trim()
-		.slice(0, 160);
+		.replace(/:\/\/[^@\s]+@/g, "://[redacted]@");
+}
+
+export function summarizeTaskForStatus(task: string): string {
+	return redactSensitiveText(task).replace(/\s+/g, " ").trim().slice(0, 160);
+}
+
+export interface SubagentActivity {
+	output: string;
+	lastActivityAt: number;
+	phase: string;
+}
+
+export function updateSubagentActivity(
+	current: SubagentActivity | undefined,
+	line: string,
+	now = Date.now(),
+): SubagentActivity | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(line) as unknown;
+	} catch {
+		return current;
+	}
+	if (!isRecord(parsed) || parsed.type !== "message_update" || !isRecord(parsed.assistantMessageEvent)) return current;
+	const event = parsed.assistantMessageEvent;
+	let addition: string | undefined;
+	let phase: string | undefined;
+	if (event.type === "text_delta" && typeof event.delta === "string") {
+		addition = "[responding]";
+		phase = "responding";
+	} else if (event.type === "toolcall_start") {
+		const partial = isRecord(event.partial) ? event.partial : undefined;
+		const candidateName =
+			typeof event.toolName === "string"
+				? event.toolName
+				: typeof partial?.name === "string"
+					? partial.name
+					: "tool";
+		const name = /^[A-Za-z0-9_.:-]{1,80}$/.test(candidateName) ? redactSensitiveText(candidateName) : "tool";
+		addition = `[tool: ${name}]`;
+		phase = `tool:${name}`;
+	}
+	if (!addition || !phase) return current;
+	return {
+		output: addition,
+		lastActivityAt: now,
+		phase,
+	};
+}
+
+export type ParsedSubagentMessageEvent =
+	| { type: "message_end"; message: Extract<Message, { role: "assistant" }> }
+	| { type: "tool_result_end"; message: Extract<Message, { role: "toolResult" }> };
+
+export function parseSubagentMessageEvent(line: string): ParsedSubagentMessageEvent | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(line) as unknown;
+	} catch {
+		return undefined;
+	}
+	if (!isRecord(parsed) || !isMessage(parsed.message)) return undefined;
+	if (parsed.type === "message_end" && parsed.message.role === "assistant") {
+		const content: typeof parsed.message.content = [];
+		for (const part of parsed.message.content) {
+			if (part.type === "text") content.push(part);
+			else if (part.type === "toolCall") {
+				const sanitizedToolCall = {
+					type: "toolCall" as const,
+					id: part.id,
+					name: part.name,
+					arguments: {},
+					argumentMetadata: {
+						visibility: "redacted" as const,
+						count: Object.keys(part.arguments).length,
+					},
+				};
+				content.push(sanitizedToolCall);
+			}
+		}
+		return {
+			type: "message_end",
+			message: { ...parsed.message, content },
+		};
+	}
+	if (parsed.type === "tool_result_end" && parsed.message.role === "toolResult") {
+		return { type: "tool_result_end", message: parsed.message };
+	}
+	return undefined;
 }
 
 function getStatusActivity(messages: Message[]): string | undefined {
@@ -219,21 +518,44 @@ function getStatusActivity(messages: Message[]): string | undefined {
 }
 
 export function createSubagentStateEvent(details: SubagentDetails): SubagentProgressEvent {
-	return {
-		toolCallId: details.toolCallId,
-		mode: details.mode,
-		results: details.results.map((result) => ({
+	if (details.results.length !== details.expectedTasks) {
+		throw new Error(
+			`Subagent snapshot expectedTasks=${details.expectedTasks} but received ${details.results.length} results`,
+		);
+	}
+	const results = details.results.map((result) =>
+		Object.freeze({
 			taskId: result.taskId,
 			agent: result.agent,
 			taskSummary: summarizeTaskForStatus(result.taskSummary),
 			status: result.status,
-			lastActivity: getStatusActivity(result.messages),
-			usage: { ...result.usage },
+			cwd: result.cwd,
+			timeoutMs: result.timeoutMs,
+			activityOutput: result.activityOutput,
+			lastActivityAt: result.lastActivityAt,
+			phase: result.phase,
+			inactivityMs: result.lastActivityAt ? Math.max(0, Date.now() - result.lastActivityAt) : undefined,
+			inactivityWarning:
+				result.status === "running" && result.lastActivityAt && Date.now() - result.lastActivityAt >= 60_000
+					? "No child activity for at least 60 seconds"
+					: undefined,
+			lastActivity: result.phase?.startsWith("tool:")
+				? result.phase
+				: (result.activityOutput?.trim().split("\n").at(-1) ?? result.phase ?? getStatusActivity(result.messages)),
+			usage: Object.freeze({ ...result.usage }),
 			provider: result.provider,
 			model: result.model,
 			thinking: result.thinking,
-		})),
-	};
+			thinkingAdjustment: result.thinkingAdjustment,
+		}),
+	);
+	return Object.freeze({
+		toolCallId: details.toolCallId,
+		mode: details.mode,
+		revision: details.revision,
+		expectedTasks: details.expectedTasks,
+		results: Object.freeze(results),
+	});
 }
 
 function createRuntimeFailure(
@@ -243,6 +565,10 @@ function createRuntimeFailure(
 	taskSummary: string,
 	error: string,
 	step?: number,
+	cwd?: string,
+	timeoutMs?: number,
+	validation?: RuntimeValidationResult,
+	thinkingAdjustment?: RuntimeThinkingAdjustment,
 ): SingleResult {
 	return {
 		taskId,
@@ -252,10 +578,18 @@ function createRuntimeFailure(
 		taskSummary: summarizeTaskForStatus(taskSummary),
 		exitCode: 1,
 		status: "failed",
+		cwd,
+		timeoutMs,
 		messages: [],
 		stderr: error,
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		errorMessage: error,
+		provider: validation?.runtime?.provider ?? validation?.diagnostic?.provider,
+		model: validation?.runtime?.model ?? validation?.diagnostic?.model,
+		thinking: validation?.runtime?.thinking ?? validation?.diagnostic?.thinking,
+		thinkingAdjustment,
+		supportedThinking: validation?.diagnostic?.supportedThinking,
+		errorCode: validation?.errorCode,
+		errorMessage: validation?.error ?? error,
 		step,
 	};
 }
@@ -267,6 +601,8 @@ function createCancelledResult(
 	taskSummary: string,
 	runtime: AgentRuntimeConfig,
 	step?: number,
+	cwd?: string,
+	timeoutMs?: number,
 ): SingleResult {
 	return {
 		taskId,
@@ -276,6 +612,8 @@ function createCancelledResult(
 		taskSummary: summarizeTaskForStatus(taskSummary),
 		exitCode: 130,
 		status: "cancelled",
+		cwd,
+		timeoutMs,
 		messages: [],
 		stderr: "Canceled before start",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
@@ -292,9 +630,10 @@ function getFinalOutput(messages: Message[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
 		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
+			return msg.content
+				.filter((part) => part.type === "text")
+				.map((part) => part.text)
+				.join("\n");
 		}
 	}
 	return "";
@@ -306,6 +645,8 @@ function isFailedResult(result: SingleResult): boolean {
 
 function getResultOutput(result: SingleResult): string {
 	if (isFailedResult(result)) {
+		const preflightFailure = formatPreflightFailure(result);
+		if (preflightFailure) return preflightFailure;
 		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
 	}
 	return getFinalOutput(result.messages) || "(no output)";
@@ -322,7 +663,72 @@ function truncateParallelOutput(output: string): string {
 	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
 }
 
-type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, unknown> };
+function formatParentVisibleField(value: string | number | undefined): string {
+	return JSON.stringify(value ?? null);
+}
+
+function formatParentVisibleError(value: string): string {
+	const redacted = redactSensitiveText(value);
+	const encoded = JSON.stringify(redacted);
+	if (Buffer.byteLength(encoded, "utf8") <= PARENT_VISIBLE_ERROR_CAP) return encoded;
+	const marker = `\n[Error truncated: ${Buffer.byteLength(redacted, "utf8")} bytes total]`;
+	let prefix = redacted.slice(0, PARENT_VISIBLE_ERROR_CAP);
+	let capped = JSON.stringify(`${prefix}${marker}`);
+	while (Buffer.byteLength(capped, "utf8") > PARENT_VISIBLE_ERROR_CAP) {
+		prefix = prefix.slice(0, -1);
+		capped = JSON.stringify(`${prefix}${marker}`);
+	}
+	return capped;
+}
+
+export function formatParentVisibleResult(result: SingleResult): string {
+	const errorMessage = isFailedResult(result)
+		? (formatPreflightFailure(result) ?? result.errorMessage ?? getResultOutput(result))
+		: result.errorMessage;
+	return [
+		[
+			`taskId=${formatParentVisibleField(result.taskId)}`,
+			`role=${formatParentVisibleField(result.agent)}`,
+			`status=${formatParentVisibleField(result.status)}`,
+			`cwd=${formatParentVisibleField(result.cwd)}`,
+			`timeoutMs=${formatParentVisibleField(result.timeoutMs)}`,
+			`provider=${formatParentVisibleField(result.provider)}`,
+			`model=${formatParentVisibleField(result.model)}`,
+			`thinking=${formatParentVisibleField(result.thinking)}`,
+			`reportedOutcome=${formatParentVisibleField(result.reportedOutcome)}`,
+		].join(" "),
+		[
+			`outcome exitCode=${formatParentVisibleField(result.exitCode)}`,
+			`stopReason=${formatParentVisibleField(result.stopReason)}`,
+			`errorMessage=${errorMessage === undefined ? formatParentVisibleField(undefined) : formatParentVisibleError(errorMessage)}`,
+		].join(" "),
+		...(result.thinkingAdjustment ? [`runtime adjustment: ${result.thinkingAdjustment.message}`] : []),
+		[
+			`usage turns=${result.usage.turns}`,
+			`input=${result.usage.input}`,
+			`output=${result.usage.output}`,
+			`cacheRead=${result.usage.cacheRead}`,
+			`cacheWrite=${result.usage.cacheWrite}`,
+			`contextTokens=${result.usage.contextTokens}`,
+			`cost=${result.usage.cost}`,
+		].join(" "),
+		`output: ${truncateParallelOutput(getFinalOutput(result.messages) || "(no output)")}`,
+	].join("\n");
+}
+
+function formatParentVisibleResults(results: readonly SingleResult[]): string {
+	return results.map(formatParentVisibleResult).join("\n\n---\n\n");
+}
+
+export function formatChainTerminalHeader(results: readonly Pick<SingleResult, "status">[]): string {
+	const completed = results.filter((result) => result.status === "completed").length;
+	const failed = results.filter(
+		(result) => result.status === "failed" || result.status === "cancelled" || result.status === "timed_out",
+	).length;
+	return `Chain: completed=${completed} failed=${failed} attempted=${completed + failed} total=${results.length}`;
+}
+
+type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; argumentCount?: number };
 
 function getDisplayItems(messages: Message[]): DisplayItem[] {
 	const items: DisplayItem[] = [];
@@ -330,7 +736,10 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 		if (msg.role === "assistant") {
 			for (const part of msg.content) {
 				if (part.type === "text") items.push({ type: "text", text: part.text });
-				else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
+				else if (part.type === "toolCall") {
+					const metadata = getRedactedToolArgumentMetadata(part);
+					items.push({ type: "toolCall", name: part.name, argumentCount: metadata.count });
+				}
 			}
 		}
 	}
@@ -439,20 +848,37 @@ export function getPiInvocation(
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
+export function buildSubagentRuntimeArgs(runtime: AgentRuntimeConfig, tools: string[] | undefined): string[] {
+	const args = [
+		"--mode",
+		"json",
+		"-p",
+		"--no-session",
+		"--no-extensions",
+		"--no-prompt-templates",
+		...buildRuntimeArgs(runtime),
+	];
+	if (tools && tools.length > 0) args.push("--tools", tools.join(","));
+	return args;
+}
+
 async function runSingleAgent(
-	defaultCwd: string,
 	agents: AgentConfig[],
 	taskId: string,
 	agentName: string,
 	task: string,
 	taskSummary: string,
 	runtime: AgentRuntimeConfig,
-	cwd: string | undefined,
+	thinkingAdjustment: RuntimeThinkingAdjustment | undefined,
+	cwd: string,
+	timeoutMs: number,
+	parentModel: ParentModelSnapshot | undefined,
 	step: number | undefined,
 	signal: AbortSignal | undefined,
 	taskSignal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	processRuntime: Pick<LocalProcessRuntime, "start">,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 	const safeTaskSummary = summarizeTaskForStatus(taskSummary);
@@ -474,35 +900,16 @@ async function runSingleAgent(
 			provider: runtime.provider,
 			model: runtime.model,
 			thinking: runtime.thinking,
+			thinkingAdjustment,
 			errorMessage,
 			step,
 		};
 	}
-	if (agent.configError) {
-		return {
-			taskId,
-			agent: agentName,
-			agentSource: agent.source,
-			task,
-			taskSummary: safeTaskSummary,
-			exitCode: 1,
-			status: "failed",
-			messages: [],
-			stderr: agent.configError,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-			provider: runtime.provider,
-			model: runtime.model,
-			thinking: runtime.thinking,
-			errorMessage: agent.configError,
-			step,
-		};
-	}
-
-	const args: string[] = ["--mode", "json", "-p", "--no-session", ...buildRuntimeArgs(runtime)];
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	const args = buildSubagentRuntimeArgs(runtime, agent.tools);
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
+	let inactivityTimer: ReturnType<typeof setInterval> | undefined;
 
 	const currentResult: SingleResult = {
 		taskId,
@@ -512,12 +919,17 @@ async function runSingleAgent(
 		taskSummary: safeTaskSummary,
 		exitCode: 0,
 		status: "running",
+		cwd,
+		timeoutMs,
+		lastActivityAt: Date.now(),
+		phase: "starting",
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		provider: runtime.provider,
 		model: runtime.model,
 		thinking: runtime.thinking,
+		thinkingAdjustment,
 		step,
 	};
 
@@ -531,65 +943,103 @@ async function runSingleAgent(
 		}
 	};
 
-	try {
-		if (agent.systemPrompt.trim()) {
-			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
-			tmpPromptDir = tmp.dir;
-			tmpPromptPath = tmp.filePath;
-			args.push("--append-system-prompt", tmpPromptPath);
-		}
-
-		args.push(`Task: ${task}`);
+	if (agent.configError) {
+		const errorMessage = redactSensitiveText(agent.configError);
+		currentResult.exitCode = 1;
+		currentResult.status = "failed";
+		currentResult.stderr = errorMessage;
+		currentResult.errorMessage = errorMessage;
 		emitUpdate();
-		let abortSource: "parent" | "task" | undefined;
+		return currentResult;
+	}
+
+	try {
+		const initialContext = buildSubagentInitialContext({
+			personaPrompt: agent.systemPrompt,
+			role: agent.name,
+			roleSource: agent.source,
+			cwd,
+			parentModel,
+			childRuntime: runtime,
+			taskId,
+			task,
+			timeoutMs,
+		});
+		const tmp = await writePromptToTempFile(agent.name, initialContext.systemPrompt);
+		tmpPromptDir = tmp.dir;
+		tmpPromptPath = tmp.filePath;
+		args.push("--append-system-prompt", tmpPromptPath, initialContext.userPrompt);
+		emitUpdate();
+		let abortSource: "parent" | "task" | "timeout" | undefined;
 
 		const invocation = getPiInvocation(args);
 		let buffer = "";
+		let stderrBytesSeen = 0;
+		let stderrTail = Buffer.alloc(0);
+		const appendStderr = (data: Buffer | string) => {
+			const chunk = typeof data === "string" ? Buffer.from(data) : data;
+			stderrBytesSeen += chunk.length;
+			stderrTail = Buffer.concat([stderrTail, chunk]);
+			const tailCap = CHILD_STDERR_CAP - 128;
+			if (stderrTail.length > tailCap) {
+				stderrTail = stderrTail.subarray(stderrTail.length - tailCap);
+			}
+			const omittedBytes = Math.max(0, stderrBytesSeen - stderrTail.length);
+			const prefix = omittedBytes > 0 ? `[stderr truncated: ${omittedBytes} bytes omitted]\n` : "";
+			currentResult.stderr = redactSensitiveText(`${prefix}${stderrTail.toString("utf8")}`);
+		};
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(line) as unknown;
-			} catch {
-				return;
+			const activity = updateSubagentActivity(
+				currentResult.lastActivityAt
+					? {
+							output: currentResult.activityOutput ?? "",
+							lastActivityAt: currentResult.lastActivityAt,
+							phase: currentResult.phase ?? "running",
+						}
+					: undefined,
+				line,
+			);
+			if (activity && activity.lastActivityAt !== currentResult.lastActivityAt) {
+				currentResult.activityOutput = activity.output;
+				currentResult.lastActivityAt = activity.lastActivityAt;
+				currentResult.phase = activity.phase;
+				emitUpdate();
 			}
-			if (!isRecord(parsed) || !isMessage(parsed.message)) return;
+			const parsed = parseSubagentMessageEvent(line);
+			if (!parsed) return;
 
 			if (parsed.type === "message_end") {
 				const msg = parsed.message;
 				currentResult.messages.push(msg);
-
-				if (msg.role === "assistant") {
-					currentResult.usage.turns++;
-					const usage = msg.usage;
-					if (usage) {
-						currentResult.usage.input += usage.input || 0;
-						currentResult.usage.output += usage.output || 0;
-						currentResult.usage.cacheRead += usage.cacheRead || 0;
-						currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-						currentResult.usage.cost += usage.cost?.total || 0;
-						currentResult.usage.contextTokens = usage.totalTokens || 0;
-					}
-					if (!currentResult.model && msg.model) currentResult.model = msg.model;
-					if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-					if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+				currentResult.usage.turns++;
+				const usage = msg.usage;
+				if (usage) {
+					currentResult.usage.input += usage.input || 0;
+					currentResult.usage.output += usage.output || 0;
+					currentResult.usage.cacheRead += usage.cacheRead || 0;
+					currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+					currentResult.usage.cost += usage.cost?.total || 0;
+					currentResult.usage.contextTokens = usage.totalTokens || 0;
 				}
+				if (!currentResult.model && msg.model) currentResult.model = msg.model;
+				if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+				if (msg.errorMessage) currentResult.errorMessage = redactSensitiveText(msg.errorMessage);
 				emitUpdate();
-			}
-
-			if (parsed.type === "tool_result_end") {
+			} else {
 				currentResult.messages.push(parsed.message);
 				emitUpdate();
 			}
 		};
-		const processHandle = localProcessRuntime.start({
+		const startedAt = Date.now();
+		const processHandle = processRuntime.start({
 			command: invocation.command,
 			args: invocation.args,
-			cwd: cwd ?? defaultCwd,
+			cwd,
 			env: invocation.env,
 			onOutput: (stream, data) => {
 				if (stream === "stderr") {
-					currentResult.stderr += data.toString();
+					appendStderr(data);
 					return;
 				}
 				buffer += data.toString();
@@ -598,37 +1048,57 @@ async function runSingleAgent(
 				for (const line of lines) processLine(line);
 			},
 		});
+		inactivityTimer = setInterval(emitUpdate, 30_000);
 		const abortBinding = bindProcessAbort(
 			{
 				kill: (childSignal) => processHandle.terminate("aborted", childSignal),
 			},
 			signal,
 			taskSignal,
+			5_000,
+			timeoutMs,
 		);
 		const processExit = await processHandle.wait();
+		if (inactivityTimer) clearInterval(inactivityTimer);
 		abortSource = abortBinding.getSource();
 		abortBinding.close();
 		if (buffer.trim()) processLine(buffer);
 		if (processExit.reason === "failed") {
-			const errorMessage = processExit.error ?? "Subagent process failed";
+			const errorMessage = redactSensitiveText(processExit.error ?? "Subagent process failed");
 			currentResult.errorMessage = errorMessage;
-			currentResult.stderr += `${errorMessage}\n`;
+			appendStderr(`${errorMessage}\n`);
 		}
 		const exitCode = processExit.exitCode ?? (processExit.reason === "failed" ? 1 : 0);
 
 		currentResult.exitCode = exitCode;
-		if (abortSource) {
+		currentResult.reportedOutcome = parseChildReportedOutcome(getFinalOutput(currentResult.messages));
+		const completionStatus = classifyProcessCompletion(exitCode, abortSource);
+		if (completionStatus === "timed_out") {
+			currentResult.exitCode = exitCode === 0 ? 124 : exitCode;
+			currentResult.stopReason = "timed-out";
+			currentResult.errorMessage = formatSubagentTimeoutDiagnostic({
+				taskId,
+				role: agent.name,
+				elapsedMs: Date.now() - startedAt,
+				timeoutMs,
+			});
+			currentResult.status = "timed_out";
+			currentResult.phase = "timed-out";
+			emitUpdate();
+		} else if (completionStatus === "cancelled") {
 			currentResult.exitCode = exitCode === 0 ? 130 : exitCode;
 			currentResult.stopReason = "aborted";
 			currentResult.errorMessage = abortSource === "parent" ? "Canceled with parent request" : "Canceled by user";
 			currentResult.status = "cancelled";
+			currentResult.phase = "cancelled";
 			emitUpdate();
 		} else {
-			currentResult.status = isFailedResult(currentResult) ? "failed" : "completed";
+			currentResult.status = isFailedResult(currentResult) ? "failed" : completionStatus;
 			emitUpdate();
 		}
 		return currentResult;
 	} finally {
+		if (inactivityTimer) clearInterval(inactivityTimer);
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);
@@ -647,23 +1117,42 @@ async function runSingleAgent(
 const ThinkingSchema = StringEnum(THINKING_LEVELS, {
 	description: "Reasoning effort for this subagent",
 });
+const ModelPolicySchema = StringEnum(MODEL_POLICY_VALUES, {
+	description: "Model fallback policy when provider/model are not explicitly configured",
+});
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task to delegate to the agent" }),
+	task: Type.String({ description: "One bounded task with a specific deliverable; split broad multi-domain work" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	timeoutMs: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: MAX_TASK_TIMEOUT_MS,
+			description: "Per-task wall-clock timeout override. The call-level explicit timeoutMs applies when omitted.",
+		}),
+	),
 	provider: Type.Optional(Type.String({ description: "Provider override for this task" })),
 	model: Type.Optional(Type.String({ description: "Model override for this task" })),
 	thinking: Type.Optional(ThinkingSchema),
+	modelPolicy: Type.Optional(ModelPolicySchema),
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
+	task: Type.String({ description: "One bounded step with optional {previous} placeholder for prior output" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	timeoutMs: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: MAX_TASK_TIMEOUT_MS,
+			description: "Per-step wall-clock timeout override. The call-level explicit timeoutMs applies when omitted.",
+		}),
+	),
 	provider: Type.Optional(Type.String({ description: "Provider override for this step" })),
 	model: Type.Optional(Type.String({ description: "Model override for this step" })),
 	thinking: Type.Optional(ThinkingSchema),
+	modelPolicy: Type.Optional(ModelPolicySchema),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -681,9 +1170,15 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	timeoutMs: Type.Integer({
+		minimum: 1,
+		maximum: MAX_TASK_TIMEOUT_MS,
+		description: "Explicit wall-clock timeout shared by tasks unless an item overrides it.",
+	}),
 	provider: Type.Optional(Type.String({ description: "Provider override for single mode" })),
 	model: Type.Optional(Type.String({ description: "Model override for single mode" })),
 	thinking: Type.Optional(ThinkingSchema),
+	modelPolicy: Type.Optional(ModelPolicySchema),
 });
 
 async function showAgentConfig(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
@@ -709,12 +1204,20 @@ async function showAgentConfig(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 
 	const action = await ctx.ui.select(`Runtime for ${agent.name}`, [
 		"Choose provider/model/effort",
+		"Inherit parent model",
+		"Use child default model",
 		"Use agent defaults",
 	]);
 	if (!action) return;
 	if (action === "Use agent defaults") {
 		await updateRuntimeOverride(agent.name, undefined);
 		ctx.ui.notify(`Cleared personal runtime override for ${agent.name}`, "info");
+		return;
+	}
+	if (action === "Inherit parent model" || action === "Use child default model") {
+		const modelPolicy = action === "Inherit parent model" ? "inherit-parent" : "child-default";
+		await updateRuntimeOverride(agent.name, { modelPolicy });
+		ctx.ui.notify(`Saved ${agent.name}: ${modelPolicy}`, "info");
 		return;
 	}
 
@@ -737,9 +1240,25 @@ async function showAgentConfig(pi: ExtensionAPI, ctx: ExtensionContext): Promise
 	pi.events.emit("pi:subagent-config-changed", { agent: agent.name });
 }
 
-export default function (pi: ExtensionAPI) {
+export interface SubagentExtensionDependencies {
+	discoverAgents?: typeof discoverAgents;
+	loadRuntimeOverrides?: typeof loadRuntimeOverrides;
+	createChildRuntimePreflight?: typeof createChildRuntimePreflight;
+	processRuntime?: Pick<LocalProcessRuntime, "start">;
+}
+
+export default function subagentExtension(pi: ExtensionAPI) {
+	registerSubagentExtension(pi);
+}
+
+export function registerSubagentExtension(pi: ExtensionAPI, dependencies: SubagentExtensionDependencies = {}) {
+	const discoverAgentsImpl = dependencies.discoverAgents ?? discoverAgents;
+	const loadRuntimeOverridesImpl = dependencies.loadRuntimeOverrides ?? loadRuntimeOverrides;
+	const createChildRuntimePreflightImpl = dependencies.createChildRuntimePreflight ?? createChildRuntimePreflight;
+	const processRuntime = dependencies.processRuntime ?? localProcessRuntime;
 	const activeTasks = new TaskControllerRegistry();
 	const progressDisplay = new SubagentProgressDisplay();
+	let availableUserRoles = formatAvailableAgentRoles(discoverAgentsImpl(process.cwd(), "user").agents);
 	let currentCtx: ExtensionContext | undefined;
 
 	const updateProgressUi = () => {
@@ -778,6 +1297,16 @@ export default function (pi: ExtensionAPI) {
 		currentCtx = ctx;
 		progressDisplay.clear();
 		updateProgressUi();
+		const discovery = discoverAgentsImpl(ctx.cwd, "user");
+		const overrides = loadRuntimeOverridesImpl();
+		const preflight = await createChildRuntimePreflightImpl();
+		availableUserRoles = formatAvailableAgentRoles(discovery.agents, {
+			overrides: overrides.error ? undefined : overrides.config.agents,
+			parentModel: captureParentModelSnapshot(ctx.model),
+			parentRegistry: ctx.modelRegistry,
+			childRegistry: preflight.registry,
+			preflightErrorCode: preflight.errorCode,
+		});
 	});
 	pi.on("session_shutdown", async () => {
 		progressDisplay.clear();
@@ -808,31 +1337,46 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: [
-			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
-			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
-		].join(" "),
+		promptSnippet: "Delegate bounded tasks to isolated subagents with explicit deadlines",
+		promptGuidelines: [
+			"Split broad repository, test, and artifact reviews into independent bounded tasks before delegation.",
+			"Treat task-stated scope and explicit paths as hard boundaries; do not inspect unrelated dirty changes or run broad repository scans unless explicitly requested.",
+			"Report nonexistent paths once without searching outside scope, and make narrow verification tasks return immediately after their acceptance checklist is satisfied.",
+			"Choose an explicit timeoutMs for every subagent call; do not rely on an implicit deadline.",
+			"Use at least 180000 ms for a focused single-file task and 300000 ms for a bounded multi-file review; split broader independent work instead of using a short deadline.",
+		],
+		get description() {
+			return [
+				"Delegate tasks to specialized subagents with isolated context.",
+				`Available user roles and runtimes: ${availableUserRoles}. Choose only a listed role unless intentionally enabling project roles with agentScope; unknown roles are rejected with the current available-role list.`,
+				"Modes: single (agent + task), parallel (independent bounded tasks), chain (bounded sequential steps with {previous}). An explicit call-level timeoutMs is required.",
+				"Child tool-call arguments are deliberately redacted from parent-visible activity and details. Sanitized records carry explicit redaction metadata outside an empty ordinary arguments payload; legacy empty payloads mean redacted with unknown count, not omitted arguments.",
+				`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
+				`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
+			].join(" ");
+		},
 		parameters: SubagentParams,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const parentModelSnapshot = captureParentModelSnapshot(ctx.model);
+			const childRuntimePreflight = createChildRuntimePreflightImpl();
 			const agentScope: AgentScope = params.agentScope ?? "user";
-			const discovery = discoverAgents(ctx.cwd, agentScope);
+			const discovery = discoverAgentsImpl(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
-			const loadedOverrides = loadRuntimeOverrides();
+			const loadedOverrides = loadRuntimeOverridesImpl();
 			if (loadedOverrides.error) {
 				return {
 					content: [{ type: "text", text: `Invalid ${getRuntimeOverridesPath()}: ${loadedOverrides.error}` }],
 					details: {
 						toolCallId,
 						mode: "single" as const,
+						revision: 0,
+						expectedTasks: 0,
 						agentScope,
 						projectAgentsDir: discovery.projectAgentsDir,
 						results: [],
 					},
-					isError: true,
 				};
 			}
 
@@ -840,37 +1384,78 @@ export default function (pi: ExtensionAPI) {
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
 			const hasSingle = Boolean(params.agent && params.task);
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
-
+			const expectedTasks = hasChain
+				? (params.chain?.length ?? 0)
+				: hasTasks
+					? (params.tasks?.length ?? 0)
+					: hasSingle
+						? 1
+						: 0;
+			let revision = 0;
+			const createDetails = (
+				mode: "single" | "parallel" | "chain",
+				results: SingleResult[],
+				currentRevision: number,
+			): SubagentDetails => ({
+				toolCallId,
+				mode,
+				revision: currentRevision,
+				expectedTasks,
+				agentScope,
+				projectAgentsDir: discovery.projectAgentsDir,
+				results: [...results],
+			});
 			const makeDetails =
 				(mode: "single" | "parallel" | "chain") =>
 				(results: SingleResult[]): SubagentDetails => {
-					const details = {
-						toolCallId,
-						mode,
-						agentScope,
-						projectAgentsDir: discovery.projectAgentsDir,
-						results,
-					};
+					if (results.length !== expectedTasks) return createDetails(mode, results, revision);
+					const details = createDetails(mode, results, ++revision);
 					const stateEvent = createSubagentStateEvent(details);
 					progressDisplay.update(stateEvent);
 					updateProgressUi();
 					pi.events.emit("pi:subagent-state", stateEvent);
 					return details;
 				};
+			const makeChildDetails =
+				(mode: "single" | "parallel" | "chain") =>
+				(results: SingleResult[]): SubagentDetails =>
+					createDetails(mode, results, revision);
 
-			const getRuntime = (agentName: string, taskOverride: AgentRuntimeConfig) => {
+			const getRuntime = async (
+				agentName: string,
+				taskOverride: AgentRuntimeConfig,
+			): Promise<RuntimeValidationResult> => {
 				const agent = agents.find((candidate) => candidate.name === agentName);
 				const personalOverride = loadedOverrides.config.agents[agentName];
 				const defaults: AgentRuntimeConfig = agent
-					? { provider: agent.provider, model: agent.model, thinking: agent.thinking }
+					? {
+							provider: agent.provider,
+							model: agent.model,
+							thinking: agent.thinking,
+							modelPolicy: agent.modelPolicy,
+						}
 					: {};
+				const preflight = await childRuntimePreflight;
+				if (!preflight.registry) return preflight;
 				return resolveAndValidateAgentRuntime(
 					defaults,
 					personalOverride,
 					taskOverride,
 					agent?.runtimeErrors,
 					ctx.modelRegistry,
+					{ parentModel: parentModelSnapshot, childRegistry: preflight.registry },
 				);
+			};
+
+			const getExecution = (requestedCwd: string | undefined, requestedTimeoutMs: number | undefined) => {
+				try {
+					return {
+						cwd: resolveTaskCwd(ctx.cwd, requestedCwd),
+						timeoutMs: normalizeTaskTimeout(requestedTimeoutMs),
+					};
+				} catch (error) {
+					return { error: error instanceof Error ? error.message : String(error) };
+				}
 			};
 
 			const runTrackedAgent = async (
@@ -879,7 +1464,9 @@ export default function (pi: ExtensionAPI) {
 				task: string,
 				taskSummary: string,
 				runtime: AgentRuntimeConfig,
-				cwd: string | undefined,
+				thinkingAdjustment: RuntimeThinkingAdjustment | undefined,
+				cwd: string,
+				timeoutMs: number,
 				step: number | undefined,
 				update: OnUpdateCallback | undefined,
 				detailsFactory: (results: SingleResult[]) => SubagentDetails,
@@ -896,39 +1483,56 @@ export default function (pi: ExtensionAPI) {
 					taskSummary: safeTaskSummary,
 					exitCode: -1,
 					status: "queued",
+					cwd,
+					timeoutMs,
 					messages: [],
 					stderr: "",
 					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 					provider: runtime.provider,
 					model: runtime.model,
 					thinking: runtime.thinking,
+					thinkingAdjustment,
 					step,
 				};
 				const queuedDetails = detailsFactory([queuedResult]);
 				update?.({ content: [{ type: "text", text: "(queued...)" }], details: queuedDetails });
 				try {
 					if (signal?.aborted || controller.signal.aborted) {
-						const cancelled = createCancelledResult(taskId, agentName, task, safeTaskSummary, runtime, step);
+						const cancelled = createCancelledResult(
+							taskId,
+							agentName,
+							task,
+							safeTaskSummary,
+							runtime,
+							step,
+							cwd,
+							timeoutMs,
+						);
 						cancelled.agentSource = agent?.source ?? "unknown";
+						cancelled.thinkingAdjustment = thinkingAdjustment;
 						const details = detailsFactory([cancelled]);
 						update?.({ content: [{ type: "text", text: "(cancelled)" }], details });
 						return cancelled;
 					}
-					return await runSingleAgent(
-						ctx.cwd,
+					const result = await runSingleAgent(
 						agents,
 						taskId,
 						agentName,
 						task,
 						safeTaskSummary,
 						runtime,
+						thinkingAdjustment,
 						cwd,
+						timeoutMs,
+						parentModelSnapshot,
 						step,
 						signal,
 						controller.signal,
 						update,
 						detailsFactory,
+						processRuntime,
 					);
+					return result;
 				} finally {
 					activeTasks.finish(taskId);
 				}
@@ -975,75 +1579,141 @@ export default function (pi: ExtensionAPI) {
 			if (params.chain && params.chain.length > 0) {
 				const chain = params.chain;
 				return await trackProgress(toolCallId, "chain", chain.length, async () => {
-					const results: SingleResult[] = [];
+					const resolvedRuntimes = await Promise.all(
+						chain.map((step) =>
+							getRuntime(step.agent, {
+								provider: step.provider,
+								model: step.model,
+								thinking: step.thinking,
+								modelPolicy: step.modelPolicy,
+							}),
+						),
+					);
+					const executions = chain.map((step) => getExecution(step.cwd, step.timeoutMs ?? params.timeoutMs));
+					const allResults: SingleResult[] = chain.map((step, index) => {
+						const resolved = resolvedRuntimes[index];
+						const execution = executions[index];
+						const taskSummary = summarizeTaskForStatus(step.task.replace(/\{previous\}/g, "[previous output]"));
+						return resolved.runtime && execution.cwd && execution.timeoutMs
+							? {
+									taskId: `${toolCallId}:${index}`,
+									agent: step.agent,
+									agentSource: agents.find((agent) => agent.name === step.agent)?.source ?? "unknown",
+									task: step.task,
+									taskSummary,
+									exitCode: -1,
+									status: "queued",
+									cwd: execution.cwd,
+									timeoutMs: execution.timeoutMs,
+									messages: [],
+									stderr: "",
+									usage: {
+										input: 0,
+										output: 0,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0,
+										contextTokens: 0,
+										turns: 0,
+									},
+									provider: resolved.runtime.provider,
+									model: resolved.runtime.model,
+									thinking: resolved.runtime.thinking,
+									thinkingAdjustment: resolved.adjustment,
+									step: index + 1,
+								}
+							: createRuntimeFailure(
+									`${toolCallId}:${index}`,
+									step.agent,
+									step.task,
+									taskSummary,
+									execution.error ??
+										(resolved.error ? formatRuntimeDiagnostic(resolved) : "Invalid task configuration"),
+									index + 1,
+									execution.cwd,
+									execution.timeoutMs,
+									resolved.runtime || (!execution.error && resolved.errorCode) ? resolved : undefined,
+									resolved.adjustment,
+								);
+					});
+					makeDetails("chain")(allResults);
 					let previousOutput = "";
 
 					for (let i = 0; i < chain.length; i++) {
 						const step = chain[i];
+						const execution = executions[i];
 						const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
 						const taskSummary = step.task.replace(/\{previous\}/g, "[previous output]");
 						const taskId = `${toolCallId}:${i}`;
-						const resolved = getRuntime(step.agent, {
-							provider: step.provider,
-							model: step.model,
-							thinking: step.thinking,
-						});
+						const resolved = resolvedRuntimes[i];
+						const chainUpdate: OnUpdateCallback = (partial) => {
+							const currentResult = partial.details?.results[0];
+							if (!currentResult) return;
+							allResults[i] = currentResult;
+							const details = makeDetails("chain")(allResults);
+							onUpdate?.({ content: partial.content, details });
+						};
 
-						// Create update callback that includes all previous results
-						const chainUpdate: OnUpdateCallback | undefined = onUpdate
-							? (partial) => {
-									// Combine completed results with current streaming result
-									const currentResult = partial.details?.results[0];
-									if (currentResult) {
-										const allResults = [...results, currentResult];
-										onUpdate({
-											content: partial.content,
-											details: makeDetails("chain")(allResults),
-										});
-									}
-								}
-							: undefined;
+						const result =
+							resolved.runtime && execution.cwd && execution.timeoutMs
+								? await runTrackedAgent(
+										taskId,
+										step.agent,
+										taskWithContext,
+										taskSummary,
+										resolved.runtime,
+										resolved.adjustment,
+										execution.cwd,
+										execution.timeoutMs,
+										i + 1,
+										chainUpdate,
+										makeChildDetails("chain"),
+									)
+								: createRuntimeFailure(
+										taskId,
+										step.agent,
+										taskWithContext,
+										taskSummary,
+										execution.error ??
+											(resolved.error ? formatRuntimeDiagnostic(resolved) : "Invalid task configuration"),
+										i + 1,
+										execution.cwd,
+										execution.timeoutMs,
+										resolved.runtime || (!execution.error && resolved.errorCode) ? resolved : undefined,
+										resolved.adjustment,
+									);
+						allResults[i] = result;
 
-						const result = resolved.runtime
-							? await runTrackedAgent(
-									taskId,
-									step.agent,
-									taskWithContext,
-									taskSummary,
-									resolved.runtime,
-									step.cwd,
-									i + 1,
-									chainUpdate,
-									makeDetails("chain"),
-								)
-							: createRuntimeFailure(
-									taskId,
-									step.agent,
-									taskWithContext,
-									taskSummary,
-									resolved.error ?? "Invalid runtime",
-									i + 1,
-								);
-						results.push(result);
-
-						const isError = isFailedResult(result);
-						if (isError) {
-							const errorMsg = getResultOutput(result);
+						if (isFailedResult(result)) {
+							for (let next = i + 1; next < allResults.length; next++) {
+								allResults[next] = {
+									...allResults[next],
+									exitCode: 1,
+									status: "skipped",
+									stderr: "Skipped because an earlier chain step did not complete",
+									errorMessage: "Skipped because an earlier chain step did not complete",
+								};
+							}
 							return {
 								content: [
-									{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` },
+									{
+										type: "text",
+										text: `${formatChainTerminalHeader(allResults)}\n\n${formatParentVisibleResults(allResults)}`,
+									},
 								],
-								details: makeDetails("chain")(results),
-								isError: true,
+								details: makeDetails("chain")(allResults),
 							};
 						}
 						previousOutput = getFinalOutput(result.messages);
 					}
 					return {
 						content: [
-							{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" },
+							{
+								type: "text",
+								text: `${formatChainTerminalHeader(allResults)}\n\n${formatParentVisibleResults(allResults)}`,
+							},
 						],
-						details: makeDetails("chain")(results),
+						details: makeDetails("chain")(allResults),
 					};
 				});
 			}
@@ -1064,47 +1734,66 @@ export default function (pi: ExtensionAPI) {
 				return await trackProgress(toolCallId, "parallel", tasks.length, async () => {
 					// Track all results for streaming updates
 					const allResults: SingleResult[] = new Array(tasks.length);
-					const resolvedRuntimes = tasks.map((task) =>
-						getRuntime(task.agent, { provider: task.provider, model: task.model, thinking: task.thinking }),
+					const resolvedRuntimes = await Promise.all(
+						tasks.map((task) =>
+							getRuntime(task.agent, {
+								provider: task.provider,
+								model: task.model,
+								thinking: task.thinking,
+								modelPolicy: task.modelPolicy,
+							}),
+						),
 					);
+					const executions = tasks.map((task) => getExecution(task.cwd, task.timeoutMs ?? params.timeoutMs));
 					const taskControllers = resolvedRuntimes.map((runtime, index) =>
-						runtime.runtime ? activeTasks.start(`${toolCallId}:${index}`) : undefined,
+						runtime.runtime && executions[index].cwd ? activeTasks.start(`${toolCallId}:${index}`) : undefined,
 					);
 
 					// Initialize placeholder results
 					for (let i = 0; i < tasks.length; i++) {
 						const runtime = resolvedRuntimes[i];
-						allResults[i] = runtime.runtime
-							? {
-									taskId: `${toolCallId}:${i}`,
-									agent: tasks[i].agent,
-									agentSource: "unknown",
-									task: tasks[i].task,
-									taskSummary: summarizeTaskForStatus(tasks[i].task),
-									exitCode: -1,
-									status: "queued",
-									messages: [],
-									stderr: "",
-									usage: {
-										input: 0,
-										output: 0,
-										cacheRead: 0,
-										cacheWrite: 0,
-										cost: 0,
-										contextTokens: 0,
-										turns: 0,
-									},
-									provider: runtime.runtime.provider,
-									model: runtime.runtime.model,
-									thinking: runtime.runtime.thinking,
-								}
-							: createRuntimeFailure(
-									`${toolCallId}:${i}`,
-									tasks[i].agent,
-									tasks[i].task,
-									tasks[i].task,
-									runtime.error ?? "Invalid runtime",
-								);
+						const execution = executions[i];
+						allResults[i] =
+							runtime.runtime && execution.cwd && execution.timeoutMs
+								? {
+										taskId: `${toolCallId}:${i}`,
+										agent: tasks[i].agent,
+										agentSource: "unknown",
+										task: tasks[i].task,
+										taskSummary: summarizeTaskForStatus(tasks[i].task),
+										exitCode: -1,
+										status: "queued",
+										cwd: execution.cwd,
+										timeoutMs: execution.timeoutMs,
+										messages: [],
+										stderr: "",
+										usage: {
+											input: 0,
+											output: 0,
+											cacheRead: 0,
+											cacheWrite: 0,
+											cost: 0,
+											contextTokens: 0,
+											turns: 0,
+										},
+										provider: runtime.runtime.provider,
+										model: runtime.runtime.model,
+										thinking: runtime.runtime.thinking,
+										thinkingAdjustment: runtime.adjustment,
+									}
+								: createRuntimeFailure(
+										`${toolCallId}:${i}`,
+										tasks[i].agent,
+										tasks[i].task,
+										tasks[i].task,
+										execution.error ??
+											(runtime.error ? formatRuntimeDiagnostic(runtime) : "Invalid task configuration"),
+										undefined,
+										execution.cwd,
+										execution.timeoutMs,
+										runtime.runtime || (!execution.error && runtime.errorCode) ? runtime : undefined,
+										runtime.adjustment,
+									);
 					}
 
 					const emitParallelUpdate = () => {
@@ -1112,12 +1801,14 @@ export default function (pi: ExtensionAPI) {
 						if (onUpdate) {
 							const queued = allResults.filter((result) => result.status === "queued").length;
 							const running = allResults.filter((result) => result.status === "running").length;
-							const done = allResults.length - queued - running;
+							const done = allResults.filter(
+								(result) => result.status !== "queued" && result.status !== "running",
+							).length;
 							onUpdate({
 								content: [
 									{
 										type: "text",
-										text: `Parallel: ${done}/${allResults.length} done, ${running} running, ${queued} queued...`,
+										text: `Parallel: ${done}/${expectedTasks} done, ${running} running, ${queued} queued...`,
 									},
 								],
 								details,
@@ -1129,46 +1820,42 @@ export default function (pi: ExtensionAPI) {
 					const results = await mapWithConcurrencyLimit(tasks, MAX_CONCURRENCY, async (t, index) => {
 						const taskId = `${toolCallId}:${index}`;
 						const resolved = resolvedRuntimes[index];
-						const result = resolved.runtime
-							? await runTrackedAgent(
-									taskId,
-									t.agent,
-									t.task,
-									t.task,
-									resolved.runtime,
-									t.cwd,
-									undefined,
-									(partial) => {
-										if (partial.details?.results[0]) {
-											allResults[index] = partial.details.results[0];
-											emitParallelUpdate();
-										}
-									},
-									makeDetails("parallel"),
-									taskControllers[index],
-								)
-							: allResults[index];
-						allResults[index] = result;
-						emitParallelUpdate();
+						const execution = executions[index];
+						const result =
+							resolved.runtime && execution.cwd && execution.timeoutMs
+								? await runTrackedAgent(
+										taskId,
+										t.agent,
+										t.task,
+										t.task,
+										resolved.runtime,
+										resolved.adjustment,
+										execution.cwd,
+										execution.timeoutMs,
+										undefined,
+										(partial) => {
+											if (partial.details?.results[0]) {
+												allResults[index] = partial.details.results[0];
+												emitParallelUpdate();
+											}
+										},
+										makeChildDetails("parallel"),
+										taskControllers[index],
+									)
+								: allResults[index];
+						if (allResults[index] !== result) {
+							allResults[index] = result;
+							emitParallelUpdate();
+						}
 						return result;
 					});
 
-					const successCount = results.filter((r) => !isFailedResult(r)).length;
-					const summaries = results.map((r) => {
-						const output = truncateParallelOutput(getResultOutput(r));
-						const status =
-							r.status === "cancelled"
-								? "cancelled"
-								: isFailedResult(r)
-									? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
-									: "completed";
-						return `### [${r.agent}] ${status}\n\n${output}`;
-					});
+					const successCount = results.filter((result) => result.status === "completed").length;
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
+								text: `Parallel: ${successCount}/${expectedTasks} succeeded\n\n${formatParentVisibleResults(results)}`,
 							},
 						],
 						details: makeDetails("parallel")(results),
@@ -1181,35 +1868,48 @@ export default function (pi: ExtensionAPI) {
 				const task = params.task;
 				return await trackProgress(toolCallId, "single", 1, async () => {
 					const taskId = `${toolCallId}:0`;
-					const resolved = getRuntime(agentName, {
+					const resolved = await getRuntime(agentName, {
 						provider: params.provider,
 						model: params.model,
 						thinking: params.thinking,
+						modelPolicy: params.modelPolicy,
 					});
-					const result = resolved.runtime
-						? await runTrackedAgent(
-								taskId,
-								agentName,
-								task,
-								task,
-								resolved.runtime,
-								params.cwd,
-								undefined,
-								onUpdate,
-								makeDetails("single"),
-							)
-						: createRuntimeFailure(taskId, agentName, task, task, resolved.error ?? "Invalid runtime");
-					const isError = isFailedResult(result);
-					if (isError) {
-						const errorMsg = getResultOutput(result);
-						return {
-							content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-							details: makeDetails("single")([result]),
-							isError: true,
-						};
-					}
+					const execution = getExecution(params.cwd, params.timeoutMs);
+					const result =
+						resolved.runtime && execution.cwd && execution.timeoutMs
+							? await runTrackedAgent(
+									taskId,
+									agentName,
+									task,
+									task,
+									resolved.runtime,
+									resolved.adjustment,
+									execution.cwd,
+									execution.timeoutMs,
+									undefined,
+									(partial) => {
+										const current = partial.details?.results[0];
+										if (!current) return;
+										const details = makeDetails("single")([current]);
+										onUpdate?.({ content: partial.content, details });
+									},
+									makeChildDetails("single"),
+								)
+							: createRuntimeFailure(
+									taskId,
+									agentName,
+									task,
+									task,
+									execution.error ??
+										(resolved.error ? formatRuntimeDiagnostic(resolved) : "Invalid task configuration"),
+									undefined,
+									execution.cwd,
+									execution.timeoutMs,
+									resolved.runtime || (!execution.error && resolved.errorCode) ? resolved : undefined,
+									resolved.adjustment,
+								);
 					return {
-						content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+						content: [{ type: "text", text: formatParentVisibleResult(result) }],
 						details: makeDetails("single")([result]),
 					};
 				});
@@ -1285,7 +1985,7 @@ export default function (pi: ExtensionAPI) {
 						const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
 						text += `${theme.fg("toolOutput", preview)}\n`;
 					} else {
-						text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
+						text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.argumentCount, theme.fg.bind(theme))}\n`;
 					}
 				}
 				return text.trimEnd();
@@ -1310,7 +2010,9 @@ export default function (pi: ExtensionAPI) {
 					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					container.addChild(new Text(header, 0, 0));
-					if (isError && r.errorMessage)
+					const preflightFailure = formatPreflightFailure(r);
+					if (preflightFailure) container.addChild(new Text(theme.fg("error", preflightFailure), 0, 0));
+					else if (isError && r.errorMessage)
 						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
 					container.addChild(new Spacer(1));
 					container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
@@ -1325,7 +2027,8 @@ export default function (pi: ExtensionAPI) {
 							if (item.type === "toolCall")
 								container.addChild(
 									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+										theme.fg("muted", "→ ") +
+											formatToolCall(item.name, item.argumentCount, theme.fg.bind(theme)),
 										0,
 										0,
 									),
@@ -1346,7 +2049,9 @@ export default function (pi: ExtensionAPI) {
 
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
+				const preflightFailure = formatPreflightFailure(r);
+				if (preflightFailure) text += `\n${theme.fg("error", preflightFailure)}`;
+				else if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
 				else if (displayItems.length === 0) {
 					text += `\n${theme.fg("muted", isPending ? `(${r.status}...)` : "(no output)")}`;
 				} else {
@@ -1414,13 +2119,16 @@ export default function (pi: ExtensionAPI) {
 							),
 						);
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+						const preflightFailure = formatPreflightFailure(r);
+						if (preflightFailure) container.addChild(new Text(theme.fg("error", preflightFailure), 0, 0));
 
 						// Show tool calls
 						for (const item of displayItems) {
 							if (item.type === "toolCall") {
 								container.addChild(
 									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+										theme.fg("muted", "→ ") +
+											formatToolCall(item.name, item.argumentCount, theme.fg.bind(theme)),
 										0,
 										0,
 									),
@@ -1460,8 +2168,10 @@ export default function (pi: ExtensionAPI) {
 								? theme.fg("success", "✓")
 								: theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
+					const preflightFailure = formatPreflightFailure(r);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+					if (preflightFailure) text += `\n${theme.fg("error", preflightFailure)}`;
+					else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}
 				const usageStr = formatUsageStats(aggregateUsage(details.results));
@@ -1473,17 +2183,31 @@ export default function (pi: ExtensionAPI) {
 			if (details.mode === "parallel") {
 				const queued = details.results.filter((result) => result.status === "queued").length;
 				const running = details.results.filter((result) => result.status === "running").length;
-				const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
-				const failCount = details.results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
+				const expectedTasks = Math.max(0, Math.floor(details.expectedTasks));
+				const successCount = Math.min(
+					expectedTasks,
+					details.results.filter((result) => result.status === "completed").length,
+				);
+				const terminalCount = Math.min(
+					expectedTasks,
+					details.results.filter((result) => result.status !== "queued" && result.status !== "running").length,
+				);
+				const unsuccessfulCount = Math.min(
+					expectedTasks,
+					details.results.filter(
+						(result) =>
+							result.status !== "queued" && result.status !== "running" && result.status !== "completed",
+					).length,
+				);
 				const isRunning = queued > 0 || running > 0;
 				const icon = isRunning
 					? theme.fg("warning", "⏳")
-					: failCount > 0
+					: unsuccessfulCount > 0
 						? theme.fg("warning", "◐")
 						: theme.fg("success", "✓");
 				const status = isRunning
-					? `${successCount + failCount}/${details.results.length} done, ${running} running, ${queued} queued`
-					: `${successCount}/${details.results.length} tasks`;
+					? `${terminalCount}/${expectedTasks} done, ${running} running, ${queued} queued`
+					: `${successCount}/${expectedTasks} succeeded`;
 
 				if (expanded && !isRunning) {
 					const container = new Container();
@@ -1496,7 +2220,7 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+						const rIcon = r.status === "completed" ? theme.fg("success", "✓") : theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -1505,13 +2229,16 @@ export default function (pi: ExtensionAPI) {
 							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
 						);
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+						const preflightFailure = formatPreflightFailure(r);
+						if (preflightFailure) container.addChild(new Text(theme.fg("error", preflightFailure), 0, 0));
 
 						// Show tool calls
 						for (const item of displayItems) {
 							if (item.type === "toolCall") {
 								container.addChild(
 									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+										theme.fg("muted", "→ ") +
+											formatToolCall(item.name, item.argumentCount, theme.fg.bind(theme)),
 										0,
 										0,
 									),
@@ -1545,12 +2272,14 @@ export default function (pi: ExtensionAPI) {
 							? theme.fg("muted", "○")
 							: r.status === "running"
 								? theme.fg("warning", "⏳")
-								: isFailedResult(r)
-									? theme.fg("error", "✗")
-									: theme.fg("success", "✓");
+								: r.status === "completed"
+									? theme.fg("success", "✓")
+									: theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
+					const preflightFailure = formatPreflightFailure(r);
 					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0) {
+					if (preflightFailure) text += `\n${theme.fg("error", preflightFailure)}`;
+					else if (displayItems.length === 0) {
 						const emptyLabel =
 							r.status === "queued" ? "(queued...)" : r.status === "running" ? "(running...)" : "(no output)";
 						text += `\n${theme.fg("muted", emptyLabel)}`;

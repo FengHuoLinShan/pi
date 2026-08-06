@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bindProcessAbort, TaskControllerRegistry } from "../examples/extensions/subagent/task-control.ts";
+import {
+	bindProcessAbort,
+	classifyProcessCompletion,
+	TaskControllerRegistry,
+} from "../examples/extensions/subagent/task-control.ts";
 
 describe("subagent task control", () => {
 	afterEach(() => {
@@ -54,7 +58,24 @@ describe("subagent task control", () => {
 		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
 	});
 
-	it("does not escalate after the child closes", () => {
+	it("times out a hung process with SIGTERM then SIGKILL", () => {
+		vi.useFakeTimers();
+		const signals: NodeJS.Signals[] = [];
+		const process = {
+			kill: (signal: NodeJS.Signals) => {
+				signals.push(signal);
+				return true;
+			},
+		};
+		const binding = bindProcessAbort(process, undefined, undefined, 5, 10);
+		vi.advanceTimersByTime(10);
+		expect(binding.getSource()).toBe("timeout");
+		expect(signals).toEqual(["SIGTERM"]);
+		vi.advanceTimersByTime(5);
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+	});
+
+	it("keeps user cancellation distinct when it wins the timeout race", () => {
 		vi.useFakeTimers();
 		const signals: NodeJS.Signals[] = [];
 		const process = {
@@ -64,10 +85,76 @@ describe("subagent task control", () => {
 			},
 		};
 		const task = new AbortController();
-		const binding = bindProcessAbort(process, undefined, task.signal, 5000);
+		const binding = bindProcessAbort(process, undefined, task.signal, 5, 10);
+		task.abort();
+		vi.advanceTimersByTime(10);
+		expect(binding.getSource()).toBe("task");
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+	});
+
+	it("does not classify cancellation when initial termination fails", () => {
+		vi.useFakeTimers();
+		const signals: NodeJS.Signals[] = [];
+		const task = new AbortController();
+		const binding = bindProcessAbort(
+			{
+				kill: (signal: NodeJS.Signals) => {
+					signals.push(signal);
+					return false;
+				},
+			},
+			undefined,
+			task.signal,
+			5,
+			10,
+		);
+		task.abort();
+		expect(binding.getSource()).toBeUndefined();
+		expect(classifyProcessCompletion(0, binding.getSource())).toBe("completed");
+		expect(signals).toEqual(["SIGTERM"]);
+		binding.close();
+		vi.runAllTimers();
+		expect(signals).toEqual(["SIGTERM"]);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("preserves process-tree escalation after direct-child wait completes", () => {
+		vi.useFakeTimers();
+		const signals: NodeJS.Signals[] = [];
+		const process = {
+			kill: (signal: NodeJS.Signals) => {
+				signals.push(signal);
+				return true;
+			},
+		};
+		const task = new AbortController();
+		const binding = bindProcessAbort(process, undefined, task.signal, 5000, 10_000);
 		task.abort();
 		binding.close();
+		expect(vi.getTimerCount()).toBe(1);
 		vi.advanceTimersByTime(5000);
-		expect(signals).toEqual(["SIGTERM"]);
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("clears deadline and escalation timers after normal completion", () => {
+		vi.useFakeTimers();
+		const signals: NodeJS.Signals[] = [];
+		const binding = bindProcessAbort(
+			{
+				kill: (signal: NodeJS.Signals) => {
+					signals.push(signal);
+					return true;
+				},
+			},
+			undefined,
+			undefined,
+			5000,
+			10_000,
+		);
+		binding.close();
+		expect(vi.getTimerCount()).toBe(0);
+		vi.runAllTimers();
+		expect(signals).toEqual([]);
 	});
 });

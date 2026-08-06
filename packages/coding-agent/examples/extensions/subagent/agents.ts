@@ -6,7 +6,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import { type AgentRuntimeFieldErrors, isThinkingLevel } from "./runtime-config.ts";
+import { type AgentRuntimeFieldErrors, isModelPolicy, isThinkingLevel, type ModelPolicy } from "./runtime-config.ts";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -17,6 +17,7 @@ export interface AgentConfig {
 	provider?: string;
 	model?: string;
 	thinking?: ThinkingLevel;
+	modelPolicy?: ModelPolicy;
 	configError?: string;
 	runtimeErrors?: AgentRuntimeFieldErrors;
 	systemPrompt: string;
@@ -92,6 +93,11 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 		if (frontmatter.thinking !== undefined && !isThinkingLevel(thinkingValue)) {
 			runtimeErrors.thinking = `Agent "${name}" has invalid thinking level "${String(frontmatter.thinking)}"`;
 		}
+		const modelPolicyValue = typeof frontmatter.modelPolicy === "string" ? frontmatter.modelPolicy.trim() : undefined;
+		const modelPolicy = isModelPolicy(modelPolicyValue) ? modelPolicyValue : undefined;
+		if (frontmatter.modelPolicy !== undefined && !isModelPolicy(modelPolicyValue)) {
+			runtimeErrors.modelPolicy = `Agent "${name}" has invalid model policy "${String(frontmatter.modelPolicy)}"`;
+		}
 		agents.push({
 			name,
 			description,
@@ -99,6 +105,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			provider,
 			model,
 			thinking,
+			modelPolicy,
 			configError,
 			runtimeErrors: Object.keys(runtimeErrors).length > 0 ? runtimeErrors : undefined,
 			systemPrompt: body,
