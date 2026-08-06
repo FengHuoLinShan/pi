@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import {
 	type CurrentWorkingSetSource,
 	type PreparedWorkingSet,
@@ -10,6 +10,7 @@ import {
 	type WorkingSetSnapshot,
 } from "@earendil-works/pi-agent-core";
 import type { SessionEntry } from "./session-manager.ts";
+import { captureFilePathSnapshot, revalidateFilePathSnapshot } from "./tools/file-transaction.ts";
 import type { WorkspaceView } from "./workspace-view.ts";
 
 export const WORKING_SET_ENTRY_TYPE = "working-set-state-v1";
@@ -20,11 +21,6 @@ export type WorkingSetSourceResolver = (
 	paths: readonly string[],
 	signal?: AbortSignal,
 ) => Promise<readonly CurrentWorkingSetSource[]>;
-
-function isInside(root: string, candidate: string): boolean {
-	const path = relative(root, candidate);
-	return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
-}
 
 function isMissingFileError(error: unknown): boolean {
 	return error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR");
@@ -40,17 +36,15 @@ export const localWorkingSetSourceResolver: WorkingSetSourceResolver = async (wo
 	for (const path of paths) {
 		signal?.throwIfAborted();
 		const candidate = resolve(root, path);
-		if (!isInside(root, candidate)) throw new Error(`Working set source escapes the logical workspace: ${path}`);
-		let resolved: string;
+		const snapshot = await captureFilePathSnapshot(candidate, path, [root], realpath, true);
+		let content: Buffer;
 		try {
-			resolved = await realpath(candidate);
+			content = await readFile(snapshot.targetPath);
 		} catch (error) {
 			if (isMissingFileError(error)) continue;
 			throw error;
 		}
-		if (!isInside(root, resolved))
-			throw new Error(`Working set source resolves outside the logical workspace: ${path}`);
-		const content = await readFile(resolved);
+		await revalidateFilePathSnapshot(snapshot, path, [root], realpath);
 		result.push({
 			path,
 			revision: `sha256:${createHash("sha256").update(content).digest("hex")}`,

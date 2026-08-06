@@ -2,12 +2,19 @@ import { randomUUID } from "node:crypto";
 import {
 	type AgentMessage,
 	type CompletionStatus,
-	createWorkingSet,
-	RevisionAwareWorkingSet,
-	type WorkingSetEntryKind,
+	createEngineeringMemory,
+	type EngineeringMemoryKind,
+	type EngineeringMemoryRecord,
+	type EngineeringMemoryRecordInput,
+	RevisionedEngineeringMemory,
 } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, StopReason } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import {
+	prepareWorkspaceEngineeringMemory,
+	resolveWorkspaceMemorySources,
+	SessionEngineeringMemoryStore,
+} from "../../core/engineering-memory-session.ts";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/index.ts";
 import {
 	type GoalCompletionPlan,
@@ -15,19 +22,28 @@ import {
 	loadGoalCompletionPlan,
 	verifyGoalCompletion,
 } from "../../core/goal-completion.ts";
+import {
+	collectGitChangedPaths,
+	getImpactGraphProvider,
+	type ImpactVerificationCatalogPlan,
+	type ImpactVerificationCoverage,
+	type ImpactVerificationResult,
+	loadImpactVerificationCatalog,
+	verifyImpactPlan,
+} from "../../core/impact-verification.ts";
 import type { SessionEntry } from "../../core/session-manager.ts";
 import {
 	cancelWorkGraph,
 	consumeWorkNodeBudget,
 	createWorkGraph,
 	recordWorkNodeProgress,
+	recoverWorkGraph,
 	reopenWorkNode,
 	transitionWorkNode,
 	type WorkGraph,
 	type WorkNode,
 } from "../../core/work-graph.ts";
 import { SessionWorkGraphStore } from "../../core/work-graph-session.ts";
-import { prepareWorkspaceWorkingSet, SessionWorkingSetStore } from "../../core/working-set-session.ts";
 import { stripAnsi } from "../../utils/ansi.ts";
 
 const GOAL_ENTRY_TYPE = "goal-mode-state-v1";
@@ -40,9 +56,12 @@ const MAX_OBJECTIVE_LENGTH = 8_000;
 const MAX_NOTE_LENGTH = 2_000;
 const DISPLAY_OBJECTIVE_LENGTH = 180;
 const DISPLAY_NOTE_LENGTH = 240;
+const MAX_DISPLAY_MEMORY_RECORDS = 20;
 const MAX_COMPLETION_CHECKS = 10;
+const MAX_IMPACT_CHECKS = 100;
 const CHECK_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const GOAL_WORK_NODE_ID = "work";
+const GOAL_IMPACT_NODE_ID = "verify:impact";
 const GOAL_COMPLETE_NODE_ID = "complete";
 
 const GoalToolParams = Type.Object(
@@ -50,10 +69,40 @@ const GoalToolParams = Type.Object(
 		action: Type.Union([
 			Type.Literal("status"),
 			Type.Literal("update"),
+			Type.Literal("remember"),
 			Type.Literal("complete"),
 			Type.Literal("blocked"),
 		]),
 		note: Type.Optional(Type.String({ maxLength: MAX_NOTE_LENGTH })),
+		memoryKind: Type.Optional(
+			Type.Union([
+				Type.Literal("fact"),
+				Type.Literal("decision"),
+				Type.Literal("attempt"),
+				Type.Literal("evidence"),
+			]),
+		),
+		sources: Type.Optional(
+			Type.Array(
+				Type.Object(
+					{
+						path: Type.String({ minLength: 1, maxLength: 4_096 }),
+						symbol: Type.Optional(Type.String({ minLength: 1, maxLength: 4_096 })),
+					},
+					{ additionalProperties: false },
+				),
+				{ maxItems: 64 },
+			),
+		),
+		replaces: Type.Optional(Type.Array(Type.String({ pattern: "^sha256:[0-9a-f]{64}$" }), { maxItems: 64 })),
+		evidenceIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4_096 }), { maxItems: 64 })),
+		rationale: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_NOTE_LENGTH })),
+		alternatives: Type.Optional(
+			Type.Array(Type.String({ minLength: 1, maxLength: MAX_NOTE_LENGTH }), { maxItems: 64 }),
+		),
+		outcome: Type.Optional(
+			Type.Union([Type.Literal("succeeded"), Type.Literal("failed"), Type.Literal("inconclusive")]),
+		),
 	},
 	{ additionalProperties: false },
 );
@@ -76,6 +125,17 @@ export interface GoalVerificationState {
 	checks: GoalVerificationCheckState[];
 }
 
+export interface GoalImpactVerificationState {
+	catalogRevision: string;
+	status: GoalVerificationStatus;
+	checkedAt?: string;
+	coverage?: ImpactVerificationCoverage;
+	changedFileCount: number;
+	affectedFileCount: number;
+	selectedCheckIds: string[];
+	evidenceId?: string;
+}
+
 export interface GoalState {
 	version: 1;
 	id: string;
@@ -87,6 +147,7 @@ export interface GoalState {
 	updatedAt: string;
 	note?: string;
 	verification?: GoalVerificationState;
+	impactVerification?: GoalImpactVerificationState;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -148,8 +209,49 @@ function parseGoalVerificationState(value: unknown): GoalVerificationState | und
 	};
 }
 
+function parseGoalImpactVerificationState(value: unknown): GoalImpactVerificationState | undefined {
+	if (
+		!isRecord(value) ||
+		typeof value.catalogRevision !== "string" ||
+		!/^sha256:[0-9a-f]{64}$/.test(value.catalogRevision) ||
+		!isGoalVerificationStatus(value.status) ||
+		(value.checkedAt !== undefined &&
+			(typeof value.checkedAt !== "string" || !Number.isFinite(Date.parse(value.checkedAt)))) ||
+		(value.coverage !== undefined &&
+			value.coverage !== "complete" &&
+			value.coverage !== "fallback" &&
+			value.coverage !== "uncovered") ||
+		!Number.isSafeInteger(value.changedFileCount) ||
+		(value.changedFileCount as number) < 0 ||
+		!Number.isSafeInteger(value.affectedFileCount) ||
+		(value.affectedFileCount as number) < 0 ||
+		!Array.isArray(value.selectedCheckIds) ||
+		value.selectedCheckIds.length > MAX_IMPACT_CHECKS ||
+		!value.selectedCheckIds.every((id) => typeof id === "string" && CHECK_ID_PATTERN.test(id)) ||
+		new Set(value.selectedCheckIds).size !== value.selectedCheckIds.length ||
+		(value.evidenceId !== undefined &&
+			(typeof value.evidenceId !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.evidenceId)))
+	) {
+		return undefined;
+	}
+	for (let index = 0; index < value.selectedCheckIds.length; index++) {
+		if (!(index in value.selectedCheckIds)) return undefined;
+	}
+	return {
+		catalogRevision: value.catalogRevision,
+		status: value.status,
+		...(value.checkedAt === undefined ? {} : { checkedAt: value.checkedAt as string }),
+		...(value.coverage === undefined ? {} : { coverage: value.coverage as ImpactVerificationCoverage }),
+		changedFileCount: value.changedFileCount as number,
+		affectedFileCount: value.affectedFileCount as number,
+		selectedCheckIds: [...value.selectedCheckIds],
+		...(value.evidenceId === undefined ? {} : { evidenceId: value.evidenceId as string }),
+	};
+}
+
 export function parseGoalState(value: unknown): GoalState | undefined {
 	const verification = isRecord(value) ? parseGoalVerificationState(value.verification) : undefined;
+	const impactVerification = isRecord(value) ? parseGoalImpactVerificationState(value.impactVerification) : undefined;
 	if (
 		!isRecord(value) ||
 		value.version !== 1 ||
@@ -171,7 +273,8 @@ export function parseGoalState(value: unknown): GoalState | undefined {
 		typeof value.updatedAt !== "string" ||
 		!Number.isFinite(Date.parse(value.updatedAt)) ||
 		(value.note !== undefined && (typeof value.note !== "string" || value.note.length > MAX_NOTE_LENGTH)) ||
-		(value.verification !== undefined && verification === undefined)
+		(value.verification !== undefined && verification === undefined) ||
+		(value.impactVerification !== undefined && impactVerification === undefined)
 	) {
 		return undefined;
 	}
@@ -186,6 +289,7 @@ export function parseGoalState(value: unknown): GoalState | undefined {
 		updatedAt: value.updatedAt as string,
 		...(value.note === undefined ? {} : { note: value.note as string }),
 		...(verification === undefined ? {} : { verification }),
+		...(impactVerification === undefined ? {} : { impactVerification }),
 	};
 }
 
@@ -217,7 +321,37 @@ function formatElapsed(createdAt: string): string {
 	return `${elapsedHours}h`;
 }
 
-function formatStatus(state: GoalState): string {
+export function formatGoalWorkGraph(graph: WorkGraph): string[] {
+	const count = (status: WorkNode["status"]) => graph.nodes.filter((node) => node.status === status).length;
+	const lines = [
+		`Work graph r${graph.revision} · ${count("succeeded")}/${graph.nodes.length} succeeded · ${count("running")} running · ${count("ready")} ready`,
+	];
+	const visibleNodes = graph.nodes.filter(
+		(node) =>
+			node.status === "running" ||
+			node.status === "ready" ||
+			node.status === "failed" ||
+			node.status === "blocked" ||
+			node.status === "paused",
+	);
+	for (const node of visibleNodes.slice(0, 5)) {
+		const budget = node.budget ? ` · ${node.budget.unit} ${node.budget.used}/${node.budget.limit}` : "";
+		const summary = node.lastSummary ? ` · ${displayText(node.lastSummary, 100)}` : "";
+		lines.push(`${node.status} ${node.id} [${node.policy}]${budget}${summary}`);
+	}
+	if (visibleNodes.length > 5) lines.push(`… ${visibleNodes.length - 5} more active nodes`);
+	if (graph.leases.length > 0) {
+		lines.push(
+			`Leases: ${graph.leases
+				.slice(0, 4)
+				.map((lease) => `${lease.mode}:${lease.resource}`)
+				.join(", ")}${graph.leases.length > 4 ? `, +${graph.leases.length - 4}` : ""}`,
+		);
+	}
+	return lines;
+}
+
+function formatStatus(state: GoalState, graph?: WorkGraph): string {
 	const lines = [
 		`Goal ${state.status} · turns ${state.turns}/${state.turnLimit} · elapsed ${formatElapsed(state.createdAt)}`,
 		`Objective: ${displayText(state.objective, DISPLAY_OBJECTIVE_LENGTH)}`,
@@ -228,10 +362,16 @@ function formatStatus(state: GoalState): string {
 			`Completion gate: ${state.verification.status} · ${state.verification.checkIds.join(", ")} · ${state.verification.configRevision.slice(0, 15)}…`,
 		);
 	}
+	if (state.impactVerification) {
+		lines.push(
+			`Impact gate: ${state.impactVerification.status} · ${state.impactVerification.coverage ?? "pending"} · ${state.impactVerification.selectedCheckIds.length} check(s)`,
+		);
+	}
+	if (graph) lines.push(...formatGoalWorkGraph(graph));
 	return lines.join("\n");
 }
 
-function updateUi(ctx: ExtensionContext, state: GoalState | undefined): void {
+function updateUi(ctx: ExtensionContext, state: GoalState | undefined, graph?: WorkGraph): void {
 	if (!state || state.status === "completed" || state.status === "stopped") {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
@@ -244,7 +384,7 @@ function updateUi(ctx: ExtensionContext, state: GoalState | undefined): void {
 				? "goal blocked"
 				: "goal paused";
 	ctx.ui.setStatus(STATUS_KEY, status);
-	ctx.ui.setWidget(WIDGET_KEY, formatStatus(state).split("\n"));
+	ctx.ui.setWidget(WIDGET_KEY, formatStatus(state, graph).split("\n"));
 }
 
 function findLastAssistant(messages: readonly AgentMessage[]): AssistantMessage | undefined {
@@ -260,9 +400,36 @@ function normalizeNote(value: string | undefined): string | undefined {
 	return note ? note : undefined;
 }
 
-function buildAgentInstruction(state: GoalState): string {
+function formatEngineeringMemory(snapshot: ReturnType<SessionEngineeringMemoryStore["get"]>): string {
+	if (!snapshot) return "No engineering memory exists in the current session branch.";
+	const memory = new RevisionedEngineeringMemory(snapshot);
+	const history = memory.history();
+	const lines = [
+		`Engineering memory r${history.memoryRevision}: ${history.activeRecordIds.length} active, ${history.supersededRecordIds.length} superseded`,
+	];
+	const activeRecords = memory.activeRecords();
+	for (const record of activeRecords.slice(0, MAX_DISPLAY_MEMORY_RECORDS)) {
+		const content = record.content.replace(/\s+/g, " ").trim();
+		const summary = content.length > DISPLAY_NOTE_LENGTH ? `${content.slice(0, DISPLAY_NOTE_LENGTH - 1)}…` : content;
+		lines.push(`- ${record.kind} ${record.id.slice(0, 15)}… ${summary}`);
+	}
+	if (activeRecords.length > MAX_DISPLAY_MEMORY_RECORDS) {
+		lines.push(`… ${activeRecords.length - MAX_DISPLAY_MEMORY_RECORDS} more active records`);
+	}
+	return lines.join("\n");
+}
+
+function buildAgentInstruction(state: GoalState, graph?: WorkGraph): string {
 	const completionGate = state.verification
 		? `\n- The trusted completion gate is locked to checks: ${state.verification.checkIds.join(", ")}. Calling "complete" runs that frozen gate in the current logical workspace. The goal completes only when every check passes; repair failures and retry.`
+		: "";
+	const impactGate = state.impactVerification
+		? '\n- The revision-locked impact gate is mandatory. Calling "complete" discovers the full Git change set, synchronizes the active CodeGraph provider, selects coverage from .pi/checks.json, and fails closed on missing graph coverage or failed checks.'
+		: "";
+	const workGraph = graph
+		? `\n\nCurrent durable work graph:\n${formatGoalWorkGraph(graph)
+				.map((line) => `- ${line}`)
+				.join("\n")}`
 		: "";
 	return `## Goal mode
 
@@ -274,17 +441,18 @@ This goal is active. Continue working autonomously until the objective is genuin
 Required protocol:
 - Make concrete progress in every turn. Inspect and verify real state instead of assuming.
 - Use the goal tool with action "update" when a concise progress checkpoint will help preserve state.
+- Use the goal tool with action "remember" to preserve source-revisioned facts, explicit decisions, failed attempts, and evidence. Replace obsolete records instead of silently contradicting them.
 - Before claiming success, verify the requested result in proportion to risk.
-- Call the goal tool with action "complete" and a concise evidence-based summary only when the full objective is achieved.${completionGate}
+- Call the goal tool with action "complete" and a concise evidence-based summary only when the full objective is achieved.${completionGate}${impactGate}
 - Call the goal tool with action "blocked" and a concrete reason only when you cannot make meaningful progress without user input or an external state change.
 - Do not treat a normal assistant response as goal completion. If work remains, leave the goal active; Pi will schedule another continuation.
 
 Current progress: ${state.note ?? "(none recorded)"}
-Turns used in this activation budget: ${state.turns}/${state.turnLimit}`;
+Turns used in this activation budget: ${state.turns}/${state.turnLimit}${workGraph}`;
 }
 
-function toolText(state: GoalState): string {
-	return formatStatus(state);
+function toolText(state: GoalState, graph?: WorkGraph): string {
+	return formatStatus(state, graph);
 }
 
 function pendingVerification(plan: GoalCompletionPlan): GoalVerificationState {
@@ -294,6 +462,32 @@ function pendingVerification(plan: GoalCompletionPlan): GoalVerificationState {
 		checkIds,
 		status: "pending",
 		checks: checkIds.map((id) => ({ id, status: "pending", exitCode: null, killed: false })),
+	};
+}
+
+function pendingImpactVerification(plan: ImpactVerificationCatalogPlan): GoalImpactVerificationState {
+	return {
+		catalogRevision: plan.configRevision,
+		status: "pending",
+		changedFileCount: 0,
+		affectedFileCount: 0,
+		selectedCheckIds: [],
+	};
+}
+
+function persistedImpactVerification(
+	plan: ImpactVerificationCatalogPlan,
+	result: ImpactVerificationResult,
+): GoalImpactVerificationState {
+	return {
+		catalogRevision: plan.configRevision,
+		status: result.status,
+		checkedAt: new Date().toISOString(),
+		coverage: result.plan.coverage,
+		changedFileCount: result.plan.impact.changedFiles.length,
+		affectedFileCount: result.plan.impact.affectedFiles.length,
+		selectedCheckIds: result.plan.selected.map(({ check }) => check.id),
+		evidenceId: result.evidence.id,
 	};
 }
 
@@ -342,9 +536,10 @@ function createGoalWorkGraph(
 	id: string,
 	objective: string,
 	completionPlan: GoalCompletionPlan | undefined,
+	impactPlan: ImpactVerificationCatalogPlan | undefined,
 	now: string,
 ): WorkGraph {
-	const verificationNodes =
+	const configuredVerificationNodes =
 		completionPlan?.checks.map((check) => ({
 			id: verificationNodeId(check.id),
 			kind: "verification" as const,
@@ -353,6 +548,19 @@ function createGoalWorkGraph(
 			dependsOn: [GOAL_WORK_NODE_ID],
 			budget: { unit: "attempt" as const, limit: MAX_TOTAL_TURNS },
 		})) ?? [];
+	const verificationNodes = impactPlan
+		? [
+				...configuredVerificationNodes,
+				{
+					id: GOAL_IMPACT_NODE_ID,
+					kind: "verification" as const,
+					policy: "verification" as const,
+					description: "Run CodeGraph-driven impact verification",
+					dependsOn: [GOAL_WORK_NODE_ID],
+					budget: { unit: "attempt" as const, limit: MAX_TOTAL_TURNS },
+				},
+			]
+		: configuredVerificationNodes;
 	return createWorkGraph({
 		id,
 		objective,
@@ -439,6 +647,8 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	let state: GoalState | undefined;
 	let runtimeArmed = false;
 	let lastStopReason: StopReason | undefined;
+	let goalMutationInFlight = false;
+	let goalMutationEpoch = 0;
 
 	function graphStore(ctx: ExtensionContext): SessionWorkGraphStore {
 		return new SessionWorkGraphStore(
@@ -447,39 +657,54 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		);
 	}
 
-	function workingSetStore(ctx: ExtensionContext): SessionWorkingSetStore {
-		return new SessionWorkingSetStore(
+	function engineeringMemoryStore(ctx: ExtensionContext): SessionEngineeringMemoryStore {
+		return new SessionEngineeringMemoryStore(
 			() => ctx.sessionManager.getBranch(),
 			(customType, data) => pi.appendEntry(customType, data),
 		);
 	}
 
-	function appendGoalWorkingSet(
-		ctx: ExtensionContext,
-		kind: WorkingSetEntryKind,
-		content: string,
-	): string | undefined {
+	function currentGoalGraph(ctx: ExtensionContext): WorkGraph | undefined {
 		if (!state) return undefined;
 		try {
-			const store = workingSetStore(ctx);
-			const snapshot = store.get(state.id);
-			if (!snapshot) return undefined;
-			const workingSet = new RevisionAwareWorkingSet(snapshot);
-			workingSet.append({
-				id: `goal:${kind}:${snapshot.revision + 1}`,
-				kind,
-				content,
-				priority: kind === "evidence" ? 100 : kind === "decision" ? 50 : 0,
-				required: false,
-				tags: ["goal"],
-				sources: [],
-				evidenceIds: [],
-				createdAt: new Date().toISOString(),
-			});
-			store.save(workingSet.snapshot(), snapshot.revision);
+			return graphStore(ctx).get(state.id);
+		} catch {
+			return undefined;
+		}
+	}
+
+	function recoverGoalGraph(ctx: ExtensionContext): string | undefined {
+		if (!state) return undefined;
+		try {
+			const store = graphStore(ctx);
+			const current = store.get(state.id);
+			if (!current) return `Work graph ${state.id} does not exist`;
+			const recovered = recoverWorkGraph(current, new Date().toISOString());
+			if (recovered.revision !== current.revision) store.save(recovered, current.revision);
 			return undefined;
 		} catch (error) {
 			return error instanceof Error ? error.message : String(error);
+		}
+	}
+
+	function appendGoalMemory(
+		ctx: ExtensionContext,
+		input: Omit<EngineeringMemoryRecordInput, "createdAt">,
+	): { record?: EngineeringMemoryRecord; error?: string } {
+		if (!state) return { error: "No goal exists in the current session branch" };
+		try {
+			const store = engineeringMemoryStore(ctx);
+			const snapshot = store.get(state.id);
+			if (!snapshot) return { error: `Engineering memory ${state.id} does not exist` };
+			const memory = new RevisionedEngineeringMemory(snapshot);
+			const record = memory.append({
+				...input,
+				createdAt: new Date().toISOString(),
+			});
+			if (memory.snapshot().revision !== snapshot.revision) store.save(memory.snapshot(), snapshot.revision);
+			return { record };
+		} catch (error) {
+			return { error: error instanceof Error ? error.message : String(error) };
 		}
 	}
 
@@ -491,7 +716,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		try {
 			const store = graphStore(ctx);
 			const current = store.get(state.id);
-			if (!current) return {};
+			if (!current) return { error: `Work graph ${state.id} does not exist` };
 			const next = mutate(current);
 			if (next.revision !== current.revision) store.save(next, current.revision);
 			return { graph: next };
@@ -507,7 +732,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			return error instanceof Error ? error.message : String(error);
 		}
 		state = nextState;
-		updateUi(ctx, state);
+		updateUi(ctx, state, currentGoalGraph(ctx));
 		return undefined;
 	}
 
@@ -518,9 +743,10 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		options: {
 			extendTurnLimit?: boolean;
 			verification?: GoalVerificationState;
+			impactVerification?: GoalImpactVerificationState;
 			syncGraph?: boolean;
-			syncWorkingSet?: boolean;
-			workingSetKind?: WorkingSetEntryKind;
+			syncMemory?: boolean;
+			memoryKind?: EngineeringMemoryKind;
 		} = {},
 	): string | undefined {
 		if (!state) return "No goal exists in the current session branch";
@@ -529,14 +755,21 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			const graphResult = mutateGoalGraph(ctx, (graph) => syncGoalWorkGraph(graph, status, note, now));
 			if (graphResult.error) return `Work graph could not be persisted: ${graphResult.error}`;
 		}
-		if (note && options.syncWorkingSet !== false) {
-			const workingSetError = appendGoalWorkingSet(
-				ctx,
-				options.workingSetKind ??
+		if (note && options.syncMemory !== false) {
+			const memoryResult = appendGoalMemory(ctx, {
+				kind:
+					options.memoryKind ??
 					(status === "completed" ? "evidence" : status === "paused" ? "decision" : "attempt"),
-				note,
-			);
-			if (workingSetError) return `Working set could not be persisted: ${workingSetError}`;
+				content: note,
+				priority: status === "completed" ? 100 : status === "paused" ? 50 : 0,
+				required: false,
+				tags: ["goal"],
+				sources: [],
+				evidenceIds: [],
+				replaces: [],
+				alternatives: [],
+			});
+			if (memoryResult.error) return `Engineering memory could not be persisted: ${memoryResult.error}`;
 		}
 		const turnLimit = options.extendTurnLimit
 			? Math.min(MAX_TOTAL_TURNS, Math.max(state.turnLimit, state.turns + DEFAULT_TURN_BATCH))
@@ -548,14 +781,15 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			updatedAt: now,
 			note,
 			verification: options.verification ?? state.verification,
+			impactVerification: options.impactVerification ?? state.impactVerification,
 		});
 	}
 
-	function queueGoalTurn(current: GoalState): void {
+	function queueGoalTurn(current: GoalState, ctx: ExtensionContext): void {
 		pi.sendMessage(
 			{
 				customType: GOAL_CONTEXT_TYPE,
-				content: buildAgentInstruction(current),
+				content: buildAgentInstruction(current, currentGoalGraph(ctx)),
 				display: false,
 				details: { goalId: current.id, turn: current.turns + 1 },
 			},
@@ -611,14 +845,52 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		return graphResult.error;
 	}
 
+	function recordImpactCheck(
+		ctx: ExtensionContext,
+		status: CompletionStatus,
+		summary: string,
+		evidenceId?: string,
+	): string | undefined {
+		const now = new Date().toISOString();
+		const graphResult = mutateGoalGraph(ctx, (graph) => {
+			let next = graph;
+			const work = requireGoalWorkNode(next);
+			if (work.status !== "succeeded") {
+				next = ensureGoalWorkRunning(next, now);
+				next = transitionWorkNode(next, GOAL_WORK_NODE_ID, "succeeded", {
+					summary: "Implementation submitted to impact verification",
+					now,
+				});
+			}
+			const node = next.nodes.find((candidate) => candidate.id === GOAL_IMPACT_NODE_ID);
+			if (!node) throw new Error(`Goal work graph is missing completion node ${GOAL_IMPACT_NODE_ID}`);
+			if (node.status !== "ready") {
+				throw new Error(`Completion node ${GOAL_IMPACT_NODE_ID} is ${node.status}, expected ready`);
+			}
+			next = transitionWorkNode(next, node.id, "running", { now });
+			return transitionWorkNode(
+				next,
+				node.id,
+				status === "pass" ? "succeeded" : status === "blocked" ? "blocked" : "failed",
+				{
+					summary,
+					evidence: evidenceId ? [{ id: evidenceId, kind: "impact", summary }] : undefined,
+					now,
+				},
+			);
+		});
+		return graphResult.error;
+	}
+
 	pi.registerTool({
 		name: "goal",
 		label: "Goal",
 		description:
-			"Report goal-mode status or progress. Only the user can start a goal. Use complete only after verifying the full objective; use blocked only when progress requires user input or an external state change.",
-		promptSnippet: "Report progress, completion, or a genuine blocker for an active /goal workflow",
+			"Report goal-mode status or progress and record revisioned engineering facts, decisions, attempts, or evidence. Only the user can start a goal. Use complete only after verifying the full objective; use blocked only when progress requires user input or an external state change.",
+		promptSnippet: "Report progress, preserve engineering memory, complete, or identify a genuine blocker",
 		promptGuidelines: [
 			"While goal mode is active, call goal complete only after verification, or goal blocked only when external input or state is required.",
+			"Use goal remember for durable facts, decisions, failed attempts, and evidence; facts require current source paths and changed conclusions should replace prior record ids.",
 		],
 		parameters: GoalToolParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -630,7 +902,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			}
 			if (params.action === "status") {
 				return {
-					content: [{ type: "text", text: toolText(state) }],
+					content: [{ type: "text", text: toolText(state, currentGoalGraph(ctx)) }],
 					details: { state },
 				};
 			}
@@ -647,108 +919,310 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 					details: { state },
 				};
 			}
-			if (params.action === "complete" && state.verification) {
-				const expected = state.verification;
-				const blockForConfig = (reason: string) => {
-					const verification: GoalVerificationState = {
-						...expected,
-						status: "blocked",
-						checkedAt: new Date().toISOString(),
-					};
-					const error = transition(ctx, "blocked", reason, { verification });
-					runtimeArmed = false;
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: error ? `Goal state could not be persisted: ${error}` : `Goal blocked: ${reason}`,
-							},
-						],
-						details: { state },
-					};
-				};
-				if (!ctx.isProjectTrusted()) {
-					return blockForConfig("Project trust was revoked before the completion gate ran.");
-				}
-				if (ctx.workspace.execution.target !== "host") {
-					return blockForConfig(
-						"Completion gates cannot run through an execution boundary because extension commands execute on the host.",
-					);
-				}
-				let plan: GoalCompletionPlan | undefined;
-				try {
-					plan = await loadGoalCompletionPlan(ctx.workspace.sourceRoot);
-				} catch (error) {
-					return blockForConfig(
-						`Completion gate configuration is invalid: ${error instanceof Error ? error.message : String(error)}`,
-					);
-				}
-				if (!plan) return blockForConfig("Completion gate configuration was removed after the goal started.");
-				if (plan.configRevision !== expected.configRevision || !sameCheckIds(expected.checkIds, plan)) {
-					return blockForConfig("Completion gate configuration changed after the goal started.");
-				}
-				const verification = await verifyGoalCompletion(
-					state.objective,
-					plan,
-					ctx.workspace.logicalRoot,
-					(command, args, options) => pi.exec(command, args, options),
-					signal,
-				);
-				const graphError = recordCompletionChecks(ctx, verification);
-				if (graphError) {
-					return blockForConfig(`Completion results could not be persisted: ${graphError}`);
-				}
-				const persisted = persistedVerification(plan, verification);
-				if (verification.report.status !== "pass") {
-					const error = transition(
-						ctx,
-						"active",
-						`Completion gate ${verification.report.status}: ${verification.checks
-							.filter((check) => check.status !== "pass")
-							.map((check) => check.id)
-							.join(", ")}`,
-						{ verification: persisted },
-					);
-					return {
-						content: [
-							{
-								type: "text",
-								text: error
-									? `Goal state could not be persisted: ${error}`
-									: formatVerificationFailure(verification),
-							},
-						],
-						details: { state, verification: verification.report },
-					};
-				}
-				const error = transition(ctx, "completed", note, { verification: persisted });
-				if (error) {
-					return {
-						content: [{ type: "text", text: `Goal state could not be persisted: ${error}` }],
-						details: { state, verification: verification.report },
-					};
-				}
-				runtimeArmed = false;
+			if (goalMutationInFlight) {
 				return {
-					content: [{ type: "text", text: `Goal completed after the completion gate passed: ${note}` }],
-					details: { state, verification: verification.report },
-				};
-			}
-			const nextStatus =
-				params.action === "complete" ? "completed" : params.action === "blocked" ? "blocked" : "active";
-			const error = transition(ctx, nextStatus, note);
-			if (error) {
-				return {
-					content: [{ type: "text", text: `Goal state could not be persisted: ${error}` }],
+					content: [{ type: "text", text: "Another goal mutation is already in progress." }],
 					details: { state },
 				};
 			}
-			if (nextStatus !== "active") runtimeArmed = false;
-			const verb = nextStatus === "completed" ? "completed" : nextStatus === "blocked" ? "blocked" : "updated";
-			return {
-				content: [{ type: "text", text: `Goal ${verb}: ${note}` }],
+			goalMutationInFlight = true;
+			const mutationGoalId = state.id;
+			const mutationEpoch = goalMutationEpoch;
+			const mutationIsCurrent = (): boolean =>
+				state?.id === mutationGoalId && state.status === "active" && goalMutationEpoch === mutationEpoch;
+			const supersededMutationResult = () => ({
+				content: [{ type: "text" as const, text: "Goal mutation stopped because the goal state changed." }],
 				details: { state },
-			};
+			});
+			try {
+				if (params.action === "remember") {
+					if (!params.memoryKind) {
+						return {
+							content: [{ type: "text", text: "memoryKind is required for goal remember." }],
+							details: { state },
+						};
+					}
+					const sourceRequests = params.sources ?? [];
+					if (params.memoryKind === "fact" && sourceRequests.length === 0) {
+						return {
+							content: [{ type: "text", text: "Fact memory requires at least one source path." }],
+							details: { state },
+						};
+					}
+					try {
+						const paths = [...new Set(sourceRequests.map((source) => source.path))];
+						const currentSources = await resolveWorkspaceMemorySources(ctx.workspace, paths, { signal });
+						if (!mutationIsCurrent()) return supersededMutationResult();
+						const revisions = new Map(currentSources.map((source) => [source.path, source.revision]));
+						const missing = paths.filter((path) => !revisions.has(path));
+						if (missing.length > 0) {
+							throw new Error(`Memory source is missing from the logical workspace: ${missing.join(", ")}`);
+						}
+						const result = appendGoalMemory(ctx, {
+							kind: params.memoryKind,
+							content: note,
+							priority: params.memoryKind === "decision" ? 50 : params.memoryKind === "evidence" ? 100 : 0,
+							required: false,
+							tags: ["goal", "engineering-memory"],
+							sources: sourceRequests.map((source) => ({
+								path: source.path,
+								revision: revisions.get(source.path)!,
+								...(source.symbol ? { symbol: source.symbol } : {}),
+							})),
+							evidenceIds: params.evidenceIds ?? [],
+							replaces: params.replaces ?? [],
+							...(params.rationale ? { rationale: params.rationale } : {}),
+							alternatives: params.alternatives ?? [],
+							...(params.outcome ? { outcome: params.outcome } : {}),
+						});
+						if (result.error || !result.record)
+							throw new Error(result.error ?? "Memory record was not persisted");
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Remembered ${params.memoryKind} ${result.record.id}: ${note}`,
+								},
+							],
+							details: { state, memoryRecord: result.record },
+						};
+					} catch (error) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Engineering memory could not be persisted: ${error instanceof Error ? error.message : String(error)}`,
+								},
+							],
+							details: { state },
+						};
+					}
+				}
+				if (params.action === "complete" && (state.verification || state.impactVerification)) {
+					const expectedVerification = state.verification;
+					const expectedImpact = state.impactVerification;
+					const blockForConfig = (reason: string) => {
+						if (!mutationIsCurrent()) return supersededMutationResult();
+						const checkedAt = new Date().toISOString();
+						const verification = expectedVerification
+							? { ...expectedVerification, status: "blocked" as const, checkedAt }
+							: undefined;
+						const impactVerification = expectedImpact
+							? { ...expectedImpact, status: "blocked" as const, checkedAt }
+							: undefined;
+						const error = transition(ctx, "blocked", reason, { verification, impactVerification });
+						runtimeArmed = false;
+						return {
+							content: [
+								{
+									type: "text" as const,
+									text: error ? `Goal state could not be persisted: ${error}` : `Goal blocked: ${reason}`,
+								},
+							],
+							details: { state },
+						};
+					};
+					if (!ctx.isProjectTrusted()) {
+						return blockForConfig("Project trust was revoked before the completion gate ran.");
+					}
+					if (ctx.workspace.execution.target !== "host") {
+						return blockForConfig(
+							"Completion gates cannot run through an execution boundary because extension commands execute on the host.",
+						);
+					}
+					let completedVerification = expectedVerification;
+					let completionReport: GoalCompletionVerification["report"] | undefined;
+					if (expectedVerification) {
+						let plan: GoalCompletionPlan | undefined;
+						try {
+							plan = await loadGoalCompletionPlan(ctx.workspace.sourceRoot);
+						} catch (error) {
+							return blockForConfig(
+								`Completion gate configuration is invalid: ${error instanceof Error ? error.message : String(error)}`,
+							);
+						}
+						if (!mutationIsCurrent()) return supersededMutationResult();
+						if (!plan) return blockForConfig("Completion gate configuration was removed after the goal started.");
+						if (
+							plan.configRevision !== expectedVerification.configRevision ||
+							!sameCheckIds(expectedVerification.checkIds, plan)
+						) {
+							return blockForConfig("Completion gate configuration changed after the goal started.");
+						}
+						const verification = await verifyGoalCompletion(
+							state.objective,
+							plan,
+							ctx.workspace.logicalRoot,
+							(command, args, options) => pi.exec(command, args, options),
+							signal,
+						);
+						if (!mutationIsCurrent()) return supersededMutationResult();
+						const graphError = recordCompletionChecks(ctx, verification);
+						if (graphError) {
+							return blockForConfig(`Completion results could not be persisted: ${graphError}`);
+						}
+						completedVerification = persistedVerification(plan, verification);
+						completionReport = verification.report;
+						if (verification.report.status !== "pass") {
+							const error = transition(
+								ctx,
+								"active",
+								`Completion gate ${verification.report.status}: ${verification.checks
+									.filter((check) => check.status !== "pass")
+									.map((check) => check.id)
+									.join(", ")}`,
+								{ verification: completedVerification },
+							);
+							return {
+								content: [
+									{
+										type: "text",
+										text: error
+											? `Goal state could not be persisted: ${error}`
+											: formatVerificationFailure(verification),
+									},
+								],
+								details: { state, verification: verification.report },
+							};
+						}
+					}
+
+					let completedImpact = expectedImpact;
+					let impactResult: ImpactVerificationResult | undefined;
+					if (expectedImpact) {
+						let impactPlan: ImpactVerificationCatalogPlan | undefined;
+						try {
+							impactPlan = await loadImpactVerificationCatalog(ctx.workspace.sourceRoot);
+						} catch (error) {
+							return blockForConfig(
+								`Impact gate configuration is invalid: ${error instanceof Error ? error.message : String(error)}`,
+							);
+						}
+						if (!mutationIsCurrent()) return supersededMutationResult();
+						if (!impactPlan)
+							return blockForConfig("Impact gate configuration was removed after the goal started.");
+						if (impactPlan.configRevision !== expectedImpact.catalogRevision) {
+							return blockForConfig("Impact gate configuration changed after the goal started.");
+						}
+						let changedPaths: string[];
+						try {
+							changedPaths = await collectGitChangedPaths(
+								ctx.workspace.logicalRoot,
+								(command, args, options) => pi.exec(command, args, options),
+								signal,
+							);
+							if (!mutationIsCurrent()) return supersededMutationResult();
+						} catch (error) {
+							return blockForConfig(
+								`Impact gate could not discover the complete Git change set: ${error instanceof Error ? error.message : String(error)}`,
+							);
+						}
+						if (changedPaths.length === 0) {
+							const graphError = recordImpactCheck(ctx, "pass", "No workspace changes require impact checks");
+							if (graphError) return blockForConfig(`Impact result could not be persisted: ${graphError}`);
+							completedImpact = {
+								...expectedImpact,
+								status: "pass",
+								checkedAt: new Date().toISOString(),
+								coverage: "complete",
+								changedFileCount: 0,
+								affectedFileCount: 0,
+								selectedCheckIds: [],
+							};
+						} else {
+							const provider = getImpactGraphProvider(ctx.workspace.logicalRoot);
+							if (!provider) {
+								return blockForConfig(
+									"Impact gate requires an active CodeGraph provider for the logical workspace.",
+								);
+							}
+							try {
+								await provider.sync({ signal });
+								if (!mutationIsCurrent()) return supersededMutationResult();
+								impactResult = await verifyImpactPlan(
+									state.objective,
+									impactPlan,
+									provider.impactMap(changedPaths, { maxDepth: 4, maxPaths: 1_000 }),
+									ctx.workspace.logicalRoot,
+									(command, args, options) => pi.exec(command, args, options),
+									signal,
+								);
+								if (!mutationIsCurrent()) return supersededMutationResult();
+							} catch (error) {
+								return blockForConfig(
+									`Impact gate execution failed: ${error instanceof Error ? error.message : String(error)}`,
+								);
+							}
+							const summary =
+								impactResult.status === "pass"
+									? `Impact gate passed with ${impactResult.plan.selected.length} check(s)`
+									: (impactResult.reason ?? `Impact gate ${impactResult.status}`);
+							const graphError = recordImpactCheck(ctx, impactResult.status, summary, impactResult.evidence.id);
+							if (graphError) return blockForConfig(`Impact result could not be persisted: ${graphError}`);
+							completedImpact = persistedImpactVerification(impactPlan, impactResult);
+							if (impactResult.status !== "pass") {
+								const error = transition(ctx, "active", summary, {
+									verification: completedVerification,
+									impactVerification: completedImpact,
+								});
+								const failure =
+									impactResult.verification && impactResult.verification.report.status !== "pass"
+										? formatVerificationFailure(impactResult.verification)
+										: summary;
+								return {
+									content: [
+										{
+											type: "text",
+											text: error ? `Goal state could not be persisted: ${error}` : failure,
+										},
+									],
+									details: { state, impact: impactResult.evidence },
+								};
+							}
+						}
+					}
+
+					if (!mutationIsCurrent()) return supersededMutationResult();
+					const error = transition(ctx, "completed", note, {
+						verification: completedVerification,
+						impactVerification: completedImpact,
+					});
+					if (error) {
+						return {
+							content: [{ type: "text", text: `Goal state could not be persisted: ${error}` }],
+							details: { state, verification: completionReport, impact: impactResult?.evidence },
+						};
+					}
+					runtimeArmed = false;
+					const gateLabel =
+						expectedVerification && expectedImpact
+							? "completion and impact gates"
+							: expectedImpact
+								? "impact gate"
+								: "completion gate";
+					return {
+						content: [{ type: "text", text: `Goal completed after the ${gateLabel} passed: ${note}` }],
+						details: { state, verification: completionReport, impact: impactResult?.evidence },
+					};
+				}
+				const nextStatus =
+					params.action === "complete" ? "completed" : params.action === "blocked" ? "blocked" : "active";
+				const error = transition(ctx, nextStatus, note);
+				if (error) {
+					return {
+						content: [{ type: "text", text: `Goal state could not be persisted: ${error}` }],
+						details: { state },
+					};
+				}
+				if (nextStatus !== "active") runtimeArmed = false;
+				const verb = nextStatus === "completed" ? "completed" : nextStatus === "blocked" ? "blocked" : "updated";
+				return {
+					content: [{ type: "text", text: `Goal ${verb}: ${note}` }],
+					details: { state },
+				};
+			} finally {
+				goalMutationInFlight = false;
+			}
 		},
 	});
 
@@ -759,7 +1233,31 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			const action = input || "status";
 
 			if (action === "status") {
-				ctx.ui.notify(state ? formatStatus(state) : "No goal exists in the current session branch.", "info");
+				ctx.ui.notify(
+					state ? formatStatus(state, currentGoalGraph(ctx)) : "No goal exists in the current session branch.",
+					"info",
+				);
+				return;
+			}
+
+			if (action === "graph") {
+				const graph = currentGoalGraph(ctx);
+				ctx.ui.notify(
+					state && graph
+						? formatGoalWorkGraph(graph).join("\n")
+						: "No goal work graph exists in the current session branch.",
+					"info",
+				);
+				return;
+			}
+
+			if (action === "memory") {
+				ctx.ui.notify(
+					state
+						? formatEngineeringMemory(engineeringMemoryStore(ctx).get(state.id))
+						: "No engineering memory exists in the current session branch.",
+					"info",
+				);
 				return;
 			}
 
@@ -768,6 +1266,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 					ctx.ui.notify("Only an active goal can be paused.", "warning");
 					return;
 				}
+				goalMutationEpoch++;
 				const error = transition(ctx, "paused", "Paused by user.");
 				if (error) {
 					ctx.ui.notify(`Goal pause could not be persisted: ${error}`, "error");
@@ -793,6 +1292,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 					return;
 				}
 				if (!requireGoalTool(ctx)) return;
+				goalMutationEpoch++;
 				const extendTurnLimit = state.turns >= state.turnLimit;
 				const error = transition(ctx, "active", state.note, { extendTurnLimit });
 				if (error) {
@@ -801,7 +1301,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 				}
 				runtimeArmed = true;
 				lastStopReason = undefined;
-				queueGoalTurn(state!);
+				queueGoalTurn(state!, ctx);
 				ctx.ui.notify("Goal resumed.", "info");
 				return;
 			}
@@ -811,6 +1311,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 					ctx.ui.notify("No unfinished goal can be stopped.", "warning");
 					return;
 				}
+				goalMutationEpoch++;
 				const error = transition(ctx, "stopped", "Stopped by user.");
 				if (error) {
 					ctx.ui.notify(`Goal stop could not be persisted: ${error}`, "error");
@@ -824,7 +1325,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 
 			const objective = action.startsWith("start ") ? action.slice("start ".length).trim() : action;
 			if (!objective) {
-				ctx.ui.notify("Usage: /goal <objective> | /goal [status|pause|resume|stop]", "warning");
+				ctx.ui.notify("Usage: /goal <objective> | /goal [status|graph|memory|pause|resume|stop]", "warning");
 				return;
 			}
 			if (objective.length > MAX_OBJECTIVE_LENGTH) {
@@ -841,26 +1342,29 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			if (!requireGoalTool(ctx)) return;
 
 			let completionPlan: GoalCompletionPlan | undefined;
+			let impactPlan: ImpactVerificationCatalogPlan | undefined;
 			if (ctx.isProjectTrusted()) {
 				try {
 					completionPlan = await loadGoalCompletionPlan(ctx.workspace.sourceRoot);
+					impactPlan = await loadImpactVerificationCatalog(ctx.workspace.sourceRoot);
 				} catch (error) {
 					ctx.ui.notify(
-						`Goal could not be started because the completion gate is invalid: ${error instanceof Error ? error.message : String(error)}`,
+						`Goal could not be started because a completion gate is invalid: ${error instanceof Error ? error.message : String(error)}`,
 						"error",
 					);
 					return;
 				}
 			}
-			if (completionPlan && ctx.workspace.execution.target !== "host") {
+			if ((completionPlan || impactPlan) && ctx.workspace.execution.target !== "host") {
 				ctx.ui.notify(
-					"Goal could not be started because its completion gate cannot run through an execution boundary.",
+					"Goal could not be started because its completion gates cannot run through an execution boundary.",
 					"error",
 				);
 				return;
 			}
 			const now = new Date().toISOString();
 			const goalId = randomUUID();
+			goalMutationEpoch++;
 			const nextState: GoalState = {
 				version: 1,
 				id: goalId,
@@ -871,15 +1375,15 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 				createdAt: now,
 				updatedAt: now,
 				...(completionPlan ? { verification: pendingVerification(completionPlan) } : {}),
+				...(impactPlan ? { impactVerification: pendingImpactVerification(impactPlan) } : {}),
 			};
 			try {
-				graphStore(ctx).create(createGoalWorkGraph(goalId, objective, completionPlan, now));
-				const store = workingSetStore(ctx);
-				const initialWorkingSet = createWorkingSet(goalId);
-				store.create(initialWorkingSet);
-				const workingSet = new RevisionAwareWorkingSet(initialWorkingSet);
-				workingSet.append({
-					id: "goal:objective",
+				graphStore(ctx).create(createGoalWorkGraph(goalId, objective, completionPlan, impactPlan, now));
+				const store = engineeringMemoryStore(ctx);
+				const initialMemory = createEngineeringMemory(goalId);
+				store.create(initialMemory);
+				const memory = new RevisionedEngineeringMemory(initialMemory);
+				memory.append({
 					kind: "objective",
 					content: objective,
 					priority: 1_000,
@@ -888,8 +1392,10 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 					sources: [],
 					evidenceIds: [],
 					createdAt: now,
+					replaces: [],
+					alternatives: [],
 				});
-				store.save(workingSet.snapshot(), initialWorkingSet.revision);
+				store.save(memory.snapshot(), initialMemory.revision);
 			} catch (error) {
 				ctx.ui.notify(
 					`Goal could not be started because its durable state was not persisted: ${error instanceof Error ? error.message : String(error)}`,
@@ -904,10 +1410,14 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			}
 			runtimeArmed = true;
 			lastStopReason = undefined;
-			queueGoalTurn(nextState);
+			queueGoalTurn(nextState, ctx);
+			const gates = [
+				...(completionPlan ? [`${completionPlan.checks.length} revision-locked completion check(s)`] : []),
+				...(impactPlan ? ["a revision-locked impact gate"] : []),
+			];
 			ctx.ui.notify(
-				completionPlan
-					? `Goal started with ${completionPlan.checks.length} revision-locked completion check${completionPlan.checks.length === 1 ? "" : "s"}.`
+				gates.length > 0
+					? `Goal started with ${gates.join(" and ")}.`
 					: "Goal started. Use /goal pause or /goal stop to interrupt it.",
 				"info",
 			);
@@ -915,20 +1425,26 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (event, ctx) => {
+		goalMutationEpoch++;
 		state = findGoalState(ctx.sessionManager.getBranch());
 		runtimeArmed = false;
 		lastStopReason = undefined;
-		updateUi(ctx, state);
+		const recoveryError = state?.status === "active" ? recoverGoalGraph(ctx) : undefined;
+		updateUi(ctx, state, currentGoalGraph(ctx));
+		if (recoveryError) ctx.ui.notify(`Goal work graph could not be recovered: ${recoveryError}`, "error");
 		if (state?.status === "active" && event.reason !== "activation") {
 			ctx.ui.notify("An active goal was restored. Run /goal resume or send a message to continue it.", "info");
 		}
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
+		goalMutationEpoch++;
 		state = findGoalState(ctx.sessionManager.getBranch());
 		runtimeArmed = false;
 		lastStopReason = undefined;
-		updateUi(ctx, state);
+		const recoveryError = state?.status === "active" ? recoverGoalGraph(ctx) : undefined;
+		updateUi(ctx, state, currentGoalGraph(ctx));
+		if (recoveryError) ctx.ui.notify(`Goal work graph could not be recovered: ${recoveryError}`, "error");
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -942,38 +1458,51 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			}
 			return;
 		}
-		let workingSetContext = "";
+		const graphResult = mutateGoalGraph(ctx, (graph) => ensureGoalWorkRunning(graph, new Date().toISOString()));
+		if (graphResult.error) {
+			const reason = `Work graph could not claim the active goal node: ${graphResult.error}`;
+			const persistError = transition(ctx, "blocked", reason, { syncGraph: false });
+			runtimeArmed = false;
+			ctx.ui.notify(
+				persistError ? `Goal and work graph failure could not be persisted: ${persistError}` : reason,
+				"error",
+			);
+			return;
+		}
+		let memoryContext = "";
 		try {
-			const snapshot = workingSetStore(ctx).get(state.id);
+			const snapshot = engineeringMemoryStore(ctx).get(state.id);
 			if (snapshot) {
-				const prepared = await prepareWorkspaceWorkingSet(
+				const prepared = await prepareWorkspaceEngineeringMemory(
 					snapshot,
 					ctx.workspace,
 					{ task: state.objective, tokenBudget: 1_600, maxEntries: 64 },
 					{ signal: ctx.signal },
 				);
-				if (prepared.status === "blocked") {
-					const stale = prepared.freshness
+				if (prepared.workingSet.status === "blocked") {
+					const stale = prepared.workingSet.freshness
 						.filter((entry) => entry.status !== "fresh")
 						.map((entry) => entry.entryId)
 						.join(", ");
-					const error = transition(ctx, "blocked", `Required working-set context is stale or missing: ${stale}`);
+					const error = transition(ctx, "blocked", `Required engineering memory is stale or missing: ${stale}`);
 					runtimeArmed = false;
 					if (error) {
-						ctx.ui.notify(`Stale working-set state could not be persisted: ${error}`, "error");
+						ctx.ui.notify(`Stale engineering memory state could not be persisted: ${error}`, "error");
 					} else {
-						ctx.ui.notify("Goal blocked because required working-set context is stale or missing.", "error");
+						ctx.ui.notify("Goal blocked because required engineering memory is stale or missing.", "error");
 					}
 					return;
 				}
-				workingSetContext = `\n\n## Durable working set\n\n${prepared.compiledContext.text}`;
+				memoryContext = `\n\n## Revisioned engineering memory\n\n${prepared.workingSet.compiledContext.text}`;
 			}
 		} catch (error) {
-			const reason = `Working set could not be prepared: ${error instanceof Error ? error.message : String(error)}`;
-			const persistError = transition(ctx, "blocked", reason, { syncWorkingSet: false });
+			const reason = `Engineering memory could not be prepared: ${error instanceof Error ? error.message : String(error)}`;
+			const persistError = transition(ctx, "blocked", reason, { syncMemory: false });
 			runtimeArmed = false;
 			ctx.ui.notify(
-				persistError ? `Working-set failure and blocked state could not be persisted: ${persistError}` : reason,
+				persistError
+					? `Engineering-memory failure and blocked state could not be persisted: ${persistError}`
+					: reason,
 				"error",
 			);
 			return;
@@ -981,7 +1510,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		runtimeArmed = true;
 		lastStopReason = undefined;
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n${buildAgentInstruction(state)}${workingSetContext}`,
+			systemPrompt: `${event.systemPrompt}\n\n${buildAgentInstruction(state, graphResult.graph)}${memoryContext}`,
 		};
 	});
 
@@ -1055,7 +1584,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		if (ctx.hasPendingMessages()) return;
-		queueGoalTurn(state);
+		queueGoalTurn(state, ctx);
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {

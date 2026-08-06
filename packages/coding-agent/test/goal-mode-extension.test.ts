@@ -4,6 +4,8 @@ import { join } from "node:path";
 import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { IncrementalCodeGraph } from "../src/core/code-graph.ts";
+import { findEngineeringMemory } from "../src/core/engineering-memory-session.ts";
 import type { ExecOptions, ExecResult } from "../src/core/exec.ts";
 import type {
 	AgentEndEvent,
@@ -17,9 +19,9 @@ import type {
 	SessionStartEvent,
 	SessionTreeEvent,
 } from "../src/core/extensions/index.ts";
+import { buildCodeImpactMap, registerImpactGraphProvider } from "../src/core/impact-verification.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { findWorkGraph } from "../src/core/work-graph-session.ts";
-import { findWorkingSet } from "../src/core/working-set-session.ts";
 import { createWorkspaceView, type WorkspaceView } from "../src/core/workspace-view.ts";
 import goalModeExtension, { findGoalState, type GoalState, parseGoalState } from "../src/extensions/goal-mode/index.ts";
 import { builtInExtensions } from "../src/extensions/index.ts";
@@ -37,8 +39,14 @@ type SessionStartHandler = (event: SessionStartEvent, ctx: ExtensionContext) => 
 type SessionTreeHandler = (event: SessionTreeEvent, ctx: ExtensionContext) => Promise<void>;
 
 interface GoalToolParams {
-	action: "status" | "update" | "complete" | "blocked";
+	action: "status" | "update" | "remember" | "complete" | "blocked";
 	note?: string;
+	memoryKind?: "fact" | "decision" | "attempt" | "evidence";
+	sources?: Array<{ path: string; symbol?: string }>;
+	replaces?: string[];
+	rationale?: string;
+	alternatives?: string[];
+	outcome?: "succeeded" | "failed" | "inconclusive";
 }
 
 interface GoalTool {
@@ -48,7 +56,7 @@ interface GoalTool {
 		signal: AbortSignal | undefined,
 		onUpdate: undefined,
 		ctx: ExtensionContext,
-	): Promise<AgentToolResult<{ state: GoalState | undefined }>>;
+	): Promise<AgentToolResult<{ state: GoalState | undefined; memoryRecord?: { id: string } }>>;
 }
 
 interface SetupOptions {
@@ -75,6 +83,11 @@ async function createTemporaryDirectory(prefix: string): Promise<string> {
 async function writeGoalConfig(root: string, checks: unknown[]): Promise<void> {
 	await mkdir(join(root, ".pi"), { recursive: true });
 	await writeFile(join(root, ".pi", "goal.json"), JSON.stringify({ version: 1, checks }));
+}
+
+async function writeImpactConfig(root: string, checks: unknown[]): Promise<void> {
+	await mkdir(join(root, ".pi"), { recursive: true });
+	await writeFile(join(root, ".pi", "checks.json"), JSON.stringify({ version: 1, checks }));
 }
 
 function setupExtension(sessionManager = SessionManager.inMemory(), options: SetupOptions = {}) {
@@ -185,9 +198,16 @@ describe("goal mode built-in extension", () => {
 		});
 		expect(extension.sendMessage).toHaveBeenCalledTimes(1);
 		expect(extension.setStatus).toHaveBeenLastCalledWith("goal-mode", "goal 0/25");
-		expect(findWorkingSet(extension.sessionManager.getBranch(), initialState!.id)?.entries).toEqual([
+		expect(extension.setWidget).toHaveBeenLastCalledWith(
+			"goal-mode",
+			expect.arrayContaining([
+				expect.stringContaining("Work graph r"),
+				expect.stringContaining("running work [inline]"),
+			]),
+		);
+		expect(findEngineeringMemory(extension.sessionManager.getBranch(), initialState!.id)?.records).toEqual([
 			expect.objectContaining({
-				id: "goal:objective",
+				id: expect.stringMatching(/^sha256:/),
 				kind: "objective",
 				content: "implement and verify the feature",
 				required: true,
@@ -197,7 +217,7 @@ describe("goal mode built-in extension", () => {
 		const promptUpdate = await extension.beforeAgentStart();
 		expect(promptUpdate?.systemPrompt).toContain("implement and verify the feature");
 		expect(promptUpdate?.systemPrompt).toContain('goal tool with action "complete"');
-		expect(promptUpdate?.systemPrompt).toContain("## Durable working set");
+		expect(promptUpdate?.systemPrompt).toContain("## Revisioned engineering memory");
 
 		await extension.agentStart();
 		await extension.agentEnd([fauxAssistantMessage("more work remains")]);
@@ -220,8 +240,8 @@ describe("goal mode built-in extension", () => {
 			note: "implementation done; verification remains",
 		});
 		expect(
-			findWorkingSet(extension.sessionManager.getBranch(), initialState!.id)?.entries.some(
-				(entry) => entry.kind === "attempt" && entry.content === "implementation done; verification remains",
+			findEngineeringMemory(extension.sessionManager.getBranch(), initialState!.id)?.records.some(
+				(record) => record.kind === "attempt" && record.content === "implementation done; verification remains",
 			),
 		).toBe(true);
 
@@ -251,6 +271,77 @@ describe("goal mode built-in extension", () => {
 
 		await extension.agentEnd([fauxAssistantMessage("done")]);
 		expect(extension.sendMessage).toHaveBeenCalledTimes(2);
+	});
+
+	it("records source-revisioned facts and reviewable decision replacements", async () => {
+		const root = await createTemporaryDirectory("pi-goal-memory-");
+		await writeFile(join(root, "worker.ts"), "export const retries = 2;\n");
+		const extension = setupExtension(SessionManager.inMemory(), { cwd: root });
+		await extension.command("repair retry policy", extension.ctx);
+		const fact = await extension.goalTool.execute(
+			"remember-fact",
+			{
+				action: "remember",
+				memoryKind: "fact",
+				note: "The worker currently retries twice.",
+				sources: [{ path: "worker.ts", symbol: "retries" }],
+			},
+			undefined,
+			undefined,
+			extension.ctx,
+		);
+		expect(fact.content[0]).toEqual(
+			expect.objectContaining({ type: "text", text: expect.stringContaining("Remembered fact sha256:") }),
+		);
+		const firstDecision = await extension.goalTool.execute(
+			"remember-decision",
+			{
+				action: "remember",
+				memoryKind: "decision",
+				note: "Keep retry state per job.",
+				rationale: "Concurrent jobs must not share retry state.",
+				alternatives: ["Global retry counter"],
+			},
+			undefined,
+			undefined,
+			extension.ctx,
+		);
+		const firstDecisionId = firstDecision.details.memoryRecord?.id;
+		expect(firstDecisionId).toMatch(/^sha256:/);
+		const replacement = await extension.goalTool.execute(
+			"replace-decision",
+			{
+				action: "remember",
+				memoryKind: "decision",
+				note: "Keep retry state in the persisted job record.",
+				rationale: "Retries must survive process recovery.",
+				replaces: [firstDecisionId!],
+			},
+			undefined,
+			undefined,
+			extension.ctx,
+		);
+		expect(replacement.content[0]).toEqual(
+			expect.objectContaining({ type: "text", text: expect.stringContaining("Remembered decision sha256:") }),
+		);
+
+		const goal = findGoalState(extension.sessionManager.getBranch())!;
+		const snapshot = findEngineeringMemory(extension.sessionManager.getBranch(), goal.id)!;
+		expect(snapshot.records).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					kind: "fact",
+					sources: [
+						expect.objectContaining({
+							path: "worker.ts",
+							symbol: "retries",
+							revision: expect.stringMatching(/^sha256:/),
+						}),
+					],
+				}),
+				expect.objectContaining({ kind: "decision", replaces: [firstDecisionId] }),
+			]),
+		);
 	});
 
 	it("requires a revision-locked completion gate to pass in the logical workspace", async () => {
@@ -377,6 +468,84 @@ describe("goal mode built-in extension", () => {
 		expect(execute).not.toHaveBeenCalled();
 	});
 
+	it("serializes goal mutations while an asynchronous completion gate is running", async () => {
+		const sourceRoot = await createTemporaryDirectory("pi-goal-concurrent-");
+		await writeGoalConfig(sourceRoot, [{ id: "check", command: "node", args: ["verify.mjs"] }]);
+		let releaseCheck: (() => void) | undefined;
+		const checkReleased = new Promise<void>((resolve) => {
+			releaseCheck = resolve;
+		});
+		let checkStarted = false;
+		const execute = vi.fn(async () => {
+			checkStarted = true;
+			await checkReleased;
+			return { stdout: "", stderr: "", code: 0, killed: false };
+		});
+		const extension = setupExtension(SessionManager.inMemory(), { cwd: sourceRoot, exec: execute });
+		await extension.command("serialize durable goal transitions", extension.ctx);
+
+		const completing = extension.goalTool.execute(
+			"goal-completing",
+			{ action: "complete", note: "completion check running" },
+			undefined,
+			undefined,
+			extension.ctx,
+		);
+		while (!checkStarted) await new Promise((resolve) => setTimeout(resolve, 1));
+		const concurrent = await extension.goalTool.execute(
+			"goal-concurrent",
+			{ action: "update", note: "must not interleave" },
+			undefined,
+			undefined,
+			extension.ctx,
+		);
+		expect(concurrent.content[0]).toEqual({
+			type: "text",
+			text: "Another goal mutation is already in progress.",
+		});
+
+		releaseCheck?.();
+		await expect(completing).resolves.toMatchObject({
+			content: [{ type: "text", text: expect.stringContaining("Goal completed") }],
+		});
+	});
+
+	it("does not let a completion gate overwrite a user pause", async () => {
+		const sourceRoot = await createTemporaryDirectory("pi-goal-pause-gate-");
+		await writeGoalConfig(sourceRoot, [{ id: "check", command: "node", args: ["verify.mjs"] }]);
+		let releaseCheck: (() => void) | undefined;
+		const checkReleased = new Promise<void>((resolve) => {
+			releaseCheck = resolve;
+		});
+		let checkStarted = false;
+		const execute = vi.fn(async () => {
+			checkStarted = true;
+			await checkReleased;
+			return { stdout: "", stderr: "", code: 0, killed: false };
+		});
+		const extension = setupExtension(SessionManager.inMemory(), { cwd: sourceRoot, exec: execute });
+		await extension.command("respect user lifecycle controls", extension.ctx);
+		const completing = extension.goalTool.execute(
+			"goal-completing",
+			{ action: "complete", note: "completion check running" },
+			undefined,
+			undefined,
+			extension.ctx,
+		);
+		while (!checkStarted) await new Promise((resolve) => setTimeout(resolve, 1));
+
+		await extension.command("pause", extension.ctx);
+		releaseCheck?.();
+
+		await expect(completing).resolves.toMatchObject({
+			content: [{ type: "text", text: "Goal mutation stopped because the goal state changed." }],
+		});
+		expect(findGoalState(extension.sessionManager.getBranch())).toMatchObject({
+			status: "paused",
+			note: "Paused by user.",
+		});
+	});
+
 	it("rejects host-only completion gates in an execution-boundary workspace", async () => {
 		const sourceRoot = await createTemporaryDirectory("pi-goal-boundary-");
 		await writeGoalConfig(sourceRoot, [{ id: "check", command: "node", args: ["verify.mjs"] }]);
@@ -399,7 +568,7 @@ describe("goal mode built-in extension", () => {
 
 		expect(findGoalState(extension.sessionManager.getBranch())).toBeUndefined();
 		expect(extension.notify).toHaveBeenCalledWith(
-			"Goal could not be started because its completion gate cannot run through an execution boundary.",
+			"Goal could not be started because its completion gates cannot run through an execution boundary.",
 			"error",
 		);
 		expect(execute).not.toHaveBeenCalled();
@@ -435,6 +604,75 @@ describe("goal mode built-in extension", () => {
 		).toBeUndefined();
 	});
 
+	it("runs the revision-locked CodeGraph impact gate by default when the project configures one", async () => {
+		const sourceRoot = await createTemporaryDirectory("pi-goal-impact-");
+		await writeImpactConfig(sourceRoot, [
+			{
+				id: "fallback-check",
+				command: "node",
+				args: ["verify-impact.mjs"],
+				timeoutMs: 5_000,
+				selection: { mode: "fallback" },
+			},
+		]);
+		const execute = vi.fn(async (command: string) =>
+			command === "git"
+				? { stdout: " M src/a.ts\0", stderr: "", code: 0, killed: false }
+				: { stdout: "ok", stderr: "", code: 0, killed: false },
+		);
+		const graph = new IncrementalCodeGraph();
+		const provider = {
+			sync: vi.fn(async () => undefined),
+			impactMap: vi.fn((paths: readonly string[]) => buildCodeImpactMap(graph.snapshot(), paths)),
+		};
+		const unregister = registerImpactGraphProvider(sourceRoot, provider);
+		try {
+			const extension = setupExtension(SessionManager.inMemory(), { cwd: sourceRoot, exec: execute });
+			await extension.command("verify every affected path", extension.ctx);
+			expect(findGoalState(extension.sessionManager.getBranch())?.impactVerification).toMatchObject({
+				status: "pending",
+				selectedCheckIds: [],
+			});
+
+			const completed = await extension.goalTool.execute(
+				"goal-impact",
+				{ action: "complete", note: "impact checks passed" },
+				undefined,
+				undefined,
+				extension.ctx,
+			);
+
+			expect(completed.content[0]).toEqual({
+				type: "text",
+				text: "Goal completed after the impact gate passed: impact checks passed",
+			});
+			const completedState = findGoalState(extension.sessionManager.getBranch());
+			expect(completedState).toMatchObject({
+				status: "completed",
+				impactVerification: {
+					status: "pass",
+					coverage: "fallback",
+					changedFileCount: 1,
+					selectedCheckIds: ["fallback-check"],
+					evidenceId: expect.stringMatching(/^sha256:/),
+				},
+			});
+			expect(
+				findWorkGraph(extension.sessionManager.getBranch(), completedState!.id)?.nodes.find(
+					(node) => node.id === "verify:impact",
+				),
+			).toMatchObject({ status: "succeeded", evidence: [expect.objectContaining({ kind: "impact" })] });
+			expect(provider.sync).toHaveBeenCalledOnce();
+			expect(execute).toHaveBeenCalledWith(
+				"node",
+				["verify-impact.mjs"],
+				expect.objectContaining({ cwd: sourceRoot, timeout: 5_000 }),
+			);
+		} finally {
+			unregister();
+		}
+	});
+
 	it("restores branch state without spending tokens and pauses an interrupted run", async () => {
 		const first = setupExtension();
 		await first.command("preserve this goal", first.ctx);
@@ -448,8 +686,19 @@ describe("goal mode built-in extension", () => {
 			"info",
 		);
 		expect(restored.setStatus).toHaveBeenLastCalledWith("goal-mode", "goal 1/25");
+		const recoveredGraph = findWorkGraph(
+			restored.sessionManager.getBranch(),
+			findGoalState(restored.sessionManager.getBranch())!.id,
+		);
+		expect(recoveredGraph?.nodes.find((node) => node.id === "work")?.status).toBe("ready");
 
 		await restored.beforeAgentStart();
+		expect(
+			findWorkGraph(
+				restored.sessionManager.getBranch(),
+				findGoalState(restored.sessionManager.getBranch())!.id,
+			)?.nodes.find((node) => node.id === "work")?.status,
+		).toBe("running");
 		await restored.agentEnd([fauxAssistantMessage("", { stopReason: "aborted" })]);
 		expect(findGoalState(restored.sessionManager.getBranch())).toMatchObject({
 			status: "paused",
