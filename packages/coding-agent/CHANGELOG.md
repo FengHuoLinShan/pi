@@ -2,8 +2,17 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Replaced the model-visible bash tool's second-based `timeout` input with the positive integer millisecond field `timeoutMs`, including millisecond request and effective-timeout details.
+
 ### Added
 
+- Added a negotiated remote durable process backend with idempotent start and cancellation requests, bounded cursor replay, artifact-backed output, persisted replay cursors, transient disconnect tolerance, and executor-instance binding.
+- Added branch-persistent revisioned engineering memory for Goal mode, including source-hashed facts, decision rationale and alternatives, attempt outcomes, explicit supersession, bounded context injection, and `/goal memory` review.
+- Added versioned architecture fitness rules with stable violation ids, explicit debt baselines, content-addressed reports, and regression comparison.
+- Added reviewable Patch Stacks with immutable cumulative overlay checkpoints, optimistic review decisions, rejection gates, and final application through the existing atomic WorkspaceOverlay transaction.
+- Added a local verified work runtime that recovers persisted graphs, serializes optimistic state updates, executes read-only nodes concurrently, enforces budgets and leases, and returns structured terminal reports.
 - Added `ctx.workspace` and `AgentSession.workspace` descriptors for the logical filesystem, revision, mounts, and execution target used by built-in tools.
 - Added a shared local process runtime for foreground bash, extension commands, verification checks, and durable process-session backends.
 - Added revision-locked `.pi/goal.json` completion gates that require configured checks to pass before `/goal` can complete.
@@ -12,14 +21,17 @@
 - Added revision-aware working sets with session persistence and WorkspaceView source hashing so stale facts fail closed while objectives, decisions, attempts, and evidence survive context compaction.
 - Added built-in `/goal` mode with branch-persistent objectives, explicit agent progress/completion/blocking, autonomous continuations, visible status, pause/resume/stop controls, and bounded activation batches.
 - Added a global live subagent progress panel that aggregates tasks from simultaneous single, parallel, and chain tool calls.
+- Added finite per-task subagent timeouts, canonical workspace-contained working directories, and bounded child activity metadata.
 - Added a responsive model sidebar for quickly selecting recent or scoped models and supported reasoning effort with the keyboard.
 - Added capability search and activation, on-demand skill loading, and package-declared lazy extensions with reload-safe lifecycle handling.
 - Added versioned offline, browser, and live capability evaluations for MCP and pinned Playwright integration candidates.
 - Added per-agent and per-task provider, model, and thinking configuration, personal runtime overrides, live state events, and isolated cancellation to the subagent extension example.
+- Added parent-model inheritance, mutually exclusive layered model selectors with child-equivalent-registry-qualified frontmatter-error precedence and selection, explicit child-default policies, credential-blind child-equivalent runtime preflight, and an evidence-focused researcher persona to the subagent extension example.
 - Added built-in llama.cpp router support with `/login` connection setup and `/llama` Hugging Face model search and downloads, explicit loading, unloading, and live progress. See [llama.cpp](docs/llama-cpp.md).
 - Added extension registration for complete pi-ai providers, including native authentication, model refresh, filtering, and streaming behavior.
 - Added SHA-256 revision preconditions and mutation evidence, opt-in canonical allowed-root enforcement, and atomic local commits for the built-in `read`, `edit`, and `write` tools.
 - Added an attested SDK execution-boundary contract for routing built-in tools and session bash through external OS, container, VM, or remote-sandbox backends, with fail-closed workspace, process, network, and environment policy validation.
+- Added versioned CLI and SDK task envelopes with canonical cwd and file-tool roots, redacted prompt context, fresh-session conflict checks, and millisecond bash timeout and expected-hang policies.
 - Added local content-addressed artifact storage and recoverable process-session lifecycle primitives with artifact-backed output and execution-boundary binding.
 - Added a transport-independent, negotiated app protocol with strict JSON-RPC validation, typed Thread/Turn/Item events, reverse approval/input requests, and bounded cursor replay.
 - Added opt-in transactional workspace overlays with complete PatchSets, conflict preflight, durable apply journals, compensating rollback, and built-in tool/session routing.
@@ -54,6 +66,7 @@
 
 ### Changed
 
+- Changed Goal mode to enable revision-locked `.pi/checks.json` impact verification by default, using complete Git change discovery and the active logical-workspace CodeGraph provider before completion.
 - Changed fixed managed-job recipes with an explicit `inheritEnv` list to use a minimal development environment plus only the named variables, while omitted lists preserve full inheritance.
 - Changed SDK-created coding sessions with a selected model to run through the durable AgentHarness runtime while preserving the public `Agent` facade and extension lifecycle, with direct run-budget, loop-detection, and tool-policy configuration.
 - Forwarded optional core tool-attempt outcomes through extension `tool_execution_end` events.
@@ -61,6 +74,16 @@
 
 ### Fixed
 
+- Fixed file discovery flooding model context by limiting model-visible bash and context-expanded grep output to 200 lines, preserving full bash output artifacts, and guiding models toward narrow searches plus precise reads.
+- Fixed task-envelope sessions to use unforgeable validated-envelope identity, isolate external resources, reject conflicting CLI inputs before envelope I/O, and redact file-tool path and revision failures across previews and boundary races.
+- Fixed subagent initial context to avoid redundant context-file discovery and mechanical EOF reads, added a separate structured child-reported outcome, and bounded and redacted retained stderr and parent-visible failures.
+- Fixed the built-in read tool to reuse unchanged content within a turn, omit already returned line prefixes, retain chunked fingerprint-verified ranges across unrelated file revisions, invalidate affected ranges after mutations, clear reuse on compaction or new user turns, and allow at most one content fallback per path and revision when a model retries a complete-range reuse marker.
+- Fixed compaction and branch-summary generation to frame untrusted history as JSON data, omit hidden reasoning, bound tool arguments and oversized summary inputs without mutating canonical history, reserve model output space on every request, reject empty or output-limited checkpoints, reserve summary headroom for models without an explicit output cap, and keep split-turn focus and recency semantics coherent while generating independent summaries concurrently.
+- Fixed subagent parent records and renderers to use an explicit tool-argument redaction contract, preserve normalized default-thinking adjustments in queued and failure states, and keep delegated reviews within task-stated scope.
+- Fixed reads of multi-megabyte single lines to return a bounded Unicode-safe preview with deterministic truncation metadata and byte-range continuation guidance.
+- Fixed oversized canonical tool results poisoning compaction summaries and undersized recent segments by bounding summary projections including serialized wrappers, preserving stored history, and returning actionable recovery guidance until a valid compactable cut exists.
+- Fixed durable coding-agent runs to close the active turn when a provider-context budget guard stops the run after tool execution.
+- Fixed subagent state events to emit revisioned full-call snapshots with distinct timeout, cancellation, and skipped terminal states while rejecting malformed child messages and withholding assistant text deltas and tool arguments, corrected running tool-card tasks being counted as done, and made unsupported-thinking preflight failures return and render the same credential-blind resolved runtime, supported thinking, canonical cwd, and effective timeout diagnostics.
 - Fixed edit and write revision guidance to require copying the complete `sha256:` token, avoiding invalid bare-digest tool retries.
 - Fixed unqualified CLI model patterns to prefer matching providers with configured authentication while preserving explicit `provider/model` selection.
 - Fixed managed-job recipe loading races by opening configs without following final symlinks, verifying file identity, and bounding reads through the verified handle.
@@ -72,6 +95,9 @@
 - Fixed obsolete custom UI, custom tool, and custom editor examples in the extension documentation ([#6735](https://github.com/earendil-works/pi/issues/6735)).
 - Fixed Kimi Coding sessions to show API-equivalent implied costs with the subscription indicator.
 - Fixed OpenAI Responses early stream endings to trigger automatic retry instead of ending the agent run ([#6727](https://github.com/earendil-works/pi/issues/6727)).
+- Fixed interactive model selection to disambiguate identical model IDs by provider and prefer the current provider for exact unqualified matches.
+- Fixed subagent result details to explicitly mark child tool arguments as redacted without retaining argument names or values.
+- Fixed unsupported role and personal default subagent thinking levels to use the model's supported clamp while preserving strict rejection for unsupported task overrides.
 
 ## [0.80.10] - 2026-07-16
 

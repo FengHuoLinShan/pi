@@ -89,6 +89,34 @@ A backend decides whether a durable handle can be reattached. During recovery:
 
 Container, VM, or remote-sandbox integrations can implement `ProcessSessionBackend` with durable remote handles, `attach`, `status`, and `terminate` operations.
 
+### Remote durable executor
+
+`RemoteProcessSessionBackend.connect()` supplies the standard implementation for a replay-capable remote executor:
+
+```typescript
+const backend = await RemoteProcessSessionBackend.connect(transport, {
+  pollIntervalMs: 250,
+  maxConsecutiveTransportFailures: 5,
+  environmentAllowlist: ["CI", "LANG"],
+});
+
+const { manager, recovery } = await ProcessSessionManager.open({
+  root: "/trusted/pi-state/processes",
+  artifactStore: store,
+  backend,
+});
+```
+
+The transport negotiates protocol version 1 and must attest durable handles, ordered cursor replay, cancellation, a bounded replay page, and a bounded output chunk. Start and terminate requests carry idempotency keys. The backend retries an ambiguously failed start a bounded number of times with the same key; the executor must durably return the same process handle for every duplicate start key. Exhausting that recovery budget reports an explicitly unknown start outcome. Persisted process handles bind the executor id, executor instance, protocol version, and last durably consumed event cursor.
+
+Host environment variables are not forwarded by default. `environmentAllowlist` explicitly selects names that may leave the host; when an execution boundary is also active, both the attested boundary policy and this remote allowlist must permit a name.
+
+Output and exit events use contiguous cursors. The manager writes output to `ArtifactStore` before advancing the handle cursor in its journal. After a client crash, a new backend instance starts replay after that persisted cursor, so acknowledged output is not duplicated and unacknowledged output is not skipped. Cursor gaps, invalid base64, oversized chunks, executor-instance mismatches, missing terminal events, and unsupported capabilities fail closed.
+
+The backend tolerates a bounded number of transient start and replay transport failures. `close()` disconnects local polling without terminating the remote process; reopening the manager with a newly negotiated backend reattaches it. `terminate()` requests remote cancellation, while the terminal event remains authoritative.
+
+`RemoteProcessExecutorTransport` is transport-neutral. An application can implement it over authenticated HTTPS, RPC, SSH, or a sandbox control plane. The adapter does not add authentication, encryption, server-side isolation, retention, or idempotency storage by itself. Those remain requirements of the remote executor.
+
 ## Interactive Managed Jobs
 
 Start pi with `--managed-jobs` to enable a user-controlled background process surface:
@@ -190,4 +218,4 @@ Environment values and output content are never copied into completion evidence.
 
 ## Integration Status
 
-These modules are exported from the public SDK and remain separate from the foreground `bash` implementation. The completion verifier is invoked only by a caller's explicit verification flow; it does not add background bash. The opt-in `/job` surface uses a bounded local manager with explicit user control. Importing the modules does not change existing `bash` behavior or session JSONL format.
+These modules are exported from the public SDK and remain separate from the foreground `bash` implementation. The completion verifier is invoked only by a caller's explicit verification flow; it does not add background bash. The opt-in `/job` surface uses a bounded local manager with explicit user control. Importing the modules does not change existing `bash` behavior. Replay-capable backends add optional backend cursors to version-1 process events and handles; local backends continue to omit them.

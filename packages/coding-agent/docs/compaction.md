@@ -45,12 +45,13 @@ You can also trigger manually with `/compact [instructions]`, where optional ins
 1. **Set the recent-history target**: Treat `keepRecentTokens` (default 20k) as an upper target and reduce it when the safe input budget cannot accommodate fixed context and summary headroom. Summary headroom is capped at the model output limit, 80% of `reserveTokens`, and 8192 tokens; split turns reserve up to twice that amount.
 2. **Find cut point**: Walk backwards from the newest message, accumulating token estimates until the effective recent-history target is reached
 3. **Extract messages**: Collect messages from the previous kept boundary (or session start) up to the cut point
-4. **Generate summary**: Call LLM to summarize with structured format, passing the previous summary as iterative context when present
+4. **Generate summary**: Serialize history into JSON-framed untrusted data, omit hidden reasoning, bound large tool arguments and tool results, and call the LLM with a continuation-oriented structured format. If the complete summarization request is still too large, retain the largest safe head/tail projection while leaving canonical history unchanged.
 5. **Validate the candidate**: Rebuild the exact post-compaction provider context and estimate it against `safeInputTokens`
 6. **Retry once if needed**: If the candidate is too large, lower the recent-history target, request a shorter checkpoint, and regenerate once. Manual and extension-provided compactions fail if they still exceed the budget.
 7. **Trim a request projection when automatic recovery still cannot fit**: Replace old tool-result images, truncate old tool-result text, then truncate unsigned, non-redacted plaintext thinking. User input, system prompt, tools, assistant text, tool calls, signed/redacted thinking, and summaries are never trimmed. If protected content alone is too large, the provider request is blocked.
-8. **Append entry**: Save only a validated `CompactionEntry` with its summary and `firstKeptEntryId`. Request trimming never changes JSONL history, exports, or later session history.
-9. **Reload**: Session reloads, using summary + messages from `firstKeptEntryId` onwards.
+8. **Reject incomplete checkpoints**: Empty summary text and responses stopped by the model output limit are rejected instead of being persisted.
+9. **Append entry**: Save only a validated `CompactionEntry` with its summary and `firstKeptEntryId`. Request trimming and summarization projections never change JSONL history, exports, or later session history.
+10. **Reload**: Session reloads, using summary + messages from `firstKeptEntryId` onwards.
 
 ```
 Before compaction:
@@ -110,9 +111,11 @@ Split turn (one huge turn exceeds budget):
   turnPrefixMessages = [usr, ass, tool, ass, tool, tool]
 ```
 
-For split turns, pi generates two summaries and merges them:
-1. **History summary**: Previous context (if any)
-2. **Turn prefix summary**: The early part of the split turn
+For split turns, pi generates the two independent summaries concurrently and merges them in explicit recency order:
+1. **Historical context**: Previous complete turns (if any)
+2. **Active turn prefix**: The discarded early part of the split turn
+
+The retained suffix follows the merged summary and is authoritative. A manual `/compact` focus prompt applies to the active turn prefix, not to older history that may have no evidence about the current task. Prefix summaries do not infer final status or mark work blocked merely because completion evidence may exist in the retained suffix.
 
 ### Cut Point Rules
 
@@ -232,6 +235,9 @@ Both compaction and branch summarization use the same structured format:
 ## Constraints & Preferences
 - [Requirements mentioned by user]
 
+## Working State
+- [Workspace, branch, active files, runtime state, and uncommitted changes]
+
 ## Progress
 ### Done
 - [x] [Completed tasks]
@@ -241,6 +247,9 @@ Both compaction and branch summarization use the same structured format:
 
 ### Blocked
 - [Issues, if any]
+
+## Verification
+- [Passed/failed checks and important exact results, or "Not run"]
 
 ## Key Decisions
 - **[Decision]**: [Rationale]
@@ -263,19 +272,18 @@ path/to/changed.ts
 
 ### Message Serialization
 
-Before summarization, messages are serialized to text via [`serializeConversation()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/utils.ts):
+Before summarization, messages are projected without mutating session history, serialized via [`serializeConversation()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/utils.ts), then JSON-encoded inside explicit untrusted-data tags:
 
 ```
 [User]: What they said
-[Assistant thinking]: Internal reasoning
 [Assistant]: Response text
 [Assistant tool calls]: read(path="foo.ts"); edit(path="bar.ts", ...)
 [Tool result]: Output from tool
 ```
 
-This prevents the model from treating it as a conversation to continue.
+Hidden reasoning is omitted. Large tool argument values are bounded with path/cwd/command-like fields ordered first, and the final serialized argument list is capped. Tool results keep only a bounded prefix plus an explicit retry marker; their tail is not copied into the summary request.
 
-Tool results are truncated to 2000 characters during serialization. Content beyond that limit is replaced with a marker indicating how many characters were truncated. This keeps summarization requests within reasonable token budgets, since tool results (especially from `read` and `bash`) are typically the largest contributors to context size.
+The complete request, including system instructions, previous summary, framing, and output reservation, is checked before the provider call. When it does not fit, pi uses a deterministic head/tail projection of the overall conversation and previous checkpoint. Canonical messages remain intact. JSON encoding prevents conversation text from closing the data tags and masquerading as summarizer instructions.
 
 ## Custom Summarization via Extensions
 
@@ -336,7 +344,6 @@ pi.on("session_before_compact", async (event, ctx) => {
   );
   // Returns:
   // [User]: message text
-  // [Assistant thinking]: thinking content
   // [Assistant]: response text
   // [Assistant tool calls]: read(path="..."); bash(command="...")
   // [Tool result]: output text

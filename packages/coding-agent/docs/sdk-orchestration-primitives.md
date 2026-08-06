@@ -2,6 +2,34 @@
 
 The coding-agent package exposes optional workspace and orchestration primitives for SDK hosts. `createAgentSession()` only enables them when passed explicitly. The interactive CLI can opt into a persistent `WorkspaceOverlay` with `--workspace-overlay` or reviewed multi-candidate runs with `--shadow-runs`.
 
+## Local verified work runtime
+
+`LocalVerifiedWorkRuntime` turns a persisted `WorkGraph` into an executable local scheduler. It recovers interrupted running nodes, claims ready nodes through optimistic revisions, executes compatible `parallel-read` nodes concurrently, and serializes every progress, budget, lease, and terminal-state mutation.
+
+```ts
+const runtime = new LocalVerifiedWorkRuntime(store, {
+  execute: async (node, context) => {
+    if (node.policy === "isolated-mutation") {
+      await context.acquireLease({
+        id: `write-${node.id}`,
+        resource: "packages/agent",
+        mode: "write",
+      });
+    }
+    const result = await executeNode(node, context.signal);
+    return {
+      status: result.passed ? "succeeded" : "failed",
+      summary: result.summary,
+      evidence: result.evidence,
+    };
+  },
+});
+
+const report = await runtime.run(graph.id, { signal });
+```
+
+Only `parallel-read` nodes share an execution batch. Mutation, verification, approval, apply, and inline nodes are claimed one at a time. The runtime never invents an executor, retries an unsafe action, or treats pending descendants as complete. A graph passes only when every node succeeds.
+
 ## Transactional workspace overlays
 
 `WorkspaceOverlay` materializes an isolated copy of a workspace and records a base revision for every file. Passing it to `createAgentSession()` routes built-in file, search, and bash tools into the overlay.
@@ -24,7 +52,9 @@ await overlay.applyPatchSet(patchSet);
 
 PatchSets include creates, updates, deletes, modes, content revisions, and text patches where available. Application preflight verifies every base revision before mutation. Application uses same-directory staging, backups, a durable journal, post-write verification, and compensating rollback. Reopening an overlay rolls back a prepared journal or finalizes a committed journal. `discard()` is explicit.
 
-In interactive CLI mode, built-in tools run in the overlay and `/overlay review`, `/overlay status`, `/overlay apply`, and `/overlay discard` manage the transaction. Applying or discarding exits the process so a later run starts from a fresh base snapshot. The CLI requires a persisted session and stores overlay state by session id under the agent directory. It also initializes independent Git metadata inside the overlay for local `git status` and `git diff`; that metadata is excluded from the PatchSet.
+`ReviewablePatchStack` can capture immutable cumulative PatchSet checkpoints from one overlay. Each layer has an optimistic stack revision and an explicit pending, approved, or rejected review state. Applying requires every layer to be approved and delegates the final cumulative PatchSet back to `WorkspaceOverlay.applyPatchSet()`, so stack review never bypasses workspace conflict detection or rollback.
+
+In interactive CLI mode, built-in tools run in the overlay. Agent settlement captures cumulative Patch Stack checkpoints; `/overlay stack`, `/overlay review [layer-id]`, `/overlay approve [layer-id]`, and `/overlay reject [layer-id]` expose review decisions. `/overlay apply` performs a final cumulative review, approves remaining pending layers, and applies through the overlay transaction. `/overlay status` and `/overlay discard` inspect or abandon the transaction. Applying or discarding exits the process so a later run starts from a fresh base snapshot. The CLI requires a persisted session and stores overlay state by session id under the agent directory. It also initializes independent Git metadata inside the overlay for local `git status` and `git diff`; that metadata is excluded from the PatchSet.
 
 An overlay cannot be combined with `executionBoundary`, custom built-in operation overrides, or arbitrary allowed roots. `.git` is excluded by default, escaping symlinks are rejected, and worktree-style `.git` files cannot be copied.
 
@@ -49,6 +79,20 @@ const impact = graph.findImpactPaths(["run"], {
 ```
 
 Updates replace one file atomically under an expected revision. Snapshots are deterministic and restorable; node/edge ids have single-file ownership; targets may remain unresolved; forward, reverse, and impact queries have explicit depth, path, and edge-kind bounds.
+
+## Architecture fitness
+
+`loadArchitectureFitnessPlan()` reads the verified project file `.pi/architecture.json`. `evaluateArchitectureFitness()` evaluates its revisioned rules against a deterministic `CodeGraphSnapshot`.
+
+Supported rules prohibit selected dependencies, restrict a layer to explicit destinations, reject file-level cycles, and bound the number of files depending on selected files. Each violation has a stable content-derived id. `baselineViolationIds` suppresses only exact known violations, so unrelated architecture debt cannot mask a new regression. `compareArchitectureFitness()` reports new, resolved, and unchanged violation ids between two content-addressed reports.
+
+The optional CodeGraph extension exposes the same evaluation through `code_graph` action `fitness` after synchronizing the current logical workspace. It requires a trusted project because the repository controls the rule file.
+
+## Revisioned engineering memory
+
+`SessionEngineeringMemoryStore` persists append-only `RevisionedEngineeringMemory` snapshots on the selected session branch with optimistic revisions. `resolveWorkspaceMemorySources()` hashes source paths from the current logical `WorkspaceView`, and `prepareWorkspaceEngineeringMemory()` revalidates every active source-bound record before compiling bounded context.
+
+Goal mode creates one memory per goal. Its `remember` action records source-grounded facts, decisions with rationale and alternatives, attempts with outcomes, or evidence. Replacements retain the prior record in history while removing it from active context. Boundary-backed hosts must provide their own source resolver when source-bound memory is required.
 
 ## Shadow runs
 
