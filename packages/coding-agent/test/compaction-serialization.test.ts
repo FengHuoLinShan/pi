@@ -3,8 +3,8 @@ import { describe, expect, it } from "vitest";
 import { serializeConversation } from "../src/core/compaction/utils.ts";
 
 describe("serializeConversation", () => {
-	it("should truncate long tool results", () => {
-		const longContent = "x".repeat(5000);
+	it("should retain only the prefix of long tool results", () => {
+		const longContent = `HEAD-${"x".repeat(4990)}-TAIL`;
 		const messages: Message[] = [
 			{
 				role: "toolResult",
@@ -19,10 +19,12 @@ describe("serializeConversation", () => {
 		const result = serializeConversation(messages);
 
 		expect(result).toContain("[Tool result]:");
-		expect(result).toContain("[... 3000 more characters truncated]");
+		expect(result).toContain(
+			"[Tool result truncated before model request: 3000 characters omitted. Re-run the tool with narrower arguments.]",
+		);
 		expect(result).not.toContain("x".repeat(3000));
-		// First 2000 chars should be present
-		expect(result).toContain("x".repeat(2000));
+		expect(result).toContain("HEAD-");
+		expect(result).not.toContain("-TAIL");
 	});
 
 	it("should not truncate short tool results", () => {

@@ -1,6 +1,7 @@
 import type { Context } from "@earendil-works/pi-ai/compat";
 import { describe, expect, it } from "vitest";
 import {
+	calculateSummaryHeadroomTokens,
 	estimateFixedPrefixTokens,
 	evaluateContextBudget,
 	trimContextToBudget,
@@ -10,6 +11,11 @@ import {
 const model = { api: "openai-responses", provider: "openai", id: "test", contextWindow: 3_000 } as const;
 
 describe("compaction context budgets", () => {
+	it("reserves configured summary output when a model reports no explicit output cap", () => {
+		expect(calculateSummaryHeadroomTokens({ maxTokens: 0 }, 10_000, false)).toBe(8_000);
+		expect(calculateSummaryHeadroomTokens({ maxTokens: 0 }, 10_000, true)).toBe(10_000);
+	});
+
 	it("counts the system prompt, tool definitions, and messages without usage data", () => {
 		const context: Context = {
 			systemPrompt: "s".repeat(40),

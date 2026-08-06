@@ -82,7 +82,8 @@ export function calculateSummaryHeadroomTokens(
 	reserveTokens: number,
 	isSplitTurn: boolean,
 ): number {
-	const base = Math.min(model.maxTokens, Math.floor(reserveTokens * 0.8), MAX_SUMMARY_HEADROOM_TOKENS);
+	const modelOutputLimit = model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY;
+	const base = Math.min(modelOutputLimit, Math.floor(reserveTokens * 0.8), MAX_SUMMARY_HEADROOM_TOKENS);
 	return isSplitTurn ? Math.min(reserveTokens, base * 2) : base;
 }
 

@@ -5,7 +5,12 @@
  * and after compaction the session is reloaded.
  */
 
-import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import {
+	type AgentMessage,
+	assertContextFitsOutputReservation,
+	type StreamFn,
+	type ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { convertToLlm } from "../messages.ts";
@@ -22,8 +27,11 @@ import {
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
+	projectMessagesForSummarization,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
+	serializePromptData,
+	truncateConversationForSummary,
 } from "./utils.ts";
 
 // ============================================================================
@@ -443,6 +451,13 @@ export function findCutPoint(
 
 const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
+Rules:
+- Preserve the active objective, latest user corrections, hard constraints, unfinished work, blockers, verified evidence, and exact continuation commands.
+- Treat newer user instructions as overriding older conflicting instructions.
+- Distinguish verified results from assumptions. Never mark work complete without evidence in the conversation.
+- Collapse completed history aggressively. Do not copy the transcript, hidden reasoning, large tool payloads, or superseded details.
+- Preserve exact file paths, symbols, error messages, test counts, and external state only when they remain relevant to continuation.
+
 Use this EXACT format:
 
 ## Goal
@@ -451,6 +466,10 @@ Use this EXACT format:
 ## Constraints & Preferences
 - [Any constraints, preferences, or requirements mentioned by user]
 - [Or "(none)" if none were mentioned]
+
+## Working State
+- [Current workspace, branch, active files, runtime/session state, and uncommitted changes needed to continue]
+- [Or "(none)" if not applicable]
 
 ## Progress
 ### Done
@@ -462,6 +481,10 @@ Use this EXACT format:
 ### Blocked
 - [Issues preventing progress, if any]
 
+## Verification
+- [Checks that passed or failed, with exact commands/results when important]
+- [Or "Not run" if no verification occurred]
+
 ## Key Decisions
 - **[Decision]**: [Brief rationale]
 
@@ -472,17 +495,18 @@ Use this EXACT format:
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise and continuation-oriented.`;
 
-const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to reconcile with the existing checkpoint in <previous-summary-json>.
 
 Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
-- UPDATE "Next Steps" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
+- Preserve only continuation-critical facts; remove resolved, stale, duplicated, superseded, or contradicted details.
+- Newer user instructions override older conflicting instructions.
+- Add new progress, decisions, blockers, evidence, and context.
+- Move work to Done only when the new messages contain completion evidence.
+- Keep unresolved failures and validation gaps explicit.
+- Preserve exact file paths, symbols, error messages, test counts, and commands when still relevant.
+- Do not copy hidden reasoning or large tool payloads.
 
 Use this EXACT format:
 
@@ -491,6 +515,9 @@ Use this EXACT format:
 
 ## Constraints & Preferences
 - [Preserve existing, add new ones discovered]
+
+## Working State
+- [Current workspace, branch, active files, runtime/session state, and uncommitted changes needed to continue]
 
 ## Progress
 ### Done
@@ -502,8 +529,11 @@ Use this EXACT format:
 ### Blocked
 - [Current blockers - remove if resolved]
 
+## Verification
+- [Passed and failed checks, or "Not run"]
+
 ## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+- **[Decision]**: [Brief rationale]
 
 ## Next Steps
 1. [Update based on current state]
@@ -511,7 +541,78 @@ Use this EXACT format:
 ## Critical Context
 - [Preserve important context, add new if needed]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise and continuation-oriented.`;
+
+/** Build the largest head/tail summary projection that preserves the model output reservation. */
+export function buildBoundedSummarizationContext(
+	conversationText: string,
+	instructions: string,
+	model: Model<any>,
+	maxTokens: number,
+	previousSummary?: string,
+): Context {
+	const previousSummaryText = previousSummary ?? "";
+	const totalPayloadChars = conversationText.length + previousSummaryText.length;
+	const buildContext = (payloadCharLimit: number): Context => {
+		let previousLimit = previousSummary ? Math.min(previousSummaryText.length, Math.ceil(payloadCharLimit / 2)) : 0;
+		let conversationLimit = Math.min(conversationText.length, Math.max(0, payloadCharLimit - previousLimit));
+		let remaining = Math.max(0, payloadCharLimit - previousLimit - conversationLimit);
+		if (remaining > 0 && previousSummary) {
+			const additionalPrevious = Math.min(remaining, previousSummaryText.length - previousLimit);
+			previousLimit += additionalPrevious;
+			remaining -= additionalPrevious;
+		}
+		if (remaining > 0) {
+			conversationLimit += Math.min(remaining, conversationText.length - conversationLimit);
+		}
+
+		const projectedConversation = truncateConversationForSummary(conversationText, conversationLimit);
+		let promptText = `<conversation-json>\n${serializePromptData(projectedConversation)}\n</conversation-json>\n\n`;
+		if (previousSummary) {
+			const projectedPrevious = truncateConversationForSummary(previousSummaryText, previousLimit);
+			promptText += `<previous-summary-json>\n${serializePromptData(projectedPrevious)}\n</previous-summary-json>\n\n`;
+		}
+		promptText += instructions;
+		return {
+			systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: promptText }],
+					timestamp: Date.now(),
+				},
+			],
+		};
+	};
+
+	const fullContext = buildContext(totalPayloadChars);
+	try {
+		assertContextFitsOutputReservation(fullContext, model, maxTokens);
+		return fullContext;
+	} catch {
+		// Find the largest reproducible projection that fits.
+	}
+
+	let low = 0;
+	let high = Math.max(0, totalPayloadChars - 1);
+	let best: Context | undefined;
+	while (low <= high) {
+		const midpoint = Math.floor((low + high) / 2);
+		const candidate = buildContext(midpoint);
+		try {
+			assertContextFitsOutputReservation(candidate, model, maxTokens);
+			best = candidate;
+			low = midpoint + 1;
+		} catch {
+			high = midpoint - 1;
+		}
+	}
+	if (best) return best;
+
+	const emptyContext = buildContext(0);
+	assertContextFitsOutputReservation(emptyContext, model, maxTokens);
+	return emptyContext;
+}
 
 function createSummarizationOptions(
 	model: Model<any>,
@@ -572,41 +673,29 @@ export async function generateSummary(
 
 	// Serialize conversation to text so model doesn't try to continue it
 	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
-	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
-
-	// Build the prompt with conversation wrapped in tags
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += basePrompt;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
+	const convertedMessages = projectMessagesForSummarization(convertToLlm(currentMessages));
+	const conversationText = serializeConversation(convertedMessages);
 
 	const completionOptions = createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel);
 
-	const response = await completeSummarization(
-		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		completionOptions,
-		streamFn,
-	);
+	const context = buildBoundedSummarizationContext(conversationText, basePrompt, model, maxTokens, previousSummary);
+	const response = await completeSummarization(model, context, completionOptions, streamFn);
 
 	if (response.stopReason === "error") {
 		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
+	}
+	if (response.stopReason === "length") {
+		throw new Error("Summarization reached the model output limit");
 	}
 
 	const textContent = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map((c) => c.text)
-		.join("\n");
+		.join("\n")
+		.trim();
+	if (textContent.length === 0) {
+		throw new Error("Summarization returned no text");
+	}
 
 	return textContent;
 }
@@ -726,7 +815,7 @@ export function prepareCompaction(
 // Main compaction function
 // ============================================================================
 
-const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the DISCARDED PREFIX of an active turn that was too large to keep. The retained SUFFIX is newer and authoritative.
 
 Summarize the prefix to provide context for the retained suffix:
 
@@ -739,6 +828,7 @@ Summarize the prefix to provide context for the retained suffix:
 ## Context for Suffix
 - [Information needed to understand the retained recent work]
 
+Do not infer the active turn's final status from this prefix. Do not mark work blocked or unknown merely because completion evidence may be in the retained suffix.
 Be concise. Focus on what's needed to understand the kept suffix.`;
 
 /**
@@ -774,23 +864,23 @@ export async function compact(
 	let summary: string;
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		const historyResult =
+		const historyPromise =
 			messagesToSummarize.length > 0
-				? await generateSummary(
+				? generateSummary(
 						messagesToSummarize,
 						model,
 						settings.reserveTokens,
 						apiKey,
 						headers,
 						signal,
-						customInstructions,
+						undefined,
 						previousSummary,
 						thinkingLevel,
 						streamFn,
 						env,
 					)
-				: "No prior history.";
-		const turnPrefixResult = await generateTurnPrefixSummary(
+				: Promise.resolve("No prior history.");
+		const turnPrefixPromise = generateTurnPrefixSummary(
 			turnPrefixMessages,
 			model,
 			settings.reserveTokens,
@@ -800,9 +890,10 @@ export async function compact(
 			signal,
 			thinkingLevel,
 			streamFn,
+			customInstructions,
 		);
-		// Merge into single summary
-		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
+		const [historyResult, turnPrefixResult] = await Promise.all([historyPromise, turnPrefixPromise]);
+		summary = `**Historical Context (older than the active split turn):**\n\n${historyResult}\n\n---\n\n**Active Turn Prefix (newer than history; retained suffix is authoritative):**\n\n${turnPrefixResult}`;
 	} else {
 		// Just generate history summary
 		summary = await generateSummary(
@@ -849,25 +940,21 @@ async function generateTurnPrefixSummary(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
+	customInstructions?: string,
 ): Promise<string> {
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	); // Smaller budget for turn prefix
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
+	const convertedMessages = projectMessagesForSummarization(convertToLlm(messages));
+	const conversationText = serializeConversation(convertedMessages);
+	const instructions = customInstructions
+		? `${TURN_PREFIX_SUMMARIZATION_PROMPT}\n\nAdditional focus: ${customInstructions}`
+		: TURN_PREFIX_SUMMARIZATION_PROMPT;
+	const context = buildBoundedSummarizationContext(conversationText, instructions, model, maxTokens);
 	const response = await completeSummarization(
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+		context,
 		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel),
 		streamFn,
 	);
@@ -875,9 +962,17 @@ async function generateTurnPrefixSummary(
 	if (response.stopReason === "error") {
 		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);
 	}
+	if (response.stopReason === "length") {
+		throw new Error("Turn prefix summarization reached the model output limit");
+	}
 
-	return response.content
+	const textContent = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map((c) => c.text)
-		.join("\n");
+		.join("\n")
+		.trim();
+	if (textContent.length === 0) {
+		throw new Error("Turn prefix summarization returned no text");
+	}
+	return textContent;
 }

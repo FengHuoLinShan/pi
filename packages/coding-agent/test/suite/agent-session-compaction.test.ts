@@ -177,6 +177,80 @@ describe("AgentSession compaction characterization", () => {
 		expect(getStreamCallCount()).toBe(1);
 	});
 
+	it("projects oversized canonical tool text before summarization and recovers afterward", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 2 } },
+			models: [{ id: "faux-1", contextWindow: 32_768, maxTokens: 4_096 }],
+		});
+		harnesses.push(harness);
+		const now = Date.now();
+		const oversized = `VISIBLE_HEAD:${"x".repeat(300_000)}:PRIVATE_TAIL`;
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "run the tool" }],
+			timestamp: now,
+		});
+		harness.sessionManager.appendMessage({
+			...createAssistant(harness, { stopReason: "toolUse", timestamp: now + 1 }),
+			content: [fauxToolCall("oversized", {}, { id: "compact-tool" })],
+		});
+		harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "compact-tool",
+			toolName: "oversized",
+			content: [{ type: "text", text: oversized }],
+			details: {},
+			isError: false,
+			timestamp: now + 2,
+		});
+		harness.sessionManager.appendMessage({
+			...createAssistant(harness, { stopReason: "stop", timestamp: now + 3 }),
+			content: [{ type: "text", text: "tool complete" }],
+		});
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "k" }],
+			timestamp: now + 4,
+		});
+		harness.sessionManager.appendMessage({
+			...createAssistant(harness, { stopReason: "stop", timestamp: now + 5 }),
+			content: [{ type: "text", text: "a" }],
+		});
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		const storedToolResult = harness.sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "message" && entry.message.role === "toolResult");
+		let summarizerPrompt = "";
+		harness.setResponses([
+			(context) => {
+				const message = context.messages[0];
+				summarizerPrompt =
+					message?.role === "user" && Array.isArray(message.content)
+						? message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("")
+						: "";
+				return fauxAssistantMessage("safe compacted summary");
+			},
+			fauxAssistantMessage("later response"),
+		]);
+
+		await harness.session.compact();
+		await harness.session.prompt("continue after compaction");
+
+		expect(summarizerPrompt).toContain("Tool result truncated before model request");
+		expect(summarizerPrompt).not.toContain("PRIVATE_TAIL");
+		expect(storedToolResult).toMatchObject({
+			type: "message",
+			message: { content: [{ text: expect.stringContaining("PRIVATE_TAIL") }] },
+		});
+		expect(
+			harness.session.messages.some(
+				(message) =>
+					message.role === "assistant" &&
+					message.content.some((part) => part.type === "text" && part.text === "later response"),
+			),
+		).toBe(true);
+	});
+
 	it("regenerates once with a tighter retained-history target when the first result is too large", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { reserveTokens: 100, keepRecentTokens: 10_000 } },
@@ -189,12 +263,11 @@ describe("AgentSession compaction characterization", () => {
 			fauxAssistantMessage("x".repeat(4000)),
 			fauxAssistantMessage("first prefix"),
 			fauxAssistantMessage("short checkpoint"),
-			fauxAssistantMessage("short prefix"),
 		]);
 
 		const result = await harness.session.compact();
 
-		expect(harness.faux.state.callCount).toBe(4);
+		expect(harness.faux.state.callCount).toBe(3);
 		expect(result.summary).toContain("short checkpoint");
 		expect(result.budget).toMatchObject({
 			attempts: 2,
@@ -216,13 +289,12 @@ describe("AgentSession compaction characterization", () => {
 		harness.setResponses([
 			fauxAssistantMessage("x".repeat(4000)),
 			fauxAssistantMessage("first prefix"),
-			fauxAssistantMessage("y".repeat(20_000)),
-			fauxAssistantMessage("z".repeat(20_000)),
+			fauxAssistantMessage("y".repeat(40_000)),
 		]);
 
 		await expect(harness.session.compact()).rejects.toThrow("Compaction still exceeds the safe input budget");
 
-		expect(harness.faux.state.callCount).toBe(4);
+		expect(harness.faux.state.callCount).toBe(3);
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);
 	});
 
@@ -262,7 +334,7 @@ describe("AgentSession compaction characterization", () => {
 			parameters,
 			async execute() {
 				return {
-					content: [{ type: "text" as const, text: `original-head-${"x".repeat(16_000)}-original-tail` }],
+					content: [{ type: "text" as const, text: `original-head-${"x".repeat(32_000)}-original-tail` }],
 					details: {},
 				};
 			},
@@ -270,12 +342,14 @@ describe("AgentSession compaction characterization", () => {
 		const harness = await createHarness({
 			tools: [tool],
 			settings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 } },
-			models: [{ id: "faux-1", contextWindow: 3_000, maxTokens: 100 }],
+			models: [{ id: "faux-1", contextWindow: 6_000, maxTokens: 100 }],
 		});
 		harnesses.push(harness);
+		const recoveredAnswer = createAssistant(harness, { stopReason: "stop" });
+		recoveredAnswer.content = [{ type: "text", text: "recovered answer" }];
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("large_result", {}, { id: "call-large" }), { stopReason: "toolUse" }),
-			fauxAssistantMessage("recovered answer"),
+			recoveredAnswer,
 			fauxAssistantMessage("post-response checkpoint"),
 		]);
 
@@ -303,6 +377,106 @@ describe("AgentSession compaction characterization", () => {
 					message.content.some((part) => part.type === "text" && part.text === "recovered answer"),
 			),
 		).toBe(true);
+	});
+
+	it("recovers a pressured incomplete tool turn after an earlier compaction", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 } },
+			models: [{ id: "faux-1", contextWindow: 6_000, maxTokens: 100 }],
+		});
+		harnesses.push(harness);
+		const now = Date.now();
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "already summarized user" }],
+			timestamp: now - 5,
+		});
+		harness.sessionManager.appendMessage({
+			...createAssistant(harness, { stopReason: "stop", timestamp: now - 4 }),
+			content: [{ type: "text", text: "already summarized assistant" }],
+		});
+		const firstKeptEntryId = harness.sessionManager.getEntries()[0]!.id;
+		harness.sessionManager.appendCompaction("earlier checkpoint", firstKeptEntryId, 100, undefined, false);
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "run poisoned legacy tool" }],
+			timestamp: now - 3,
+		});
+		harness.sessionManager.appendMessage({
+			...createAssistant(harness, { stopReason: "toolUse", timestamp: now - 2 }),
+			content: [fauxToolCall("legacy_tool", {}, { id: "legacy-call" })],
+		});
+		harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "legacy-call",
+			toolName: "legacy_tool",
+			content: [{ type: "text", text: `VISIBLE_HEAD:${"x".repeat(300_000)}:PRIVATE_TAIL` }],
+			details: {},
+			isError: false,
+			timestamp: now - 1,
+		});
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		const storedToolResult = harness.sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "message" && entry.message.role === "toolResult");
+		const entryCountBeforeRecovery = harness.sessionManager.getEntries().length;
+
+		await expect(harness.session.compact()).rejects.toThrow(
+			"Recent tool output exceeds safe request limits but cannot be compacted until the tool turn is complete. Send a follow-up prompt to recover with a bounded projection.",
+		);
+
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(harness.sessionManager.getEntries()).toHaveLength(entryCountBeforeRecovery);
+		expect(storedToolResult).toMatchObject({
+			type: "message",
+			message: { content: [{ text: expect.stringContaining("PRIVATE_TAIL") }] },
+		});
+
+		let summarizerPrompt = "";
+		let finalProviderContext = "";
+		harness.setResponses([
+			(context) => {
+				summarizerPrompt = JSON.stringify(context.messages);
+				return fauxAssistantMessage("recovery checkpoint");
+			},
+			(context) => {
+				finalProviderContext = JSON.stringify(context.messages);
+				return fauxAssistantMessage("recovered final answer");
+			},
+		]);
+
+		await harness.session.prompt("continue after poisoned tool turn");
+
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(summarizerPrompt).toContain("Tool result truncated before model request");
+		expect(summarizerPrompt).not.toContain("PRIVATE_TAIL");
+		expect(finalProviderContext).not.toContain("PRIVATE_TAIL");
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(2);
+		expect(storedToolResult).toMatchObject({
+			type: "message",
+			message: { content: [{ text: expect.stringContaining("PRIVATE_TAIL") }] },
+		});
+		expect(
+			harness.session.messages.some(
+				(message) =>
+					message.role === "assistant" &&
+					message.content.some((part) => part.type === "text" && part.text === "recovered final answer"),
+			),
+		).toBe(true);
+	});
+
+	it("keeps the normal Nothing to compact result for a small safe session", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "small safe session" }],
+			timestamp: Date.now(),
+		});
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+
+		await expect(harness.session.compact()).rejects.toThrow("Nothing to compact (session too small)");
+		expect(harness.faux.state.callCount).toBe(0);
 	});
 
 	it("fails closed when an oversized protected user message cannot be compacted or trimmed", async () => {

@@ -1,4 +1,4 @@
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { assistantMsg, userMsg } from "../../utilities.ts";
 import { createHarness, type Harness } from "../harness.ts";
@@ -10,6 +10,48 @@ describe("issue #6324 branch summary ambient auth", () => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+	});
+
+	it("never sends oversized canonical tool-result text to the summarizer", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const targetId = harness.sessionManager.appendMessage(userMsg("branch anchor"));
+		harness.sessionManager.appendMessage(
+			fauxAssistantMessage(fauxToolCall("branch_tool", {}, { id: "branch-tool-call" }), {
+				stopReason: "toolUse",
+			}),
+		);
+		const toolResultId = harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "branch-tool-call",
+			toolName: "branch_tool",
+			content: [{ type: "text", text: `VISIBLE_TOOL_HEAD:${"x".repeat(2_000_000)}:PRIVATE_TOOL_TAIL` }],
+			details: {},
+			isError: false,
+			timestamp: Date.now(),
+		});
+		harness.sessionManager.appendMessage(assistantMsg("visible branch answer"));
+		let serializedProviderContext = "";
+		harness.setResponses([
+			(context) => {
+				serializedProviderContext = JSON.stringify(context);
+				return fauxAssistantMessage("safe branch summary");
+			},
+		]);
+
+		const result = await harness.session.navigateTree(targetId, { summarize: true });
+
+		expect(result.cancelled).toBe(false);
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(serializedProviderContext).toContain("visible branch answer");
+		expect(serializedProviderContext).not.toContain("VISIBLE_TOOL_HEAD");
+		expect(serializedProviderContext).not.toContain("PRIVATE_TOOL_TAIL");
+		const storedToolResult = harness.sessionManager.getEntry(toolResultId);
+		expect(storedToolResult).toMatchObject({
+			type: "message",
+			message: { content: [{ text: expect.stringContaining("PRIVATE_TOOL_TAIL") }] },
+		});
+		expect(result.summaryEntry?.summary).toContain("safe branch summary");
 	});
 
 	it("summarizes tree branches when request auth has no API key", async () => {

@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
-import type { Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
+import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
@@ -15,14 +15,14 @@ import {
 	createCustomMessage,
 } from "../messages.ts";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
-import { estimateTokens } from "./compaction.ts";
+import { buildBoundedSummarizationContext, estimateTokens } from "./compaction.ts";
 import {
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
-	SUMMARIZATION_SYSTEM_PROMPT,
+	projectMessagesForSummarization,
 	serializeConversation,
 } from "./utils.ts";
 
@@ -251,6 +251,8 @@ Summary of that exploration:
 
 const BRANCH_SUMMARY_PROMPT = `Create a structured summary of this conversation branch for context when returning later.
 
+Preserve the branch objective, latest user corrections, constraints, unfinished work, blockers, verified evidence, and exact next action. Collapse completed or superseded detail, distinguish evidence from assumptions, and do not copy hidden reasoning or large tool payloads.
+
 Use this EXACT format:
 
 ## Goal
@@ -259,6 +261,9 @@ Use this EXACT format:
 ## Constraints & Preferences
 - [Any constraints, preferences, or requirements mentioned]
 - [Or "(none)" if none were mentioned]
+
+## Working State
+- [Workspace, branch, active files, and uncommitted state needed to resume]
 
 ## Progress
 ### Done
@@ -270,13 +275,16 @@ Use this EXACT format:
 ### Blocked
 - [Issues preventing progress, if any]
 
+## Verification
+- [Checks and results, or "Not run"]
+
 ## Key Decisions
 - **[Decision]**: [Brief rationale]
 
 ## Next Steps
 1. [What should happen next to continue this work]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise and continuation-oriented.`;
 
 /**
  * Generate a summary of abandoned branch entries.
@@ -302,7 +310,7 @@ export async function generateBranchSummary(
 
 	// Token budget = context window minus reserved space for prompt + response
 	const contextWindow = model.contextWindow || 128000;
-	const tokenBudget = contextWindow - reserveTokens;
+	const tokenBudget = Math.max(0, contextWindow - reserveTokens - Math.ceil(contextWindow * 0.02));
 
 	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
 
@@ -312,7 +320,7 @@ export async function generateBranchSummary(
 
 	// Transform to LLM-compatible messages, then serialize to text
 	// Serialization prevents the model from treating it as a conversation to continue
-	const llmMessages = convertToLlm(messages);
+	const llmMessages = projectMessagesForSummarization(convertToLlm(messages));
 	const conversationText = serializeConversation(llmMessages);
 
 	// Build prompt
@@ -324,21 +332,19 @@ export async function generateBranchSummary(
 	} else {
 		instructions = BRANCH_SUMMARY_PROMPT;
 	}
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
 	// Call LLM for summarization. Prefer the session stream function so SDK
 	// request behavior (timeouts, retries, attribution headers) stays consistent
 	// without running through agent state/events.
-	const context = { systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages };
-	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal, maxTokens: 2048 };
+	const maxTokens = Math.min(2048, model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);
+	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal, maxTokens };
+	let context: Context;
+	try {
+		context = buildBoundedSummarizationContext(conversationText, instructions, model, maxTokens);
+	} catch (error) {
+		return {
+			error: `Branch summary input exceeds the safe model budget: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
 	const response = streamFn
 		? await (await streamFn(model, context, requestOptions)).result()
 		: await completeSimple(model, context, requestOptions);
@@ -350,11 +356,19 @@ export async function generateBranchSummary(
 	if (response.stopReason === "error") {
 		return { error: response.errorMessage || "Summarization failed" };
 	}
+	if (response.stopReason === "length") {
+		return { error: "Branch summary reached the model output limit" };
+	}
 
-	let summary = response.content
+	const summaryText = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map((c) => c.text)
-		.join("\n");
+		.join("\n")
+		.trim();
+	if (summaryText.length === 0) {
+		return { error: "Branch summary returned no text" };
+	}
+	let summary = summaryText;
 
 	// Prepend preamble to provide context about the branch summary
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
