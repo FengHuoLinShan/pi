@@ -109,6 +109,57 @@ describe("model routing", () => {
 		expect(plan.evaluations[0]).toMatchObject({ eligible: false, issues: [{ code: "unavailable" }] });
 	});
 
+	it("fails closed on missing, failed, stale, or wrong-corpus eval qualifications", () => {
+		const qualified = candidate("qualified");
+		qualified.qualification = {
+			status: "qualified",
+			corpusId: "core",
+			corpusRevision: 4,
+			passRate: 1,
+			reportId: `sha256:${"a".repeat(64)}`,
+		};
+		const stale = candidate("stale");
+		stale.qualification = {
+			status: "qualified",
+			corpusId: "core",
+			corpusRevision: 3,
+			passRate: 0.8,
+			reportId: `sha256:${"b".repeat(64)}`,
+		};
+		const failed = candidate("failed");
+		failed.qualification = {
+			status: "failed",
+			corpusId: "other",
+			corpusRevision: 4,
+			passRate: 0,
+			reportId: `sha256:${"c".repeat(64)}`,
+		};
+		const plan = routeModels({
+			requestId: "quality-gated",
+			candidates: [candidate("untested"), stale, failed, qualified],
+			requirements: {
+				qualityGate: { required: true, corpusId: "core", minCorpusRevision: 4, minPassRate: 1 },
+			},
+		});
+
+		expect(plan.selected?.id).toBe("qualified");
+		expect(plan.evaluations.find((evaluation) => evaluation.candidate.id === "untested")?.issues).toContainEqual(
+			expect.objectContaining({ code: "qualification_missing" }),
+		);
+		expect(plan.evaluations.find((evaluation) => evaluation.candidate.id === "stale")?.issues).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ code: "qualification_revision_too_old" }),
+				expect.objectContaining({ code: "qualification_pass_rate_too_low" }),
+			]),
+		);
+		expect(plan.evaluations.find((evaluation) => evaluation.candidate.id === "failed")?.issues).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ code: "qualification_failed" }),
+				expect.objectContaining({ code: "qualification_corpus_mismatch" }),
+			]),
+		);
+	});
+
 	it("fails closed on malformed nested profiles and runtime requirements", () => {
 		const missingInput = candidate("missing-input");
 		missingInput.profile = {
@@ -132,6 +183,59 @@ describe("model routing", () => {
 				requestId: "bad-tools",
 				candidates: [candidate("tools")],
 				requirements: { tools: "required" } as unknown as Parameters<typeof routeModels>[0]["requirements"],
+			}),
+		).toThrowError(expect.objectContaining({ code: "invalid_request" }));
+
+		const qualificationWithHiddenContent = candidate("hidden-qualification");
+		qualificationWithHiddenContent.qualification = {
+			status: "qualified",
+			corpusId: "core",
+			corpusRevision: 1,
+			passRate: 1,
+			reportId: `sha256:${"d".repeat(64)}`,
+			rawResult: "must not flow into a route plan",
+		} as unknown as NonNullable<ModelRouteCandidate["qualification"]>;
+		expect(() =>
+			routeModels({ requestId: "hidden-qualification", candidates: [qualificationWithHiddenContent] }),
+		).toThrowError(expect.objectContaining({ code: "invalid_candidate" }));
+
+		expect(() =>
+			routeModels({
+				requestId: "misspelled-quality-gate",
+				candidates: [candidate("untested")],
+				requirements: {
+					qualityGate: { required: true, minPassRtae: 1 },
+				} as unknown as Parameters<typeof routeModels>[0]["requirements"],
+			}),
+		).toThrowError(expect.objectContaining({ code: "invalid_request" }));
+
+		const unknownCandidate = candidate("unknown-field") as ModelRouteCandidate & { secret?: string };
+		unknownCandidate.secret = "must not flow into the route plan";
+		expect(() => routeModels({ requestId: "unknown-field", candidates: [unknownCandidate] })).toThrowError(
+			expect.objectContaining({ code: "invalid_candidate" }),
+		);
+
+		const sparseProfile = candidate("sparse-profile");
+		sparseProfile.profile = {
+			...sparseProfile.profile,
+			input: { modalities: new Array<"text" | "image">(1) },
+		};
+		expect(() => routeModels({ requestId: "sparse-profile", candidates: [sparseProfile] })).toThrowError(
+			expect.objectContaining({ code: "invalid_candidate" }),
+		);
+
+		expect(() =>
+			routeModels({
+				requestId: "sparse-requirements",
+				candidates: [candidate("candidate")],
+				requirements: { modalities: new Array<"text" | "image">(1) },
+			}),
+		).toThrowError(expect.objectContaining({ code: "invalid_request" }));
+
+		expect(() =>
+			routeModels({
+				requestId: "sparse-candidates",
+				candidates: new Array<ModelRouteCandidate>(1),
 			}),
 		).toThrowError(expect.objectContaining({ code: "invalid_request" }));
 	});

@@ -133,14 +133,14 @@ describe("openai-completions empty tools handling", () => {
 		await streamSimple(
 			model,
 			{
-				messages: [{ role: "user", content: "x".repeat(8000), timestamp: Date.now() }],
+				messages: [{ role: "user", content: "x".repeat(24_000), timestamp: Date.now() }],
 			},
 			{ apiKey: "test" },
 		).result();
 
 		const params = mockState.lastParams as { max_tokens?: number; max_completion_tokens?: number };
 		expect(params.max_tokens).toBeUndefined();
-		expect(params.max_completion_tokens).toBe(3904);
+		expect(params.max_completion_tokens).toBe(3795);
 	});
 
 	it("clamps explicit maxTokens to remaining context", async () => {
@@ -150,14 +150,14 @@ describe("openai-completions empty tools handling", () => {
 		await streamSimple(
 			model,
 			{
-				messages: [{ role: "user", content: "x".repeat(8000), timestamp: Date.now() }],
+				messages: [{ role: "user", content: "x".repeat(24_000), timestamp: Date.now() }],
 			},
 			{ apiKey: "test", maxTokens: 7000 },
 		).result();
 
 		const params = mockState.lastParams as { max_tokens?: number; max_completion_tokens?: number };
 		expect(params.max_tokens).toBeUndefined();
-		expect(params.max_completion_tokens).toBe(3904);
+		expect(params.max_completion_tokens).toBe(3795);
 	});
 
 	it("uses conservative OpenAI-compatible fields for Cloudflare AI Gateway /compat models", async () => {

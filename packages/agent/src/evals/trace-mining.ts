@@ -489,6 +489,42 @@ function isExecutionSummary(value: unknown): value is ReplayEvalExecutionSummary
 	});
 }
 
+function hasCandidateReplayCoverage(fixture: MinedReplayEvalFixture): boolean {
+	const branch = fixture.candidateBranch;
+	if (
+		fixture.baseline.status !== "complete" ||
+		fixture.baseline.branchId !== `${fixture.id}-baseline` ||
+		branch.manifest.branchId !== `${fixture.id}-candidate` ||
+		branch.manifest.prefixEventCount !== fixture.criticalSequence - 1 ||
+		branch.stateAtFork?.lastSequence !== branch.manifest.prefixEventCount ||
+		branch.steps.length === 0 ||
+		fixture.baseline.items.length !== branch.steps.length
+	) {
+		return false;
+	}
+	let invokesSelectedAdapter = false;
+	for (let index = 0; index < branch.steps.length; index++) {
+		if (!(index in branch.steps) || !(index in fixture.baseline.items)) return false;
+		const step = branch.steps[index]!;
+		const baseline = fixture.baseline.items[index]!;
+		const stepId = step.kind === "model" ? step.requestId : step.toolCallId;
+		if (
+			baseline.kind !== step.kind ||
+			baseline.id !== stepId ||
+			baseline.sequence !== step.sequence ||
+			baseline.status !== "resolved" ||
+			baseline.responseSource !== "recorded" ||
+			baseline.resultHash === undefined
+		) {
+			return false;
+		}
+		if (step.responseSource === undefined && fixture.adapterKinds.includes(step.kind)) {
+			invokesSelectedAdapter = true;
+		}
+	}
+	return invokesSelectedAdapter;
+}
+
 export async function verifyMinedReplayEvalFixture(fixture: MinedReplayEvalFixture): Promise<boolean> {
 	if (
 		!isRecord(fixture) ||
@@ -515,7 +551,8 @@ export async function verifyMinedReplayEvalFixture(fixture: MinedReplayEvalFixtu
 		fixture.candidateBranch.manifest.sourceBundleId !== fixture.sourceBundleId ||
 		fixture.candidateBranch.manifest.sourceBundleChecksum !== fixture.sourceBundleChecksum ||
 		fixture.candidateBranch.manifest.forkBeforeSequence !== fixture.criticalSequence ||
-		!(await verifyReplayBranch(fixture.candidateBranch as ReplayBranch))
+		!(await verifyReplayBranch(fixture.candidateBranch as ReplayBranch)) ||
+		!hasCandidateReplayCoverage(fixture)
 	) {
 		return false;
 	}

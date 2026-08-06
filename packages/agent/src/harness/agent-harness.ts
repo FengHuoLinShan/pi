@@ -28,6 +28,7 @@ import { formatPromptTemplateInvocation } from "./prompt-templates.ts";
 import { type RuntimeQueueName, type RuntimeRecoveryResult, SessionRuntimeEventStore } from "./runtime-events/index.ts";
 import { uuidv7 } from "./session/uuid.ts";
 import { formatSkillInvocation } from "./skills.ts";
+import { guardToolResultContext } from "./tool-result-context-guard.ts";
 import type {
 	AbortResult,
 	AgentHarnessEvent,
@@ -602,11 +603,12 @@ export class AgentHarness<
 				transformHeaders: requestOptions.transformHeaders,
 				websocketConnectTimeoutMs: requestOptions.websocketConnectTimeoutMs,
 			};
+			const guardedContext = guardToolResultContext(context, model, requestOptions.maxTokens ?? model.maxTokens);
 			if (this.streamFn) {
 				const { transformHeaders: _transformHeaders, ...streamOptionsWithoutTransforms } = options;
-				return this.streamFn(model, context, streamOptionsWithoutTransforms);
+				return this.streamFn(model, guardedContext, streamOptionsWithoutTransforms);
 			}
-			return this.models.streamSimple(model, context, options);
+			return this.models.streamSimple(model, guardedContext, options);
 		};
 	}
 
@@ -635,7 +637,17 @@ export class AgentHarness<
 			model: turnState.model,
 			reasoning: turnState.thinkingLevel === "off" ? undefined : turnState.thinkingLevel,
 			convertToLlm: this.convertMessages,
-			transformModelRequestContext: this.transformModelRequestContext,
+			transformModelRequestContext: async (context, signal) => {
+				const transformed = this.transformModelRequestContext
+					? await this.transformModelRequestContext(context, signal)
+					: context;
+				const activeTurnState = getTurnState();
+				return guardToolResultContext(
+					transformed,
+					activeTurnState.model,
+					activeTurnState.streamOptions.maxTokens ?? activeTurnState.model.maxTokens,
+				);
+			},
 			shouldStopBeforeModelRequest: this.shouldStopBeforeModelRequest,
 			runBudget: turnState.runBudget,
 			loopDetection: turnState.loopDetection,
@@ -931,6 +943,10 @@ export class AgentHarness<
 			return;
 		}
 		if (event.type === "agent_end") {
+			if (this.runtimeEvents && this.activeTurnId) {
+				await this.runtimeEvents.append({ type: "turn_finished", turnId: this.activeTurnId });
+				this.activeTurnId = undefined;
+			}
 			this.acceptsTurnInput = false;
 			this.runAbortController = undefined;
 			await this.flushPendingSessionWrites();

@@ -26,6 +26,7 @@
 		"profile:tui": "node scripts/profile-coding-agent-node.mjs --mode tui",
 		"profile:rpc": "node scripts/profile-coding-agent-node.mjs --mode rpc",
 		"eval:harness": "npm --prefix packages/agent run eval:harness",
+		"eval:lifecycle-faults": "npm --prefix packages/agent run eval:lifecycle-faults",
 		"eval:capabilities:offline": "npm --prefix packages/coding-agent run eval:capabilities:offline",
 		"eval:capabilities:browser": "npm --prefix packages/coding-agent run eval:capabilities:browser",
 		"eval:capabilities:live": "npm --prefix packages/coding-agent run eval:capabilities:live",

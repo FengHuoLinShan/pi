@@ -64,7 +64,26 @@ const plan = routeModels({
 });
 ```
 
-Unknown capabilities and degraded candidates fail closed unless the request allows them. Eligible candidates are ordered only by caller-supplied `priority`, then caller-supplied `preferenceScore`, followed by stable identifiers. The result includes every rejection and warning. It does not contact a provider or hide a fallback loop.
+Unknown capabilities and degraded candidates fail closed unless the request allows them. Candidate profiles and requirement objects are validated as the declared versioned schema: unknown fields, sparse capability arrays, and duplicate capabilities are rejected instead of being copied into a route plan. Eligible candidates are ordered only by caller-supplied `priority`, then caller-supplied `preferenceScore`, followed by stable identifiers. The result includes every rejection and warning. It does not contact a provider or hide a fallback loop.
+
+Routes can also require a content-addressed eval qualification:
+
+```ts
+const plan = routeModels({
+  requestId: "turn-13",
+  candidates,
+  requirements: {
+    qualityGate: {
+      required: true,
+      corpusId: "coding-agent-regressions",
+      minCorpusRevision: 12,
+      minPassRate: 1,
+    },
+  },
+});
+```
+
+Missing, failed, wrong-corpus, stale-revision, and low-pass-rate qualifications are distinct rejection reasons. `runControlledModelRouting()` in the evals entrypoint produces these qualifications by replaying a frozen mined-trace corpus before delegating to `routeModels()`.
 
 ## Structured recovery
 

@@ -4,6 +4,9 @@
 
 ### Added
 
+- Added append-only mined-trace eval corpora and controlled model routing that qualifies every candidate against a frozen corpus revision before capability routing.
+- Added revisioned engineering memory with semantic record ids, explicit decision and fact supersession, structured rationale, alternatives and attempt outcomes, source freshness gates, and reviewable replacement chains.
+- Added a deterministic lifecycle fault lab that injects before-persist and after-persist failures across canonical runtime boundaries, reopens real session storage, verifies conservative recovery invariants, and emits privacy-safe JSON reports.
 - Added a deterministic AgentHarness eval runner with declarative faux-provider scenarios, semantic replay checks, JSON reports, and baseline quality gates for local and CI regression testing.
 - Added privacy-safe telemetry, redacted checksummed trace bundles, and five-level UI/state/model/tool/live replay with explicit recording availability.
 - Added structured `ToolSpec` declarations with explicit retry-safety metadata, deterministic tool policy decisions, exact resolved-action-bound approval requests and grants, one-shot grant tracking, and native fail-closed `AgentHarness`/loop adapters.
@@ -29,6 +32,9 @@
 
 ### Fixed
 
+- Fixed compaction and branch-summary generation to frame untrusted history as JSON data, omit hidden reasoning, bound tool arguments and oversized summary inputs without mutating canonical history, reserve model output space on every request, and reject empty or output-limited checkpoints.
+- Fixed oversized textual tool results poisoning provider and compaction-summary requests by applying explicit byte, token, total-result, remaining-context, output-reservation, and serialized-wrapper limits at request-only boundaries while preserving canonical history and non-text content.
+- Fixed AgentHarness runtime settlement to finish a started turn when a pre-provider request guard ends the run after tool execution.
 - Fixed AgentHarness terminal settlement, startup abort barriers, concurrent durable callback writes, final follow-up closure, and an abort race that could wait on a newer run.
 - Fixed parallel tool preflight to skip prepared tool bodies when cancellation arrives before body invocation.
 - Fixed tool-attempt finalization so hostile before-hook result getters, unstringifiable thrown values, and rejected update listeners produce classified end events instead of interrupting the event sequence.

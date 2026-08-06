@@ -323,6 +323,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return prototype === Object.prototype || prototype === null;
 }
 
+function isSafeInteger(value: unknown): value is number {
+	return Number.isSafeInteger(value);
+}
+
 function requireBranchValue(value: unknown, label: string): asserts value is ReplayBranchValue {
 	if (!isPlainObject(value) || !Object.hasOwn(value, "value")) {
 		throw new ReplayBranchError("invalid_branch", `${label} must explicitly contain a value`);
@@ -589,17 +593,126 @@ function assertReplayForkBoundary(bundle: TraceBundle, forkBeforeSequence: numbe
 	}
 }
 
-/** Detect mutation before a branch is executed or persisted. */
-export async function verifyReplayBranch(branch: ReplayBranch): Promise<boolean> {
+function isReplayBranchStructure(branch: unknown): branch is ReplayBranch {
+	if (!isPlainObject(branch)) return false;
+	const manifest = branch.manifest;
+	const stateAtFork = branch.stateAtFork;
 	if (
-		!isPlainObject(branch) ||
-		!isPlainObject(branch.manifest) ||
-		branch.manifest.version !== REPLAY_BRANCH_VERSION ||
-		typeof branch.manifest.definitionHash !== "string" ||
+		Object.keys(branch).some((key) => !["manifest", "effectiveConfig", "stateAtFork", "steps"].includes(key)) ||
+		!isPlainObject(manifest) ||
+		Object.keys(manifest).some(
+			(key) =>
+				![
+					"version",
+					"branchId",
+					"label",
+					"sourceBundleId",
+					"sourceBundleChecksum",
+					"forkBeforeSequence",
+					"prefixEventCount",
+					"definitionHash",
+				].includes(key),
+		) ||
+		manifest.version !== REPLAY_BRANCH_VERSION ||
+		typeof manifest.branchId !== "string" ||
+		manifest.branchId.trim() === "" ||
+		(manifest.label !== undefined && (typeof manifest.label !== "string" || manifest.label.trim() === "")) ||
+		typeof manifest.sourceBundleId !== "string" ||
+		manifest.sourceBundleId.trim() === "" ||
+		typeof manifest.sourceBundleChecksum !== "string" ||
+		!/^[0-9a-f]{64}$/.test(manifest.sourceBundleChecksum) ||
+		!isSafeInteger(manifest.forkBeforeSequence) ||
+		manifest.forkBeforeSequence < 1 ||
+		!isSafeInteger(manifest.prefixEventCount) ||
+		manifest.prefixEventCount !== manifest.forkBeforeSequence - 1 ||
+		typeof manifest.definitionHash !== "string" ||
+		!/^[0-9a-f]{64}$/.test(manifest.definitionHash) ||
+		!isPlainObject(stateAtFork) ||
+		stateAtFork.version !== 1 ||
+		typeof stateAtFork.sessionId !== "string" ||
+		stateAtFork.sessionId.trim() === "" ||
+		stateAtFork.lastSequence !== manifest.prefixEventCount ||
+		!["queueItems", "pendingWrites", "operations", "turns", "providerRequests", "toolCalls"].every((key) =>
+			isPlainObject(stateAtFork[key]),
+		) ||
 		!Array.isArray(branch.steps)
 	) {
 		return false;
 	}
+	let previousSequence = 0;
+	const ids = new Set<string>();
+	for (let index = 0; index < branch.steps.length; index++) {
+		if (!(index in branch.steps)) return false;
+		const step = branch.steps[index];
+		const sequence = isPlainObject(step) ? step.sequence : undefined;
+		if (
+			!isPlainObject(step) ||
+			(step.kind !== "model" && step.kind !== "tool") ||
+			!isSafeInteger(sequence) ||
+			sequence < manifest.forkBeforeSequence ||
+			sequence <= previousSequence ||
+			(step.inputSource !== "recorded" && step.inputSource !== "override") ||
+			(step.responseSource !== undefined && step.responseSource !== "recorded" && step.responseSource !== "override")
+		) {
+			return false;
+		}
+		previousSequence = sequence;
+		const id = step.kind === "model" ? step.requestId : step.toolCallId;
+		if (typeof id !== "string" || id.trim() === "" || ids.has(`${step.kind}:${id}`)) return false;
+		ids.add(`${step.kind}:${id}`);
+		if (step.kind === "model") {
+			if (
+				Object.keys(step).some(
+					(key) =>
+						![
+							"kind",
+							"sequence",
+							"requestId",
+							"provider",
+							"modelId",
+							"input",
+							"inputSource",
+							"response",
+							"responseSource",
+						].includes(key),
+				) ||
+				typeof step.provider !== "string" ||
+				step.provider.trim() === "" ||
+				typeof step.modelId !== "string" ||
+				step.modelId.trim() === ""
+			) {
+				return false;
+			}
+		} else if (
+			Object.keys(step).some(
+				(key) =>
+					![
+						"kind",
+						"sequence",
+						"toolCallId",
+						"toolName",
+						"input",
+						"inputSource",
+						"response",
+						"responseSource",
+						"isError",
+					].includes(key),
+			) ||
+			typeof step.toolName !== "string" ||
+			step.toolName.trim() === "" ||
+			(step.responseSource !== undefined && typeof step.isError !== "boolean") ||
+			(step.responseSource === undefined && step.isError !== undefined)
+		) {
+			return false;
+		}
+		if (step.responseSource === undefined && step.response !== undefined) return false;
+	}
+	return true;
+}
+
+/** Detect mutation before a branch is executed or persisted. */
+export async function verifyReplayBranch(branch: ReplayBranch): Promise<boolean> {
+	if (!isReplayBranchStructure(branch)) return false;
 	try {
 		const { definitionHash, ...manifest } = branch.manifest;
 		return (await sha256(branchBody({ ...branch, manifest }))) === definitionHash;

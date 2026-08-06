@@ -1,4 +1,5 @@
-import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { AgentHarness, restoreAgentHarness } from "../../src/harness/agent-harness.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
@@ -106,6 +107,50 @@ describe("AgentHarness durable runtime integration", () => {
 		expect(Object.values(state.operations).map((operation) => operation.status)).toEqual(["finished"]);
 		expect(Object.values(state.turns).map((turn) => turn.status)).toEqual(["finished"]);
 		expect(Object.values(state.providerRequests).map((request) => request.status)).toEqual(["finished"]);
+	});
+
+	it("finishes a started turn when the next provider request guard stops the run", async () => {
+		const models = createModels();
+		const registration = fauxProvider({ provider: "runtime-guard-after-tool" });
+		registration.setResponses([
+			() =>
+				fauxAssistantMessage(fauxToolCall("large_result", {}, { id: "call-1" }), {
+					stopReason: "toolUse",
+				}),
+			() => fauxAssistantMessage("must not be requested"),
+		]);
+		models.setProvider(registration.provider);
+		const session = new Session(new InMemorySessionStorage());
+		const runtimeEvents = await SessionRuntimeEventStore.open(session);
+		let guardCalls = 0;
+		const harness = new AgentHarness({
+			models,
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			runtimeEvents,
+			model: registration.getModel(),
+			tools: [
+				{
+					name: "large_result",
+					label: "Large result",
+					description: "Return a result",
+					parameters: Type.Object({}),
+					async execute() {
+						return { content: [{ type: "text" as const, text: "large" }], details: {} };
+					},
+				},
+			],
+			shouldStopBeforeModelRequest: () => ++guardCalls === 2,
+		});
+
+		await harness.prompt("use the tool");
+
+		expect(registration.state.callCount).toBe(1);
+		const state = runtimeEvents.getState();
+		expect(Object.values(state.turns).map((turn) => turn.status)).toEqual(["finished", "finished"]);
+		expect(Object.values(state.operations).map((operation) => operation.status)).toEqual(["finished"]);
+		expect(Object.values(state.turns).some((turn) => turn.status === "active")).toBe(false);
+		expect(Object.values(state.operations).some((operation) => operation.status === "active")).toBe(false);
 	});
 
 	it("journals provider failures without marking the request or run successful", async () => {

@@ -125,6 +125,33 @@ const prepared = workingSet.prepare({
 
 The coding-agent package supplies a `WorkspaceView` source-hashing adapter and optimistic session persistence. Boundary-backed workspaces must provide their own source resolver; host extensions do not assume they can read paths inside a remote execution boundary.
 
+## Revisioned engineering memory
+
+`RevisionedEngineeringMemory` builds a reviewable engineering history on top of the working-set compiler. Records cover objectives, source-grounded facts, decisions with rationale and alternatives, attempts with outcomes, and evidence. Record ids are derived from semantic content rather than timestamps.
+
+A new record can explicitly replace active records of the same kind. Replaced records remain in the append-only snapshot and appear in replacement chains, while only active records enter the current working set. Facts require at least one workspace-relative SHA-256 source revision. Preparing memory therefore excludes stale facts and blocks when a stale or missing fact was marked required.
+
+```ts
+const memory = new RevisionedEngineeringMemory(createEngineeringMemory("task-1"));
+const decision = memory.append({
+  kind: "decision",
+  content: "Keep retry state per job.",
+  rationale: "Concurrent jobs must not share retry state.",
+  alternatives: ["Global retry counter"],
+  createdAt: new Date().toISOString(),
+});
+
+memory.append({
+  kind: "decision",
+  content: "Persist retry state in each job record.",
+  rationale: "Retries must survive process recovery.",
+  replaces: [decision.id],
+  createdAt: new Date().toISOString(),
+});
+```
+
+Snapshots preserve the full history with an optimistic revision and reject unknown persisted fields instead of carrying data outside the semantic record identity. `activeRecords()`, `history()`, and `workingSetSnapshot()` expose the current view, superseded records, replacement chains, and bounded context input without deleting prior reasoning.
+
 ## Trust labels and prompt-injection containment
 
 `protectContext()` is an explicit pre-compilation boundary for retrieved or application-supplied context. Each `LabeledContextFragment` declares:

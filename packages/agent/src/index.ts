@@ -44,6 +44,7 @@ export * from "./harness/session/session.ts";
 export { uuidv7 } from "./harness/session/uuid.ts";
 export * from "./harness/skills.ts";
 export * from "./harness/system-prompt.ts";
+export * from "./harness/tool-result-context-guard.ts";
 // Harness
 export * from "./harness/types.ts";
 export * from "./harness/utils/shell-output.ts";

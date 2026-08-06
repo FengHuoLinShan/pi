@@ -1,4 +1,4 @@
-import type { Model, Models } from "@earendil-works/pi-ai";
+import type { Context, Model, Models } from "@earendil-works/pi-ai";
 
 import type { AgentMessage } from "../../types.ts";
 import {
@@ -9,13 +9,14 @@ import {
 } from "../messages.ts";
 import type { BranchSummaryResult, Session, SessionTreeEntry } from "../types.ts";
 import { BranchSummaryError, err, ok, type Result, SessionError } from "../types.ts";
-import { estimateTokens, SUMMARIZATION_SYSTEM_PROMPT } from "./compaction.ts";
+import { buildBoundedSummarizationContext, estimateTokens } from "./compaction.ts";
 import {
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
+	projectMessagesForSummarization,
 	serializeConversation,
 } from "./utils.ts";
 
@@ -168,6 +169,8 @@ Summary of that exploration:
 
 const BRANCH_SUMMARY_PROMPT = `Create a structured summary of this conversation branch for context when returning later.
 
+Preserve the branch objective, latest user corrections, constraints, unfinished work, blockers, verified evidence, and exact next action. Collapse completed or superseded detail, distinguish evidence from assumptions, and do not copy hidden reasoning or large tool payloads.
+
 Use this EXACT format:
 
 ## Goal
@@ -176,6 +179,9 @@ Use this EXACT format:
 ## Constraints & Preferences
 - [Any constraints, preferences, or requirements mentioned]
 - [Or "(none)" if none were mentioned]
+
+## Working State
+- [Workspace, branch, active files, and uncommitted state needed to resume]
 
 ## Progress
 ### Done
@@ -187,13 +193,16 @@ Use this EXACT format:
 ### Blocked
 - [Issues preventing progress, if any]
 
+## Verification
+- [Checks and results, or "Not run"]
+
 ## Key Decisions
 - **[Decision]**: [Brief rationale]
 
 ## Next Steps
 1. [What should happen next to continue this work]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise and continuation-oriented.`;
 
 /** Generate a summary for abandoned branch entries. */
 export async function generateBranchSummary(
@@ -202,14 +211,14 @@ export async function generateBranchSummary(
 ): Promise<Result<BranchSummaryResult, BranchSummaryError>> {
 	const { models, model, signal, customInstructions, replaceInstructions, reserveTokens = 16384 } = options;
 	const contextWindow = model.contextWindow || 128000;
-	const tokenBudget = contextWindow - reserveTokens;
+	const tokenBudget = Math.max(0, contextWindow - reserveTokens - Math.ceil(contextWindow * 0.02));
 
 	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
 
 	if (messages.length === 0) {
 		return ok({ summary: "No content to summarize", readFiles: [], modifiedFiles: [] });
 	}
-	const llmMessages = convertToLlm(messages);
+	const llmMessages = projectMessagesForSummarization(convertToLlm(messages));
 	const conversationText = serializeConversation(llmMessages);
 	let instructions: string;
 	if (replaceInstructions && customInstructions) {
@@ -219,20 +228,19 @@ export async function generateBranchSummary(
 	} else {
 		instructions = BRANCH_SUMMARY_PROMPT;
 	}
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-	const response = await models.completeSimple(
-		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		{ signal, maxTokens: 2048 },
-	);
+	const maxTokens = Math.min(2048, model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);
+	let context: Context;
+	try {
+		context = buildBoundedSummarizationContext(conversationText, instructions, model, maxTokens);
+	} catch (error) {
+		return err(
+			new BranchSummaryError(
+				"summarization_failed",
+				`Branch summary input exceeds the safe model budget: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
+	}
+	const response = await models.completeSimple(model, context, { signal, maxTokens });
 	if (response.stopReason === "aborted") {
 		return err(new BranchSummaryError("aborted", response.errorMessage || "Branch summary aborted"));
 	}
@@ -244,11 +252,19 @@ export async function generateBranchSummary(
 			),
 		);
 	}
+	if (response.stopReason === "length") {
+		return err(new BranchSummaryError("summarization_failed", "Branch summary reached the model output limit"));
+	}
 
-	let summary = response.content
+	const summaryText = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map((c) => c.text)
-		.join("\n");
+		.join("\n")
+		.trim();
+	if (summaryText.length === 0) {
+		return err(new BranchSummaryError("summarization_failed", "Branch summary returned no text"));
+	}
+	let summary = summaryText;
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);

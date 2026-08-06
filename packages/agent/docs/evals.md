@@ -81,6 +81,26 @@ The updater refuses to create a baseline from a failing report. Review both the 
 
 Library consumers can import `runAgentHarnessEvalSuite`, `compareAgentHarnessEvalReport`, schemas, report types, and baseline helpers from `@earendil-works/pi-agent-core/evals`.
 
+## Lifecycle Fault Lab
+
+The lifecycle fault lab snapshots a structured-cloneable scenario before its first asynchronous operation, then exercises the real session-backed runtime event store at every event in that immutable view. Each boundary is run twice: once with persistence rejected before the event becomes durable, and once with persistence rejected immediately after the durable write. Every case reopens the session from storage, performs conservative recovery, and verifies:
+
+- contiguous canonical sequences and unique event ids
+- deterministic replay equivalence
+- at most one terminal event per operation, turn, provider request, and tool call
+- valid operation/turn/request/tool ownership after recovery
+- preservation of queued messages and pending writes
+- retry exposure only for tool calls declared retry-safe
+- no active runtime work after recovery
+
+Run the independent gate from the repository root:
+
+```bash
+npm run eval:lifecycle-faults
+```
+
+The command writes `.artifacts/agent-lifecycle-fault-lab.json`. Reports contain event types, counts, fault positions, and invariant violations only. They never include queued messages, tool arguments, pending-write bodies, or entity ids.
+
 ## Mining replay regressions
 
 `mineReplayEval()` converts an exact trace suffix from a failed or explicitly costly run into a versioned replay fixture. It selects the first failed tool/provider/turn boundary, or a configured metric-threshold breach, and retains only the replay steps at or after that critical sequence.
@@ -102,3 +122,39 @@ const report = await runMinedReplayEval(fixture, {
 ```
 
 The default expectation is hash equivalence with the recorded baseline. Fixtures can instead require a different complete outcome or only require complete execution. `verifyMinedReplayEvalFixture()` checks both fixture and replay-branch integrity. Reports contain hashes and comparison statuses, never adapter result bodies.
+
+## Eval corpus and controlled routing
+
+`createReplayEvalCorpus()` and `appendReplayEvalCorpus()` promote reviewed mined fixtures into an append-only, optimistic-revision corpus. Addition snapshots its inputs before integrity checks, verifies exact baseline-to-candidate replay coverage plus branch structure and hashes, and then uses only the verified snapshots. Reusing a fixture id with different content fails; adding the same fixture hash is idempotent.
+
+`runControlledModelRouting()` clones and verifies one corpus revision plus candidate metadata before invoking adapters, executes an isolated fixture clone through stable candidate-specific adapter references, and attaches a content-addressed qualification to each route candidate. Model replay steps are rebound to that candidate profile's provider and model before adapter invocation. It then invokes the normal capability router with a mandatory quality gate.
+
+```ts
+const corpus = await appendReplayEvalCorpus(
+  createReplayEvalCorpus("coding-agent-regressions"),
+  fixture,
+  {
+    expectedRevision: 0,
+    addedAt: new Date().toISOString(),
+    tags: ["tool", "regression"],
+  },
+);
+
+const report = await runControlledModelRouting({
+  requestId: "turn-42",
+  corpus,
+  candidates: candidateModels.map(({ route, adapters }) => ({
+    candidate: route,
+    adapters,
+  })),
+  requirements: {
+    reasoningLevel: "high",
+    tools: { required: true, strictMode: true },
+  },
+  policy: { minPassRate: 1, maxFailures: 0 },
+});
+```
+
+Untested, failing, wrong-corpus, stale-revision, and below-threshold qualifications are explicit route rejections. Adapter exceptions and incomplete executions cannot qualify a candidate even when the policy allows ordinary replay mismatches. Qualification reports retain fixture ids, hashes, statuses, and replay comparison reports but never adapter result bodies.
+
+Corpus fixtures still contain captured replay inputs. Keep the corpus under the same access, secret-scanning, retention, and review controls as its source trace bundles.

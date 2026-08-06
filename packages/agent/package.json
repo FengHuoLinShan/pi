@@ -33,6 +33,7 @@
 		"test:harness": "vitest --run --config vitest.harness.config.ts",
 		"eval:harness": "tsx src/evals/cli.ts --suite evals/scenarios/core.json --baseline evals/baseline.json --report ../../.artifacts/agent-harness-evals.json",
 		"eval:harness:update": "tsx src/evals/cli.ts --suite evals/scenarios/core.json --baseline evals/baseline.json --report ../../.artifacts/agent-harness-evals.json --update-baseline",
+		"eval:lifecycle-faults": "tsx src/evals/lifecycle-fault-cli.ts --report ../../.artifacts/agent-lifecycle-fault-lab.json",
 		"coverage:harness": "vitest --run --config vitest.harness.config.ts --coverage",
 		"prepublishOnly": "npm run clean && npm run build"
 	},

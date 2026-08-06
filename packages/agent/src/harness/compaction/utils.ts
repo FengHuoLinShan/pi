@@ -1,4 +1,4 @@
-import type { Message } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "../../types.ts";
 
 /** File paths touched by a session branch or compaction range. */
@@ -72,6 +72,9 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 }
 
 const TOOL_RESULT_MAX_CHARS = 2000;
+const TOOL_ARGUMENT_VALUE_MAX_CHARS = 1000;
+const TOOL_CALL_ARGUMENTS_MAX_CHARS = 4000;
+const TOOL_ARGUMENT_PRIORITY = ["path", "file", "cwd", "command", "pattern", "query"];
 
 function safeJsonStringify(value: unknown): string {
 	try {
@@ -81,14 +84,80 @@ function safeJsonStringify(value: unknown): string {
 	}
 }
 
-function truncateForSummary(text: string, maxChars: number): string {
+function truncateForSummary(text: string, maxChars: number, kind: "generic" | "tool-result" = "generic"): string {
 	if (text.length <= maxChars) return text;
 	const truncatedChars = text.length - maxChars;
-	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
+	const marker =
+		kind === "tool-result"
+			? `\n\n[Tool result truncated before model request: ${truncatedChars} characters omitted. Re-run the tool with narrower arguments.]\n\n`
+			: `\n\n[... ${truncatedChars} more characters truncated]\n\n`;
+	if (maxChars <= marker.length) return marker.slice(0, maxChars);
+	if (kind === "tool-result") return `${text.slice(0, maxChars - marker.length)}${marker}`;
+	const retainedChars = Math.max(0, maxChars - marker.length);
+	const headChars = Math.ceil(retainedChars / 2);
+	const tailChars = Math.floor(retainedChars / 2);
+	return `${text.slice(0, headChars)}${marker}${tailChars > 0 ? text.slice(-tailChars) : ""}`;
+}
+
+/** Keep the beginning and end of untrusted conversation data within a character budget. */
+export function truncateConversationForSummary(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	if (maxChars <= 0) return "";
+	const omittedChars = text.length - maxChars;
+	const marker = `\n\n[Context projection: ${omittedChars} characters omitted from the middle]\n\n`;
+	if (maxChars <= marker.length) return marker.slice(0, maxChars);
+	const retainedChars = maxChars - marker.length;
+	const headChars = Math.ceil(retainedChars / 2);
+	const tailChars = Math.floor(retainedChars / 2);
+	return `${text.slice(0, headChars)}${marker}${tailChars > 0 ? text.slice(-tailChars) : ""}`;
+}
+
+function projectToolArguments(args: Record<string, unknown>): Record<string, unknown> {
+	const priority = new Map(TOOL_ARGUMENT_PRIORITY.map((key, index) => [key, index]));
+	const entries = Object.entries(args).sort(
+		([left], [right]) =>
+			(priority.get(left) ?? TOOL_ARGUMENT_PRIORITY.length) - (priority.get(right) ?? TOOL_ARGUMENT_PRIORITY.length),
+	);
+	return Object.fromEntries(
+		entries.map(([key, value]) => {
+			if (typeof value === "string") {
+				return [key, truncateForSummary(value, TOOL_ARGUMENT_VALUE_MAX_CHARS)];
+			}
+			if (value === null || typeof value === "number" || typeof value === "boolean") {
+				return [key, value];
+			}
+			return [key, truncateForSummary(safeJsonStringify(value), TOOL_ARGUMENT_VALUE_MAX_CHARS)];
+		}),
+	);
+}
+
+/** Clone messages into a bounded, reasoning-free projection used only for summarization requests. */
+export function projectMessagesForSummarization(messages: Message[]): Message[] {
+	return messages.map((message) => {
+		if (message.role !== "assistant") return message;
+		const content: AssistantMessage["content"] = [];
+		for (const block of message.content) {
+			if (block.type === "thinking") continue;
+			if (block.type === "toolCall") {
+				content.push({ ...block, arguments: projectToolArguments(block.arguments as Record<string, unknown>) });
+			} else {
+				content.push(block);
+			}
+		}
+		return {
+			...message,
+			content,
+		};
+	});
+}
+
+/** Encode untrusted summary input without allowing it to close prompt framing tags. */
+export function serializePromptData(value: string): string {
+	return JSON.stringify(value).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
 }
 
 /** Serialize LLM messages to plain text for summarization prompts. */
-export function serializeConversation(messages: Message[]): string {
+export function serializeConversation(messages: Message[], toolResultMaxChars = TOOL_RESULT_MAX_CHARS): string {
 	const parts: string[] = [];
 
 	for (const msg of messages) {
@@ -103,26 +172,23 @@ export function serializeConversation(messages: Message[]): string {
 			if (content) parts.push(`[User]: ${content}`);
 		} else if (msg.role === "assistant") {
 			const textParts: string[] = [];
-			const thinkingParts: string[] = [];
 			const toolCalls: string[] = [];
 
 			for (const block of msg.content) {
 				if (block.type === "text") {
 					textParts.push(block.text);
-				} else if (block.type === "thinking") {
-					thinkingParts.push(block.thinking);
 				} else if (block.type === "toolCall") {
 					const args = block.arguments as Record<string, unknown>;
-					const argsStr = Object.entries(args)
-						.map(([k, v]) => `${k}=${safeJsonStringify(v)}`)
-						.join(", ");
+					const argsStr = truncateForSummary(
+						Object.entries(args)
+							.map(([k, v]) => `${k}=${safeJsonStringify(v)}`)
+							.join(", "),
+						TOOL_CALL_ARGUMENTS_MAX_CHARS,
+					);
 					toolCalls.push(`${block.name}(${argsStr})`);
 				}
 			}
 
-			if (thinkingParts.length > 0) {
-				parts.push(`[Assistant thinking]: ${thinkingParts.join("\n")}`);
-			}
 			if (textParts.length > 0) {
 				parts.push(`[Assistant]: ${textParts.join("\n")}`);
 			}
@@ -135,7 +201,7 @@ export function serializeConversation(messages: Message[]): string {
 				.map((c) => c.text)
 				.join("");
 			if (content) {
-				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
+				parts.push(`[Tool result]: ${truncateForSummary(content, toolResultMaxChars, "tool-result")}`);
 			}
 		}
 	}
