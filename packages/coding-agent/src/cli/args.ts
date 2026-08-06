@@ -47,6 +47,7 @@ export interface Args {
 	offline?: boolean;
 	verbose?: boolean;
 	projectTrustOverride?: boolean;
+	taskEnvelope?: string;
 	messages: string[];
 	fileArgs: string[];
 	/** Unknown flags (potentially extension flags) - map of flag name to value */
@@ -79,6 +80,12 @@ export function parseArgs(args: string[]): Args {
 			const mode = args[++i];
 			if (mode === "text" || mode === "json" || mode === "rpc") {
 				result.mode = mode;
+			}
+		} else if (arg === "--task-envelope") {
+			if (i + 1 < args.length && !args[i + 1].startsWith("-")) {
+				result.taskEnvelope = args[++i];
+			} else {
+				result.diagnostics.push({ type: "error", message: "--task-envelope requires a JSON file" });
 			}
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
@@ -206,6 +213,43 @@ export function parseArgs(args: string[]): Args {
 		}
 	}
 
+	if (result.taskEnvelope) {
+		if (result.messages.length > 0 || result.fileArgs.length > 0) {
+			result.diagnostics.push({
+				type: "error",
+				message: "--task-envelope cannot be combined with positional prompts or @file arguments",
+			});
+		}
+		if (result.continue || result.resume || result.session || result.sessionId || result.fork) {
+			result.diagnostics.push({
+				type: "error",
+				message: "--task-envelope requires a fresh session and cannot be combined with session selection",
+			});
+		}
+		if (result.mode === "rpc") {
+			result.diagnostics.push({ type: "error", message: "--task-envelope is not supported in RPC mode" });
+		}
+		if (result.export || result.listModels !== undefined) {
+			result.diagnostics.push({
+				type: "error",
+				message: "--task-envelope cannot be combined with export or model-listing commands",
+			});
+		}
+		if (
+			result.systemPrompt !== undefined ||
+			result.appendSystemPrompt !== undefined ||
+			result.extensions !== undefined ||
+			result.skills !== undefined ||
+			result.promptTemplates !== undefined ||
+			result.themes !== undefined
+		) {
+			result.diagnostics.push({
+				type: "error",
+				message: "--task-envelope cannot be combined with external resource or prompt overrides",
+			});
+		}
+	}
+
 	return result;
 }
 
@@ -243,6 +287,7 @@ ${chalk.bold("Options:")}
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
+  --task-envelope <json-file>    Run the single task authorized by a versioned envelope
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
   --session <path|id>            Use specific session file or partial UUID

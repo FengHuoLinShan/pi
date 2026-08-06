@@ -241,6 +241,18 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 }
 
 /**
+ * Truncate a string to a UTF-8-safe prefix within a byte limit.
+ */
+export function truncateStringToBytesFromStart(str: string, maxBytes: number): string {
+	const buffer = Buffer.from(str, "utf8");
+	if (buffer.length <= maxBytes) return str;
+
+	let end = maxBytes;
+	while (end > 0 && (buffer[end] & 0xc0) === 0x80) end--;
+	return buffer.subarray(0, end).toString("utf8");
+}
+
+/**
  * Truncate a string to fit within a byte limit (from the end).
  * Handles multi-byte UTF-8 characters correctly.
  */

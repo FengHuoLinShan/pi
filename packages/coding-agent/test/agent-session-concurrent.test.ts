@@ -11,6 +11,7 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	EventStream,
+	fauxAssistantMessage,
 	getModel,
 	type ImageContent,
 	type TextContent,
@@ -22,6 +23,7 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import type { BuildSystemPromptOptions } from "../src/core/system-prompt.ts";
+import { createHarness, getUserTexts } from "./suite/harness.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 // Mock stream that mimics AssistantMessageEventStream
@@ -126,6 +128,88 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		return session;
 	}
+
+	it("delivers queued steering exactly once after consecutive retry failures", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+		});
+		const queuedRequestUsers: string[][] = [];
+		const queuedRequestLastRoles: Array<string | undefined> = [];
+		let errorCount = 0;
+
+		try {
+			harness.session.subscribe((event) => {
+				if (
+					event.type !== "message_end" ||
+					event.message.role !== "assistant" ||
+					event.message.stopReason !== "error"
+				) {
+					return;
+				}
+				errorCount++;
+				if (errorCount === 3) {
+					void harness.session.steer("queued input one");
+					void harness.session.steer("queued input two");
+				}
+			});
+			harness.setResponses([
+				(context) => {
+					queuedRequestLastRoles.push(context.messages.at(-1)?.role);
+					throw new Error("fetch failed");
+				},
+				(context) => {
+					queuedRequestLastRoles.push(context.messages.at(-1)?.role);
+					throw new Error("fetch failed");
+				},
+				(context) => {
+					queuedRequestLastRoles.push(context.messages.at(-1)?.role);
+					throw new Error("fetch failed");
+				},
+				(context) => {
+					queuedRequestLastRoles.push(context.messages.at(-1)?.role);
+					queuedRequestUsers.push(
+						context.messages
+							.filter((message) => message.role === "user")
+							.map((message) => {
+								if (typeof message.content === "string") return message.content;
+								return message.content
+									.filter((part): part is TextContent => part.type === "text")
+									.map((part) => part.text)
+									.join("\n");
+							}),
+					);
+					return fauxAssistantMessage("handled first queued input");
+				},
+				(context) => {
+					queuedRequestLastRoles.push(context.messages.at(-1)?.role);
+					queuedRequestUsers.push(
+						context.messages
+							.filter((message) => message.role === "user")
+							.map((message) => {
+								if (typeof message.content === "string") return message.content;
+								return message.content
+									.filter((part): part is TextContent => part.type === "text")
+									.map((part) => part.text)
+									.join("\n");
+							}),
+					);
+					return fauxAssistantMessage("handled second queued input");
+				},
+			]);
+
+			await expect(harness.session.prompt("initial input")).resolves.toBeUndefined();
+			expect(getUserTexts(harness)).toEqual(["initial input", "queued input one", "queued input two"]);
+			expect(queuedRequestUsers).toEqual([
+				["initial input", "queued input one"],
+				["initial input", "queued input one", "queued input two"],
+			]);
+			expect(queuedRequestLastRoles).toEqual(["user", "user", "user", "user", "user"]);
+			expect(harness.session.pendingMessageCount).toBe(0);
+			expect(harness.getPendingResponseCount()).toBe(0);
+		} finally {
+			harness.cleanup();
+		}
+	});
 
 	it("should throw when prompt() called while streaming", async () => {
 		await createSession();
@@ -453,6 +537,7 @@ describe("AgentSession concurrent prompt guard", () => {
 					systemPromptOptions: BuildSystemPromptOptions,
 				) => Promise<undefined>;
 				invalidate: (message?: string) => void;
+				disposeExtensions: () => Promise<void>;
 			};
 		};
 		sessionWithRunner._extensionRunner = {
@@ -471,6 +556,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitInput: async () => ({ action: "continue" }),
 			emitBeforeAgentStart: async () => undefined,
 			invalidate: () => {},
+			disposeExtensions: async () => {},
 		};
 
 		await session.prompt("hi");
@@ -598,6 +684,7 @@ describe("AgentSession concurrent prompt guard", () => {
 					systemPromptOptions: BuildSystemPromptOptions,
 				) => Promise<undefined>;
 				invalidate: (message?: string) => void;
+				disposeExtensions: () => Promise<void>;
 			};
 		};
 		sessionWithRunner._extensionRunner = {
@@ -612,6 +699,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitInput: async () => ({ action: "continue" }),
 			emitBeforeAgentStart: async () => undefined,
 			invalidate: () => {},
+			disposeExtensions: async () => {},
 		};
 
 		await session.prompt("hi");

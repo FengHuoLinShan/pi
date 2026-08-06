@@ -26,6 +26,8 @@ export interface BashExecutorOptions {
 	signal?: AbortSignal;
 	/** Explicit environment for delegated execution. */
 	env?: NodeJS.ProcessEnv;
+	/** Effective timeout in milliseconds. */
+	timeoutMs?: number;
 }
 
 export interface BashResult {
@@ -111,6 +113,7 @@ export async function executeBashWithOperations(
 			onData,
 			signal: options?.signal,
 			env: options?.env,
+			timeout: options?.timeoutMs === undefined ? undefined : options.timeoutMs / 1000,
 		});
 
 		const fullOutput = outputChunks.join("");

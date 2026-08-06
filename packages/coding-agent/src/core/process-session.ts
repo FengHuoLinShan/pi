@@ -24,6 +24,8 @@ export type ProcessSessionState =
 export interface ProcessBackendHandle {
 	id: string;
 	pid?: number;
+	/** Last durably consumed backend event. Used by replay-capable backends. */
+	cursor?: number;
 	metadata?: Record<string, string | number | boolean | null>;
 }
 
@@ -39,8 +41,12 @@ export interface ProcessBackendStatus {
 }
 
 export interface ProcessBackendCallbacks {
-	onOutput: (stream: ProcessOutputStream, chunk: Buffer) => void;
-	onExit: (exit: ProcessBackendExit) => void;
+	/**
+	 * Replay-capable backends await returned promises before advancing their
+	 * cursor. Local callback producers may ignore the optional acknowledgment.
+	 */
+	onOutput: (stream: ProcessOutputStream, chunk: Buffer, cursor?: number) => void | Promise<void>;
+	onExit: (exit: ProcessBackendExit, cursor?: number) => void | Promise<void>;
 }
 
 export interface ProcessBackendStartRequest {
@@ -57,6 +63,8 @@ export interface ProcessSessionBackend {
 		backendId: string;
 		profileDigest: string;
 	};
+	/** Optional backend-specific environment reduction applied before audit and start. */
+	filterEnvironment?: (environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
 	start: (request: ProcessBackendStartRequest, callbacks: ProcessBackendCallbacks) => Promise<ProcessBackendHandle>;
 	/** Returns false when the backend cannot durably reattach this handle. */
 	attach: (handle: ProcessBackendHandle, callbacks: ProcessBackendCallbacks) => Promise<boolean>;
@@ -156,6 +164,7 @@ interface ProcessOutputEvent extends ProcessEventBase {
 	stream: ProcessOutputStream;
 	artifact: ArtifactRef;
 	byteLength: number;
+	backendCursor?: number;
 }
 
 interface ProcessTerminationRequestedEvent extends ProcessEventBase {
@@ -166,11 +175,13 @@ interface ProcessExitedEvent extends ProcessEventBase {
 	type: "process_exited";
 	exitCode: number | null;
 	signal?: string;
+	backendCursor?: number;
 }
 
 interface ProcessFailedEvent extends ProcessEventBase {
 	type: "process_failed";
 	error: string;
+	backendCursor?: number;
 }
 
 interface ProcessInterruptedEvent extends ProcessEventBase {
@@ -219,6 +230,8 @@ function isProcessBackendHandle(value: unknown): value is ProcessBackendHandle {
 		handle.id.length > 0 &&
 		(handle.pid === undefined ||
 			(typeof handle.pid === "number" && Number.isSafeInteger(handle.pid) && handle.pid > 0)) &&
+		(handle.cursor === undefined ||
+			(typeof handle.cursor === "number" && Number.isSafeInteger(handle.cursor) && handle.cursor >= 0)) &&
 		(handle.metadata === undefined ||
 			(typeof handle.metadata === "object" &&
 				handle.metadata !== null &&
@@ -278,17 +291,31 @@ function isProcessSessionEvent(value: unknown): value is ProcessSessionEvent {
 				/^sha256:[0-9a-f]{64}$/.test(event.artifact) &&
 				typeof event.byteLength === "number" &&
 				Number.isSafeInteger(event.byteLength) &&
-				event.byteLength >= 0
+				event.byteLength >= 0 &&
+				(event.backendCursor === undefined ||
+					(typeof event.backendCursor === "number" &&
+						Number.isSafeInteger(event.backendCursor) &&
+						event.backendCursor > 0))
 			);
 		case "process_termination_requested":
 			return true;
 		case "process_exited":
 			return (
 				(event.exitCode === null || (typeof event.exitCode === "number" && Number.isSafeInteger(event.exitCode))) &&
-				(event.signal === undefined || typeof event.signal === "string")
+				(event.signal === undefined || typeof event.signal === "string") &&
+				(event.backendCursor === undefined ||
+					(typeof event.backendCursor === "number" &&
+						Number.isSafeInteger(event.backendCursor) &&
+						event.backendCursor > 0))
 			);
 		case "process_failed":
-			return typeof event.error === "string";
+			return (
+				typeof event.error === "string" &&
+				(event.backendCursor === undefined ||
+					(typeof event.backendCursor === "number" &&
+						Number.isSafeInteger(event.backendCursor) &&
+						event.backendCursor > 0))
+			);
 		case "process_interrupted":
 			return typeof event.reason === "string";
 		default:
@@ -300,6 +327,10 @@ interface NodeLiveProcess {
 	handle: ProcessRuntimeHandle;
 	callbacks: ProcessBackendCallbacks;
 	status: ProcessBackendStatus;
+}
+
+function observeBackendCallback(result: void | Promise<void>): void {
+	if (result) void result.catch(() => undefined);
 }
 
 /**
@@ -317,7 +348,7 @@ export class NodeProcessSessionBackend implements ProcessSessionBackend {
 			args: request.args,
 			cwd: request.cwd,
 			env: request.env,
-			onOutput: (stream, chunk) => live.callbacks.onOutput(stream, chunk),
+			onOutput: (stream, chunk) => observeBackendCallback(live.callbacks.onOutput(stream, chunk)),
 		});
 		const live: NodeLiveProcess = { handle, callbacks, status: { state: "running" } };
 		this.live.set(handle.id, live);
@@ -328,7 +359,7 @@ export class NodeProcessSessionBackend implements ProcessSessionBackend {
 				error: result.reason === "failed" ? result.error : undefined,
 			};
 			live.status = { state: "exited", exit };
-			live.callbacks.onExit(exit);
+			observeBackendCallback(live.callbacks.onExit(exit));
 		});
 		return { id: handle.id, pid: handle.pid };
 	}
@@ -346,7 +377,8 @@ export class NodeProcessSessionBackend implements ProcessSessionBackend {
 
 	async terminate(handle: ProcessBackendHandle): Promise<void> {
 		const live = this.live.get(handle.id);
-		if (!live || live.status.state !== "running") throw new Error(`Process handle is unavailable: ${handle.id}`);
+		if (!live) throw new Error(`Process handle is unavailable: ${handle.id}`);
+		if (live.status.state === "exited") return;
 		live.handle.terminate();
 	}
 }
@@ -533,11 +565,17 @@ export class ProcessSessionManager {
 		});
 		await this.runForeground(() => this.appendAndApply(created));
 
-		const bufferedCallbacks: Array<() => void> = [];
+		const bufferedCallbacks: Array<{
+			callback: () => Promise<void>;
+			resolve: () => void;
+			reject: (error: unknown) => void;
+		}> = [];
 		let started = false;
 		const callbacks = this.createCallbacks(id, (callback) => {
-			if (started) callback();
-			else bufferedCallbacks.push(callback);
+			if (started) return callback();
+			return new Promise<void>((resolvePromise, reject) => {
+				bufferedCallbacks.push({ callback, resolve: resolvePromise, reject });
+			});
 		});
 		let handle: ProcessBackendHandle | undefined;
 		try {
@@ -545,8 +583,13 @@ export class ProcessSessionManager {
 			if (!isProcessBackendHandle(handle)) throw new Error("Process backend returned an invalid durable handle");
 			const startedEvent = this.createEvent(id, 1, { type: "process_started", handle: copyHandle(handle) });
 			await this.runForeground(() => this.appendAndApply(startedEvent));
+			const callbackAcknowledgments = bufferedCallbacks.splice(0).map((pending) => {
+				const acknowledgment = pending.callback();
+				acknowledgment.then(pending.resolve, pending.reject);
+				return acknowledgment;
+			});
 			started = true;
-			for (const callback of bufferedCallbacks) callback();
+			await Promise.all(callbackAcknowledgments);
 			return this.requireRecord(id);
 		} catch (error) {
 			started = true;
@@ -558,8 +601,13 @@ export class ProcessSessionManager {
 				}
 			}
 			const message = error instanceof Error ? error.message : String(error);
-			await this.runForeground(() => this.appendFailed(id, message));
-			for (const callback of bufferedCallbacks) callback();
+			try {
+				await this.runForeground(() => this.appendFailed(id, message));
+				for (const pending of bufferedCallbacks.splice(0)) pending.resolve();
+			} catch (persistenceError) {
+				for (const pending of bufferedCallbacks.splice(0)) pending.reject(persistenceError);
+				throw persistenceError;
+			}
 			throw error;
 		}
 	}
@@ -736,25 +784,25 @@ export class ProcessSessionManager {
 
 	private resolveProcessEnvironment(environment: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
 		const source = environment ?? process.env;
-		return this.boundary ? filterBoundaryEnvironment(this.boundary.profile, source) : { ...source };
+		const filtered = this.boundary ? filterBoundaryEnvironment(this.boundary.profile, source) : { ...source };
+		return this.backend.filterEnvironment ? this.backend.filterEnvironment(filtered) : filtered;
 	}
 
-	private createCallbacks(id: string, schedule?: (callback: () => void) => void): ProcessBackendCallbacks {
-		const enqueue = schedule ?? ((callback: () => void) => callback());
+	private createCallbacks(
+		id: string,
+		schedule?: (callback: () => Promise<void>) => void | Promise<void>,
+	): ProcessBackendCallbacks {
+		const enqueue = schedule ?? ((callback: () => Promise<void>) => callback());
 		return {
-			onOutput: (stream, chunk) => {
+			onOutput: (stream, chunk, cursor) => {
 				const durableChunk = Buffer.from(chunk);
-				enqueue(() => this.enqueueBackground(() => this.appendOutput(id, stream, durableChunk)));
+				return enqueue(() => this.queueOperation(() => this.appendOutput(id, stream, durableChunk, cursor), true));
 			},
-			onExit: (exit) => {
+			onExit: (exit, cursor) => {
 				const durableExit = { ...exit };
-				enqueue(() => this.enqueueBackground(() => this.appendExit(id, durableExit)));
+				return enqueue(() => this.queueOperation(() => this.appendExit(id, durableExit, cursor), true));
 			},
 		};
-	}
-
-	private enqueueBackground(operation: () => Promise<void>): void {
-		void this.queueOperation(operation, true);
 	}
 
 	private async runForeground(operation: () => Promise<void>): Promise<void> {
@@ -803,9 +851,21 @@ export class ProcessSessionManager {
 		}
 	}
 
-	private async appendOutput(id: string, stream: ProcessOutputStream, chunk: Buffer): Promise<void> {
+	private async appendOutput(
+		id: string,
+		stream: ProcessOutputStream,
+		chunk: Buffer,
+		backendCursor?: number,
+	): Promise<void> {
 		const record = this.records.get(id);
 		if (!record || !isActiveState(record.state) || chunk.length === 0) return;
+		if (
+			backendCursor !== undefined &&
+			record.backendHandle?.cursor !== undefined &&
+			backendCursor <= record.backendHandle.cursor
+		) {
+			return;
+		}
 		const persistedBytes = record.outputs.reduce((total, output) => total + output.byteLength, 0);
 		const remainingBytes =
 			this.maxOutputBytesPerSession === undefined
@@ -826,6 +886,7 @@ export class ProcessSessionManager {
 				stream,
 				artifact: artifact.ref,
 				byteLength: durableChunk.length,
+				backendCursor,
 			});
 			await this.appendAndApply(event);
 		}
@@ -847,25 +908,33 @@ export class ProcessSessionManager {
 		}
 	}
 
-	private async appendExit(id: string, exit: ProcessBackendExit): Promise<void> {
+	private async appendExit(id: string, exit: ProcessBackendExit, backendCursor?: number): Promise<void> {
 		const record = this.records.get(id);
 		if (!record || isTerminalState(record.state)) return;
+		if (
+			backendCursor !== undefined &&
+			record.backendHandle?.cursor !== undefined &&
+			backendCursor <= record.backendHandle.cursor
+		) {
+			return;
+		}
 		if (exit.error) {
-			await this.appendFailed(id, exit.error);
+			await this.appendFailed(id, exit.error, backendCursor);
 			return;
 		}
 		const event = this.createNextEvent(id, {
 			type: "process_exited",
 			exitCode: exit.exitCode,
 			signal: exit.signal,
+			backendCursor,
 		});
 		await this.appendAndApply(event);
 	}
 
-	private async appendFailed(id: string, error: string): Promise<void> {
+	private async appendFailed(id: string, error: string, backendCursor?: number): Promise<void> {
 		const record = this.records.get(id);
 		if (!record || isTerminalState(record.state)) return;
-		await this.appendAndApply(this.createNextEvent(id, { type: "process_failed", error }));
+		await this.appendAndApply(this.createNextEvent(id, { type: "process_failed", error, backendCursor }));
 	}
 
 	private async appendInterrupted(id: string, reason: string): Promise<void> {
@@ -950,6 +1019,9 @@ export class ProcessSessionManager {
 				record.state = "running";
 				break;
 			case "process_output":
+				if (event.backendCursor !== undefined && record.backendHandle) {
+					record.backendHandle.cursor = event.backendCursor;
+				}
 				record.outputs.push({
 					sequence: record.outputs.length,
 					stream: event.stream,
@@ -962,10 +1034,16 @@ export class ProcessSessionManager {
 				record.state = "terminating";
 				break;
 			case "process_exited":
+				if (event.backendCursor !== undefined && record.backendHandle) {
+					record.backendHandle.cursor = event.backendCursor;
+				}
 				record.state = record.state === "terminating" ? "terminated" : "exited";
 				record.exit = { exitCode: event.exitCode, signal: event.signal, timestamp: event.timestamp };
 				break;
 			case "process_failed":
+				if (event.backendCursor !== undefined && record.backendHandle) {
+					record.backendHandle.cursor = event.backendCursor;
+				}
 				record.state = "failed";
 				record.error = event.error;
 				record.exit = { exitCode: null, error: event.error, timestamp: event.timestamp };

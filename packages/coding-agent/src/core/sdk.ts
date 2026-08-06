@@ -16,7 +16,7 @@ import { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { CodingAgentHarnessRuntime } from "./coding-agent-harness-runtime.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
-import type { ExecutionBoundary } from "./execution-boundary.ts";
+import { type ExecutionBoundary, resolveExecutionBoundary } from "./execution-boundary.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
@@ -26,6 +26,13 @@ import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
+import {
+	assertTaskEnvelopeResourceLoader,
+	authorizeTaskEnvelopeResourceLoader,
+	type TaskEnvelope,
+	type ValidatedTaskEnvelope,
+	validateTaskEnvelope,
+} from "./task-envelope.ts";
 import { time } from "./timings.ts";
 import {
 	allToolNames,
@@ -92,6 +99,9 @@ export interface CreateAgentSessionOptions {
 	 * The host owns PatchSet review, application, and discard.
 	 */
 	workspaceOverlay?: WorkspaceOverlay;
+
+	/** Versioned task authorization. Its targetCwd becomes the effective session cwd. */
+	taskEnvelope?: TaskEnvelope | ValidatedTaskEnvelope;
 
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
@@ -197,7 +207,14 @@ function getDefaultAgentDir(): string {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
+	const taskEnvelope = options.taskEnvelope ? await validateTaskEnvelope(options.taskEnvelope) : undefined;
+	if (taskEnvelope && options.resourceLoader) {
+		assertTaskEnvelopeResourceLoader(options.resourceLoader, taskEnvelope);
+	}
+	if (taskEnvelope && options.cwd && (await realpath(resolvePath(options.cwd))) !== taskEnvelope.targetCwd) {
+		throw new Error("cwd must match taskEnvelope.targetCwd");
+	}
+	const cwd = taskEnvelope?.targetCwd ?? resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
 
@@ -207,6 +224,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+	if (taskEnvelope && (await realpath(sessionManager.getCwd())) !== taskEnvelope.targetCwd) {
+		throw new Error("sessionManager cwd must match taskEnvelope.targetCwd");
+	}
+	if (taskEnvelope && sessionManager.buildSessionContext().messages.length > 0) {
+		throw new Error("taskEnvelope requires a fresh session");
+	}
+	if (taskEnvelope && options.workspaceOverlay) {
+		throw new Error("taskEnvelope cannot be combined with workspaceOverlay");
+	}
 	if (options.workspaceOverlay && options.executionBoundary) {
 		throw new Error("workspaceOverlay cannot be combined with executionBoundary");
 	}
@@ -218,26 +244,51 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	if (!resourceLoader) {
-		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+		resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
+			...(taskEnvelope
+				? {
+						taskEnvelopeIsolation: true,
+						noExtensions: true,
+						additionalExtensionPaths: [],
+						extensionFactories: [],
+						extensionsOverride: undefined,
+					}
+				: {}),
+		});
+		if (taskEnvelope) authorizeTaskEnvelopeResourceLoader(resourceLoader, taskEnvelope);
 		await resourceLoader.reload();
 		time("resourceLoader.reload");
 	}
 
-	if (options.executionBoundary) {
+	if (taskEnvelope && options.executionBoundary) {
+		const boundary = resolveExecutionBoundary(options.executionBoundary, ["read", "bash", "edit", "write"]);
+		const sameRoots = (left: readonly string[], right: readonly string[]) =>
+			left.length === right.length && left.every((root) => right.includes(root));
+		if (
+			boundary.cwd !== taskEnvelope.targetCwd ||
+			!sameRoots(boundary.readableRoots, taskEnvelope.readableRoots) ||
+			!sameRoots(boundary.writableRoots, taskEnvelope.writableRoots)
+		) {
+			throw new Error("executionBoundary filesystem scope must exactly match taskEnvelope authorization");
+		}
+	}
+
+	if (options.executionBoundary || taskEnvelope) {
 		if (options.customTools && options.customTools.length > 0) {
-			throw new Error(
-				"customTools cannot be enabled with executionBoundary because they execute in the host process",
-			);
+			throw new Error("customTools cannot be enabled with a bounded task because they execute in the host process");
 		}
 		const unsupportedTool = options.tools?.find((toolName) => !allToolNames.has(toolName as ToolName));
 		if (unsupportedTool) {
 			throw new Error(
-				`Tool ${unsupportedTool} cannot be enabled with executionBoundary because it is not a bounded built-in tool`,
+				`Tool ${unsupportedTool} cannot be enabled with a bounded task because it is not a bounded built-in tool`,
 			);
 		}
-		const extensionTool = resourceLoader
-			.getExtensions()
-			.extensions.flatMap((extension) => [...extension.tools.keys()])[0];
+		const extensionTool = options.executionBoundary
+			? resourceLoader.getExtensions().extensions.flatMap((extension) => [...extension.tools.keys()])[0]
+			: undefined;
 		if (extensionTool) {
 			throw new Error(
 				`Extension tool ${extensionTool} cannot be enabled with executionBoundary because it executes in the host process`,
@@ -482,6 +533,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		customTools: options.customTools,
 		executionBoundary: options.executionBoundary,
 		workspaceOverlay: options.workspaceOverlay,
+		taskEnvelope,
 		modelRuntime,
 		initialActiveToolNames,
 		allowedToolNames,

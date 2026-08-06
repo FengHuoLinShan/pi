@@ -1,5 +1,8 @@
 import { describe, expect, test } from "vitest";
 import { buildSystemPrompt } from "../src/core/system-prompt.ts";
+import { createBashToolDefinition } from "../src/core/tools/bash.ts";
+import { createGrepToolDefinition } from "../src/core/tools/grep.ts";
+import { createReadToolDefinition } from "../src/core/tools/read.ts";
 
 describe("buildSystemPrompt", () => {
 	describe("empty tools", () => {
@@ -114,6 +117,56 @@ describe("buildSystemPrompt", () => {
 	});
 
 	describe("prompt guidelines", () => {
+		test("steers shell discovery toward bounded built-in search and precise reads", () => {
+			const bashTool = createBashToolDefinition(process.cwd());
+			const prompt = buildSystemPrompt({
+				selectedTools: ["bash"],
+				toolSnippets: { bash: bashTool.promptSnippet ?? "Execute bash commands" },
+				promptGuidelines: bashTool.promptGuidelines,
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(bashTool.description).toContain("last 200 lines");
+			expect(prompt).toContain("otherwise keep shell discovery to paths or line-number-only matches");
+			expect(prompt).toContain("Do not use shell rg/grep context flags or pipelines as a bulk file reader");
+			expect(prompt).toContain("use read with exact non-overlapping ranges");
+		});
+
+		test("steers grep toward narrow context-free discovery before precise reads", () => {
+			const grepTool = createGrepToolDefinition(process.cwd());
+			const prompt = buildSystemPrompt({
+				selectedTools: ["grep"],
+				toolSnippets: { grep: grepTool.promptSnippet ?? "Search file contents" },
+				promptGuidelines: grepTool.promptGuidelines,
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(grepTool.description).toContain("200 output lines");
+			expect(prompt).toContain("Start grep searches with context=0 and a narrow limit");
+			expect(prompt).toContain("then use read for exact source ranges");
+		});
+
+		test("includes read reuse guidance to avoid duplicate unchanged ranges", () => {
+			const readTool = createReadToolDefinition(process.cwd());
+			const prompt = buildSystemPrompt({
+				selectedTools: ["read"],
+				toolSnippets: { read: readTool.promptSnippet ?? "Read file contents" },
+				promptGuidelines: readTool.promptGuidelines,
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain("Reuse unchanged file content already returned in the current turn");
+			expect(prompt).toContain("do not repeat the same path and range");
+			expect(prompt).toContain("do not retry the same or a narrower covered range");
+			expect(prompt).toContain("request only the missing non-overlapping range");
+		});
+
 		test("appends promptGuidelines to default guidelines", () => {
 			const prompt = buildSystemPrompt({
 				selectedTools: ["read", "dynamic_tool"],

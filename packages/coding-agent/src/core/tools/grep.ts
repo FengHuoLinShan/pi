@@ -13,6 +13,7 @@ import {
 	captureFilePathSnapshot,
 	type FilePathOperations,
 	type FilePathPolicy,
+	redactFileError,
 	revalidateFilePathSnapshot,
 } from "./file-transaction.ts";
 import { resolveToCwd } from "./path-utils.ts";
@@ -43,12 +44,14 @@ const grepSchema = Type.Object({
 
 export type GrepToolInput = Static<typeof grepSchema>;
 const DEFAULT_LIMIT = 100;
+const GREP_MAX_OUTPUT_LINES = 200;
 
 async function validateMatchPath(
 	matchPath: string,
 	searchPath: string,
 	operations: GrepOperations,
 	policyEnabled: boolean,
+	redactPathErrors: boolean,
 ): Promise<string> {
 	const absolutePath = path.isAbsolute(matchPath) ? matchPath : path.resolve(searchPath, matchPath);
 	const snapshot = await captureFilePathSnapshot(
@@ -57,8 +60,15 @@ async function validateMatchPath(
 		policyEnabled ? [searchPath] : undefined,
 		operations.realpath,
 		true,
+		redactPathErrors,
 	);
-	await revalidateFilePathSnapshot(snapshot, matchPath, policyEnabled ? [searchPath] : undefined, operations.realpath);
+	await revalidateFilePathSnapshot(
+		snapshot,
+		matchPath,
+		policyEnabled ? [searchPath] : undefined,
+		operations.realpath,
+		redactPathErrors,
+	);
 	return snapshot.targetPath;
 }
 
@@ -156,7 +166,13 @@ function formatGrepResult(
 	if (matchLimit || truncation?.truncated || linesTruncated) {
 		const warnings: string[] = [];
 		if (matchLimit) warnings.push(`${matchLimit} matches limit`);
-		if (truncation?.truncated) warnings.push(`${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit`);
+		if (truncation?.truncated) {
+			warnings.push(
+				truncation.truncatedBy === "lines"
+					? `${truncation.maxLines} output lines limit`
+					: `${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit`,
+			);
+		}
 		if (linesTruncated) warnings.push("some lines truncated");
 		text += `\n${theme.fg("warning", `[Truncated: ${warnings.join(", ")}]`)}`;
 	}
@@ -169,11 +185,15 @@ export function createGrepToolDefinition(
 ): ToolDefinition<typeof grepSchema, GrepToolDetails | undefined> {
 	const customOps = options?.operations;
 	const allowedRoots = options?.allowedRoots?.map((root) => resolveToCwd(root, cwd));
+	const redactPathErrors = options?.redactPathErrors ?? false;
 	return {
 		name: "grep",
 		label: "grep",
-		description: `Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to ${DEFAULT_LIMIT} matches or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Long lines are truncated to ${GREP_MAX_LINE_LENGTH} chars.`,
+		description: `Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to ${DEFAULT_LIMIT} matches, ${GREP_MAX_OUTPUT_LINES} output lines, or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Long lines are truncated to ${GREP_MAX_LINE_LENGTH} chars.`,
 		promptSnippet: "Search file contents for patterns (respects .gitignore)",
+		promptGuidelines: [
+			"Start grep searches with context=0 and a narrow limit; request context only for a small number of relevant matches, then use read for exact source ranges.",
+		],
 		parameters: grepSchema,
 		async execute(
 			_toolCallId,
@@ -210,6 +230,11 @@ export function createGrepToolDefinition(
 						fn();
 					}
 				};
+				const sanitizeOperationError = (error: unknown): Error => {
+					const normalized = error instanceof Error ? error : new Error(String(error));
+					if (normalized.message === "Operation aborted") return normalized;
+					return redactFileError(normalized, redactPathErrors, "FILE_OPERATION_FAILED");
+				};
 
 				(async () => {
 					try {
@@ -221,16 +246,31 @@ export function createGrepToolDefinition(
 							allowedRoots,
 							ops.realpath,
 							true,
+							redactPathErrors,
 						);
 						const searchPath = pathSnapshot.targetPath;
 						let isDirectory: boolean;
 						try {
 							isDirectory = await ops.isDirectory(searchPath);
 						} catch {
-							settle(() => reject(new Error(`Path not found: ${searchPath}`)));
+							settle(() =>
+								reject(
+									redactFileError(
+										new Error(`Path not found: ${searchPath}`),
+										redactPathErrors,
+										"FILE_OPERATION_FAILED",
+									),
+								),
+							);
 							return;
 						}
-						await revalidateFilePathSnapshot(pathSnapshot, searchDir || ".", allowedRoots, ops.realpath);
+						await revalidateFilePathSnapshot(
+							pathSnapshot,
+							searchDir || ".",
+							allowedRoots,
+							ops.realpath,
+							redactPathErrors,
+						);
 
 						const contextValue = context && context > 0 ? context : 0;
 						const effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT);
@@ -251,7 +291,10 @@ export function createGrepToolDefinition(
 								try {
 									const content = await ops.readFile(filePath);
 									lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-								} catch {
+								} catch (error) {
+									if (redactPathErrors) {
+										throw redactFileError(error, true, "FILE_OPERATION_FAILED");
+									}
 									lines = [];
 								}
 								fileCache.set(filePath, lines);
@@ -298,6 +341,7 @@ export function createGrepToolDefinition(
 									searchPath,
 									ops,
 									allowedRoots !== undefined,
+									redactPathErrors,
 								);
 								if (contextValue === 0 && match.lineText !== undefined) {
 									const relativePath = formatPath(validatedFilePath);
@@ -315,7 +359,7 @@ export function createGrepToolDefinition(
 							}
 
 							const rawOutput = outputLines.join("\n");
-							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+							const truncation = truncateHead(rawOutput, { maxLines: GREP_MAX_OUTPUT_LINES });
 							let output = truncation.content;
 							const details: GrepToolDetails = {};
 							const notices: string[] = [];
@@ -326,7 +370,11 @@ export function createGrepToolDefinition(
 								details.matchLimitReached = effectiveLimit;
 							}
 							if (truncation.truncated) {
-								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+								notices.push(
+									truncation.truncatedBy === "lines"
+										? `${GREP_MAX_OUTPUT_LINES} output lines limit reached`
+										: `${formatSize(DEFAULT_MAX_BYTES)} limit reached`,
+								);
 								details.truncation = truncation;
 							}
 							if (linesTruncated) {
@@ -441,7 +489,7 @@ export function createGrepToolDefinition(
 
 						child.on("error", (error) => {
 							cleanup();
-							settle(() => reject(new Error(`Failed to run ripgrep: ${error.message}`)));
+							settle(() => reject(sanitizeOperationError(new Error(`Failed to run ripgrep: ${error.message}`))));
 						});
 						child.on("close", async (code) => {
 							cleanup();
@@ -452,16 +500,16 @@ export function createGrepToolDefinition(
 								}
 								if (!killedDueToLimit && code !== 0 && code !== 1) {
 									const errorMsg = stderr.trim() || `ripgrep exited with code ${code}`;
-									settle(() => reject(new Error(errorMsg)));
+									settle(() => reject(sanitizeOperationError(new Error(errorMsg))));
 									return;
 								}
 								await formatMatches(matches, matchLimitReached);
 							} catch (error) {
-								settle(() => reject(error instanceof Error ? error : new Error(String(error))));
+								settle(() => reject(sanitizeOperationError(error)));
 							}
 						});
-					} catch (err) {
-						settle(() => reject(err as Error));
+					} catch (error) {
+						settle(() => reject(sanitizeOperationError(error)));
 					}
 				})();
 			});

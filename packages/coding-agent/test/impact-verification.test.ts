@@ -2,9 +2,13 @@ import { describe, expect, it, vi } from "vitest";
 import { computeCodeGraphFileRevision, IncrementalCodeGraph } from "../src/core/code-graph.ts";
 import {
 	buildCodeImpactMap,
+	collectGitChangedPaths,
+	getImpactGraphProvider,
 	type ImpactVerificationCatalogPlan,
+	parseGitChangedPaths,
 	parseImpactVerificationCatalog,
 	planImpactVerification,
+	registerImpactGraphProvider,
 	verifyImpactPlan,
 } from "../src/core/impact-verification.ts";
 
@@ -108,6 +112,26 @@ describe("CodeGraph-driven impact verification", () => {
 		]);
 	});
 
+	it("fails closed when graph traversal is truncated without a fallback check", async () => {
+		const impact = {
+			...buildCodeImpactMap(createSnapshot(), ["src/a.ts"]),
+			truncated: true,
+		};
+		const plan = planImpactVerification(catalog(false), impact);
+		expect(plan).toMatchObject({
+			coverage: "uncovered",
+			uncoveredFiles: [],
+		});
+
+		const execute = vi.fn();
+		const result = await verifyImpactPlan("verify truncated impact", catalog(false), impact, "/logical", execute);
+		expect(result).toMatchObject({
+			status: "blocked",
+			reason: expect.stringContaining("truncated"),
+		});
+		expect(execute).not.toHaveBeenCalled();
+	});
+
 	it("fails closed on uncovered changes and executes only a covered plan", async () => {
 		const uncoveredImpact = buildCodeImpactMap(createSnapshot(), ["docs/design.md"]);
 		const execute = vi.fn();
@@ -181,5 +205,35 @@ describe("CodeGraph-driven impact verification", () => {
 				],
 			}),
 		).toThrow("paths is not allowed for fallback checks");
+	});
+
+	it("discovers changed paths from NUL-delimited Git status and exposes a scoped live graph provider", async () => {
+		expect(parseGitChangedPaths(" M src/a.ts\0?? docs/new.md\0R  src/new-name.ts\0src/old-name.ts\0")).toEqual([
+			"docs/new.md",
+			"src/a.ts",
+			"src/new-name.ts",
+			"src/old-name.ts",
+		]);
+		const execute = vi.fn(async () => ({
+			stdout: " M src/a.ts\0?? docs/new.md\0",
+			stderr: "",
+			code: 0,
+			killed: false,
+		}));
+		await expect(collectGitChangedPaths("/logical", execute)).resolves.toEqual(["docs/new.md", "src/a.ts"]);
+		expect(execute).toHaveBeenCalledWith(
+			"git",
+			["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+			expect.objectContaining({ cwd: "/logical" }),
+		);
+
+		const provider = {
+			sync: vi.fn(async () => undefined),
+			impactMap: vi.fn(() => buildCodeImpactMap(createSnapshot(), ["src/a.ts"])),
+		};
+		const unregister = registerImpactGraphProvider("/logical", provider);
+		expect(getImpactGraphProvider("/logical")).toBe(provider);
+		unregister();
+		expect(getImpactGraphProvider("/logical")).toBeUndefined();
 	});
 });

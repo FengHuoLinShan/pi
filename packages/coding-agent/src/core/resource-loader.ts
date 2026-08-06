@@ -149,6 +149,8 @@ export interface DefaultResourceLoaderOptions {
 	agentDir: string;
 	settingsManager?: SettingsManager;
 	eventBus?: EventBus;
+	/** Disable every external resource source and later resource extension for a task-envelope session. */
+	taskEnvelopeIsolation?: boolean;
 	additionalExtensionPaths?: string[];
 	additionalSkillPaths?: string[];
 	additionalPromptTemplatePaths?: string[];
@@ -187,6 +189,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private settingsManager: SettingsManager;
 	private eventBus: EventBus;
 	private packageManager: DefaultPackageManager;
+	private taskEnvelopeIsolation: boolean;
 	private additionalExtensionPaths: string[];
 	private additionalSkillPaths: string[];
 	private additionalPromptTemplatePaths: string[];
@@ -250,6 +253,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			agentDir: this.agentDir,
 			settingsManager: this.settingsManager,
 		});
+		this.taskEnvelopeIsolation = options.taskEnvelopeIsolation ?? false;
 		this.additionalExtensionPaths = options.additionalExtensionPaths ?? [];
 		this.additionalSkillPaths = options.additionalSkillPaths ?? [];
 		this.additionalPromptTemplatePaths = options.additionalPromptTemplatePaths ?? [];
@@ -293,30 +297,39 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	getExtensions(): LoadExtensionsResult {
+		if (this.taskEnvelopeIsolation) {
+			return { extensions: [], errors: [], runtime: this.extensionsResult.runtime };
+		}
 		return this.extensionsResult;
 	}
 
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] } {
+		if (this.taskEnvelopeIsolation) return { skills: [], diagnostics: [] };
 		return { skills: this.skills, diagnostics: this.skillDiagnostics };
 	}
 
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] } {
+		if (this.taskEnvelopeIsolation) return { prompts: [], diagnostics: [] };
 		return { prompts: this.prompts, diagnostics: this.promptDiagnostics };
 	}
 
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] } {
+		if (this.taskEnvelopeIsolation) return { themes: [], diagnostics: [] };
 		return { themes: this.themes, diagnostics: this.themeDiagnostics };
 	}
 
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> } {
+		if (this.taskEnvelopeIsolation) return { agentsFiles: [] };
 		return { agentsFiles: this.agentsFiles };
 	}
 
 	getSystemPrompt(): string | undefined {
+		if (this.taskEnvelopeIsolation) return undefined;
 		return this.systemPrompt;
 	}
 
 	getAppendSystemPrompt(): string[] {
+		if (this.taskEnvelopeIsolation) return [];
 		return this.appendSystemPrompt;
 	}
 
@@ -467,6 +480,16 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	extendResources(paths: ResourceExtensionPaths): void {
+		if (
+			this.taskEnvelopeIsolation &&
+			((paths.skillPaths?.length ?? 0) > 0 ||
+				(paths.promptPaths?.length ?? 0) > 0 ||
+				(paths.themePaths?.length ?? 0) > 0)
+		) {
+			throw new Error("Resource extension is disabled for task-envelope sessions");
+		}
+		if (this.taskEnvelopeIsolation) return;
+
 		const skillPaths = this.normalizeExtensionPaths(paths.skillPaths ?? []);
 		const promptPaths = this.normalizeExtensionPaths(paths.promptPaths ?? []);
 		const themePaths = this.normalizeExtensionPaths(paths.themePaths ?? []);
@@ -507,6 +530,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	async loadProjectTrustExtensions(): Promise<LoadExtensionsResult> {
+		if (this.taskEnvelopeIsolation) {
+			return { extensions: [], errors: [], runtime: createExtensionRuntime() };
+		}
 		// Force untrusted project settings for the bootstrap pass. This keeps project-local
 		// extensions/packages out while still loading user/global and temporary CLI extensions.
 		this.settingsManager.setProjectTrusted(false);
@@ -528,6 +554,25 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	private async reloadResources(options?: ResourceLoaderReloadOptions): Promise<void> {
+		if (this.taskEnvelopeIsolation) {
+			await this.settingsManager.reload();
+			this.extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
+			this.skills = [];
+			this.skillDiagnostics = [];
+			this.prompts = [];
+			this.promptDiagnostics = [];
+			this.themes = [];
+			this.themeDiagnostics = [];
+			this.agentsFiles = [];
+			this.systemPrompt = undefined;
+			this.appendSystemPrompt = [];
+			this.lastSkillPaths = [];
+			this.lastPromptPaths = [];
+			this.lastThemePaths = [];
+			this.loaded = true;
+			return;
+		}
+
 		if (this.loaded) {
 			clearExtensionCache();
 		}

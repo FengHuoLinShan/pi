@@ -13,16 +13,17 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
-import type {
-	Agent,
-	AgentEvent,
-	AgentMessage,
-	AgentState,
-	AgentTool,
-	PrepareNextTurnContext,
-	ThinkingLevel,
+import {
+	type Agent,
+	type AgentEvent,
+	type AgentMessage,
+	type AgentState,
+	type AgentTool,
+	guardToolResultContext,
+	type PrepareNextTurnContext,
+	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import type {
 	AssistantMessage,
@@ -117,6 +118,12 @@ import { loadSkillBody } from "./skills.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
+import {
+	assertTaskEnvelopeResourceLoader,
+	assertValidatedTaskEnvelope,
+	summarizeTaskEnvelope,
+	type ValidatedTaskEnvelope,
+} from "./task-envelope.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import {
 	type CapabilityKind,
@@ -228,6 +235,8 @@ export interface AgentSessionConfig {
 	executionBoundary?: ExecutionBoundary;
 	/** Optional explicit materialized workspace for built-in tools and session bash execution. */
 	workspaceOverlay?: WorkspaceOverlay;
+	/** Validated task authorization and context. */
+	taskEnvelope?: ValidatedTaskEnvelope;
 	/** Canonical model/auth runtime used by coding-agent internals. */
 	modelRuntime: ModelRuntime;
 	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
@@ -247,6 +256,52 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+}
+
+function sameTaskEnvelopeRootSet(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length && left.every((root) => right.includes(root));
+}
+
+function assertAgentSessionConfigInvariants(config: AgentSessionConfig): void {
+	if (config.executionBoundary && config.baseToolsOverride) {
+		throw new Error("baseToolsOverride cannot be combined with executionBoundary");
+	}
+	if (config.executionBoundary && config.workspaceOverlay) {
+		throw new Error("executionBoundary cannot be combined with workspaceOverlay");
+	}
+	if (config.workspaceOverlay && config.baseToolsOverride) {
+		throw new Error("baseToolsOverride cannot be combined with workspaceOverlay");
+	}
+	if ((config.executionBoundary || config.taskEnvelope) && config.customTools && config.customTools.length > 0) {
+		throw new Error("customTools cannot be enabled with a bounded task because they execute in the host process");
+	}
+	if (!config.taskEnvelope) return;
+
+	assertValidatedTaskEnvelope(config.taskEnvelope);
+	if (config.workspaceOverlay || config.baseToolsOverride) {
+		throw new Error("taskEnvelope cannot be combined with workspaceOverlay or baseToolsOverride");
+	}
+	if (
+		realpathSync(config.cwd) !== config.taskEnvelope.targetCwd ||
+		realpathSync(config.sessionManager.getCwd()) !== config.taskEnvelope.targetCwd
+	) {
+		throw new Error("AgentSession cwd and session cwd must match taskEnvelope.targetCwd");
+	}
+	if (config.sessionManager.buildSessionContext().messages.length > 0) {
+		throw new Error("taskEnvelope requires a fresh session with no messages");
+	}
+	assertTaskEnvelopeResourceLoader(config.resourceLoader, config.taskEnvelope);
+
+	if (config.executionBoundary) {
+		const boundary = resolveExecutionBoundary(config.executionBoundary, []);
+		if (
+			boundary.cwd !== config.taskEnvelope.targetCwd ||
+			!sameTaskEnvelopeRootSet(boundary.readableRoots, config.taskEnvelope.readableRoots) ||
+			!sameTaskEnvelopeRootSet(boundary.writableRoots, config.taskEnvelope.writableRoots)
+		) {
+			throw new Error("executionBoundary filesystem scope must exactly match taskEnvelope authorization");
+		}
+	}
 }
 
 export interface ExtensionBindings {
@@ -379,6 +434,7 @@ export class AgentSession {
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _executionBoundary?: ExecutionBoundary;
 	private _workspaceOverlay?: WorkspaceOverlay;
+	private _taskEnvelope?: ValidatedTaskEnvelope;
 	private _agentOwnsSessionPersistence: boolean;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
@@ -407,20 +463,7 @@ export class AgentSession {
 	private _systemPromptOverride?: string;
 
 	constructor(config: AgentSessionConfig) {
-		if (config.executionBoundary && config.baseToolsOverride) {
-			throw new Error("baseToolsOverride cannot be combined with executionBoundary");
-		}
-		if (config.executionBoundary && config.workspaceOverlay) {
-			throw new Error("executionBoundary cannot be combined with workspaceOverlay");
-		}
-		if (config.workspaceOverlay && config.baseToolsOverride) {
-			throw new Error("baseToolsOverride cannot be combined with workspaceOverlay");
-		}
-		if (config.executionBoundary && config.customTools && config.customTools.length > 0) {
-			throw new Error(
-				"customTools cannot be enabled with executionBoundary because they execute in the host process",
-			);
-		}
+		assertAgentSessionConfigInvariants(config);
 		this.agent = config.agent;
 		this._agentOwnsSessionPersistence = config.agentOwnsSessionPersistence ?? false;
 		this.sessionManager = config.sessionManager;
@@ -437,6 +480,7 @@ export class AgentSession {
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._executionBoundary = config.executionBoundary;
 		this._workspaceOverlay = config.workspaceOverlay;
+		this._taskEnvelope = config.taskEnvelope;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 
 		// Always subscribe to agent events for internal handling
@@ -1174,7 +1218,8 @@ export class AgentSession {
 		this._baseSystemPromptOptions = {
 			cwd: this._cwd,
 			skills: loadedSkills,
-			skillLoading: this._executionBoundary ? "prompt" : this.settingsManager.getSkillLoading(),
+			skillLoading:
+				this._executionBoundary || this._taskEnvelope ? "prompt" : this.settingsManager.getSkillLoading(),
 			contextFiles: loadedContextFiles,
 			customPrompt: loaderSystemPrompt,
 			appendSystemPrompt,
@@ -1182,7 +1227,10 @@ export class AgentSession {
 			toolSnippets,
 			promptGuidelines,
 		};
-		return buildSystemPrompt(this._baseSystemPromptOptions);
+		const systemPrompt = buildSystemPrompt(this._baseSystemPromptOptions);
+		return this._taskEnvelope
+			? `${systemPrompt}\n\n${summarizeTaskEnvelope(this._taskEnvelope, this._executionBoundary !== undefined)}`
+			: systemPrompt;
 	}
 
 	searchCapabilities(kind: "all" | CapabilityKind, query: string, limit = 10): CapabilitySearchMatch[] {
@@ -2331,6 +2379,17 @@ export class AgentSession {
 				if (lastEntry?.type === "compaction") {
 					throw new Error("Already compacted");
 				}
+				const requestContext: Context = {
+					systemPrompt: this.agent.state.systemPrompt,
+					messages: convertToLlm(buildSessionContext(pathEntries).messages),
+					tools: this.agent.state.tools,
+				};
+				const boundedContext = guardToolResultContext(requestContext, this.model, this.model.maxTokens);
+				if (boundedContext !== requestContext) {
+					throw new Error(
+						"Recent tool output exceeds safe request limits but cannot be compacted until the tool turn is complete. Send a follow-up prompt to recover with a bounded projection.",
+					);
+				}
 				throw new Error("Nothing to compact (session too small)");
 			}
 
@@ -3083,6 +3142,7 @@ export class AgentSession {
 			: createAllToolDefinitions(this._cwd, {
 					boundary: this._executionBoundary,
 					overlay: this._workspaceOverlay,
+					taskEnvelope: this._taskEnvelope,
 					read: { autoResizeImages },
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
@@ -3094,7 +3154,7 @@ export class AgentSession {
 			this.settingsManager.getSkillLoading() === "on-demand" &&
 			this._resourceLoader.getSkills().skills.some((skill) => !skill.disableModelInvocation);
 		const hasLazyExtensions = (this._resourceLoader.getLazyExtensions?.().length ?? 0) > 0;
-		if (!this._executionBoundary && (hasVisibleOnDemandSkills || hasLazyExtensions)) {
+		if (!this._executionBoundary && !this._taskEnvelope && (hasVisibleOnDemandSkills || hasLazyExtensions)) {
 			this._baseToolDefinitions.set(
 				"capability",
 				createCapabilityToolDefinition({
@@ -3105,7 +3165,8 @@ export class AgentSession {
 		}
 
 		const extensionsResult = this._resourceLoader.getExtensions();
-		const extensionTool = extensionsResult.extensions.flatMap((extension) => [...extension.tools.keys()])[0];
+		const activeExtensions = this._taskEnvelope ? [] : extensionsResult.extensions;
+		const extensionTool = activeExtensions.flatMap((extension) => [...extension.tools.keys()])[0];
 		this._assertExtensionToolAllowed(extensionTool);
 		if (options.flagValues) {
 			for (const [name, value] of options.flagValues) {
@@ -3114,7 +3175,7 @@ export class AgentSession {
 		}
 
 		this._extensionRunner = new ExtensionRunner(
-			extensionsResult.extensions,
+			activeExtensions,
 			extensionsResult.runtime,
 			this._cwd,
 			this.sessionManager,
@@ -3317,6 +3378,7 @@ export class AgentSession {
 					onChunk,
 					signal: this._bashAbortController.signal,
 					env: boundary ? filterBoundaryEnvironment(boundary.profile, getShellEnv()) : undefined,
+					timeoutMs: this._taskEnvelope?.commandPolicy?.defaultTimeoutMs,
 				},
 			);
 

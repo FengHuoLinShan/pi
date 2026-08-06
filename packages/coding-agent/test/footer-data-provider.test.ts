@@ -77,16 +77,6 @@ function createReftableWorktree(tempDir: string): WorktreeFixture {
 	return { worktreeDir, reftableDir };
 }
 
-async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
-	const startedAt = Date.now();
-	while (!condition()) {
-		if (Date.now() - startedAt > timeoutMs) {
-			throw new Error("Timed out waiting for condition");
-		}
-		await new Promise((resolve) => setTimeout(resolve, 10));
-	}
-}
-
 describe("FooterDataProvider reftable branch detection", () => {
 	let originalCwd: string;
 	let tempDir: string;
@@ -167,19 +157,28 @@ describe("FooterDataProvider reftable branch detection", () => {
 		}
 	});
 
-	it("does not notify listeners when reftable updates keep the same branch", async () => {
-		const { worktreeDir, reftableDir } = createReftableWorktree(tempDir);
+	it("does not notify listeners when a reftable refresh keeps the same branch", async () => {
+		const { worktreeDir } = createReftableWorktree(tempDir);
 		process.chdir(worktreeDir);
+		vi.useFakeTimers();
 
 		const provider = new FooterDataProvider(worktreeDir);
 		try {
 			expect(provider.getGitBranch()).toBe("main");
 			vi.mocked(spawnSync).mockClear();
+			vi.mocked(execFile).mockClear();
 			const onBranchChange = vi.fn();
 			provider.onBranchChange(onBranchChange);
+			const providerWithInternals = provider as unknown as {
+				reftableWatcher: FSWatcher | null;
+				reftableTablesListWatcher: FSWatcher | null;
+				scheduleRefresh: () => void;
+			};
+			expect(providerWithInternals.reftableWatcher).not.toBeNull();
+			expect(providerWithInternals.reftableTablesListWatcher).not.toBeNull();
 
-			writeFileSync(join(reftableDir, "tables.list"), "1\n");
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
+			providerWithInternals.scheduleRefresh();
+			await vi.runAllTimersAsync();
 
 			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
 			expect(vi.mocked(spawnSync)).not.toHaveBeenCalled();
@@ -187,50 +186,64 @@ describe("FooterDataProvider reftable branch detection", () => {
 			expect(onBranchChange).not.toHaveBeenCalled();
 		} finally {
 			provider.dispose();
+			vi.useRealTimers();
 		}
 	});
 
 	it("debounces rapid reftable updates into a single async refresh", async () => {
-		const { worktreeDir, reftableDir } = createReftableWorktree(tempDir);
+		const { worktreeDir } = createReftableWorktree(tempDir);
 		process.chdir(worktreeDir);
+		vi.useFakeTimers();
 
 		const provider = new FooterDataProvider(worktreeDir);
 		try {
 			expect(provider.getGitBranch()).toBe("main");
 			vi.mocked(execFile).mockClear();
+			const providerWithInternals = provider as unknown as {
+				scheduleRefresh: () => void;
+			};
 
-			writeFileSync(join(reftableDir, "tables.list"), "1\n");
-			writeFileSync(join(reftableDir, "tables.list"), "2\n");
-			writeFileSync(join(reftableDir, "tables.list"), "3\n");
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
-			await new Promise((resolve) => setTimeout(resolve, 650));
+			providerWithInternals.scheduleRefresh();
+			providerWithInternals.scheduleRefresh();
+			providerWithInternals.scheduleRefresh();
+			await vi.advanceTimersByTimeAsync(500);
 
 			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
 		} finally {
 			provider.dispose();
+			vi.useRealTimers();
 		}
 	});
 
-	it("updates the cached branch when the reftable directory changes", async () => {
-		const { worktreeDir, reftableDir } = createReftableWorktree(tempDir);
+	it("updates the cached branch when a reftable watcher schedules a refresh", async () => {
+		const { worktreeDir } = createReftableWorktree(tempDir);
 		process.chdir(worktreeDir);
+		vi.useFakeTimers();
 
 		const provider = new FooterDataProvider(worktreeDir);
 		try {
 			expect(provider.getGitBranch()).toBe("main");
 			resolvedBranch = "foo";
+			vi.mocked(execFile).mockClear();
 			const onBranchChange = vi.fn();
 			provider.onBranchChange(onBranchChange);
+			const providerWithInternals = provider as unknown as {
+				reftableWatcher: FSWatcher | null;
+				reftableTablesListWatcher: FSWatcher | null;
+				scheduleRefresh: () => void;
+			};
+			expect(providerWithInternals.reftableWatcher).not.toBeNull();
+			expect(providerWithInternals.reftableTablesListWatcher).not.toBeNull();
 
-			writeFileSync(join(reftableDir, "tables.list"), "1\n");
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
-			await waitFor(() => provider.getGitBranch() === "foo");
+			providerWithInternals.scheduleRefresh();
+			await vi.runAllTimersAsync();
 
 			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
 			expect(provider.getGitBranch()).toBe("foo");
 			expect(onBranchChange).toHaveBeenCalledTimes(1);
 		} finally {
 			provider.dispose();
+			vi.useRealTimers();
 		}
 	});
 

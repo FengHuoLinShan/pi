@@ -39,6 +39,7 @@ import {
 } from "./core/session-cwd.ts";
 import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
+import { loadTaskEnvelope, type ValidatedTaskEnvelope } from "./core/task-envelope.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import type { WorkspaceOverlay } from "./core/workspace-overlay.ts";
@@ -475,6 +476,54 @@ export interface MainOptions {
 
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
+	const parsed = parseArgs(args);
+	time("parseArgs");
+
+	if (parsed.version) {
+		console.log(VERSION);
+		process.exit(0);
+		return;
+	}
+	if (parsed.help && parsed.taskEnvelope) {
+		printHelp([]);
+		process.exit(0);
+		return;
+	}
+	if (parsed.taskEnvelope) {
+		const parseErrors = parsed.diagnostics.filter((diagnostic) => diagnostic.type === "error");
+		if (parseErrors.length > 0) {
+			reportDiagnostics(parseErrors);
+			process.exit(1);
+			return;
+		}
+	}
+
+	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
+	let stdinContent: string | undefined;
+	if (parsed.taskEnvelope && appMode !== "rpc") {
+		stdinContent = await readPipedStdin();
+		if (stdinContent !== undefined) {
+			console.error(chalk.red("Error: --task-envelope cannot be combined with piped stdin"));
+			process.exit(1);
+			return;
+		}
+		time("readPipedStdin");
+	}
+
+	let cwd = process.cwd();
+	let taskEnvelope: ValidatedTaskEnvelope | undefined;
+	if (parsed.taskEnvelope) {
+		try {
+			taskEnvelope = await loadTaskEnvelope(parsed.taskEnvelope);
+			cwd = taskEnvelope.targetCwd;
+			parsed.messages.push(taskEnvelope.task);
+		} catch (error) {
+			console.error(chalk.red(`Error: ${error instanceof Error ? error.message : "Invalid task envelope"}`));
+			process.exit(1);
+			return;
+		}
+	}
+
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
@@ -486,7 +535,6 @@ export async function main(args: string[], options?: MainOptions) {
 		cleanupWindowsSelfUpdateQuarantine(getPackageDir());
 	}
 
-	const cwd = process.cwd();
 	const agentDir = getAgentDir();
 	const bootstrapSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
 	applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
@@ -509,7 +557,6 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
-	const parsed = parseArgs(args);
 	if (parsed.diagnostics.length > 0) {
 		for (const d of parsed.diagnostics) {
 			const color = d.type === "error" ? chalk.red : chalk.yellow;
@@ -517,13 +564,8 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 		if (parsed.diagnostics.some((d) => d.type === "error")) {
 			process.exit(1);
+			return;
 		}
-	}
-	time("parseArgs");
-
-	if (parsed.version) {
-		console.log(VERSION);
-		process.exit(0);
 	}
 
 	if (parsed.export) {
@@ -540,7 +582,6 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 
-	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
 	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
 	if (shouldTakeOverStdout) {
 		takeOverStdout();
@@ -638,6 +679,7 @@ export async function main(args: string[], options?: MainOptions) {
 			cwd,
 			agentDir,
 			settingsManager: runtimeSettingsManager,
+			taskEnvelope,
 			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderReloadOptions: shouldResolveProjectTrust
 				? {
@@ -825,15 +867,15 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 
-	// Read piped stdin content (if any) - skip for RPC mode which uses stdin for JSON-RPC
-	let stdinContent: string | undefined;
-	if (appMode !== "rpc") {
-		stdinContent = await readPipedStdin();
-		if (stdinContent !== undefined && appMode === "interactive") {
-			appMode = "print";
+	if (!parsed.taskEnvelope) {
+		if (appMode !== "rpc") {
+			stdinContent = await readPipedStdin();
+			if (stdinContent !== undefined && appMode === "interactive") {
+				appMode = "print";
+			}
 		}
+		time("readPipedStdin");
 	}
-	time("readPipedStdin");
 
 	const { initialMessage, initialImages } = await prepareInitialMessage(
 		parsed,

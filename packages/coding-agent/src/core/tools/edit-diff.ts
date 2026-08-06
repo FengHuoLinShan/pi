@@ -5,7 +5,12 @@
 import * as Diff from "diff";
 import { constants } from "fs";
 import { access, readFile, realpath } from "fs/promises";
-import { captureFilePathSnapshot, type FilePathOperations, revalidateFilePathSnapshot } from "./file-transaction.ts";
+import {
+	captureFilePathSnapshot,
+	type FilePathOperations,
+	redactFileError,
+	revalidateFilePathSnapshot,
+} from "./file-transaction.ts";
 import { resolveToCwd } from "./path-utils.ts";
 
 export function detectLineEnding(content: string): "\r\n" | "\n" {
@@ -520,6 +525,8 @@ export interface EditDiffOperations extends FilePathOperations {
 export interface ComputeEditsDiffOptions {
 	operations?: EditDiffOperations;
 	allowedRoots?: string[];
+	/** Replace path-bearing errors with stable restricted-mode diagnostics. Default: false. */
+	redactPathErrors?: boolean;
 }
 
 const defaultEditDiffOperations: EditDiffOperations = {
@@ -541,17 +548,31 @@ export async function computeEditsDiff(
 	const absolutePath = resolveToCwd(path, cwd);
 	const allowedRoots = options?.allowedRoots?.map((root) => resolveToCwd(root, cwd));
 	const ops = options?.operations ?? defaultEditDiffOperations;
+	const redactPathErrors = options?.redactPathErrors ?? false;
 
 	try {
-		const pathSnapshot = await captureFilePathSnapshot(absolutePath, path, allowedRoots, ops.realpath, true);
+		const pathSnapshot = await captureFilePathSnapshot(
+			absolutePath,
+			path,
+			allowedRoots,
+			ops.realpath,
+			true,
+			redactPathErrors,
+		);
 		// Check if file exists and is readable
 		try {
 			await ops.access(pathSnapshot.targetPath);
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
-			return { error: `Could not edit file: ${path}. ${errorMessage}.` };
+			return {
+				error: redactFileError(
+					new Error(`Could not edit file: ${path}. ${errorMessage}.`),
+					redactPathErrors,
+					"FILE_OPERATION_FAILED",
+				).message,
+			};
 		}
-		await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath);
+		await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath, redactPathErrors);
 
 		// Read the file
 		const rawContent = (await ops.readFile(pathSnapshot.targetPath)).toString("utf8");
@@ -563,8 +584,8 @@ export async function computeEditsDiff(
 
 		// Generate the diff
 		return generateDiffString(baseContent, newContent);
-	} catch (err) {
-		return { error: err instanceof Error ? err.message : String(err) };
+	} catch (error) {
+		return { error: redactFileError(error, redactPathErrors, "FILE_OPERATION_FAILED").message };
 	}
 }
 

@@ -10,6 +10,7 @@ import {
 	captureFilePathSnapshot,
 	type FilePathOperations,
 	type FilePathPolicy,
+	redactFileError,
 	revalidateFilePathSnapshot,
 } from "./file-transaction.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
@@ -105,6 +106,7 @@ export function createLsToolDefinition(
 ): ToolDefinition<typeof lsSchema, LsToolDetails | undefined> {
 	const ops = options?.operations ?? defaultLsOperations;
 	const allowedRoots = options?.allowedRoots?.map((root) => resolveToCwd(root, cwd));
+	const redactPathErrors = options?.redactPathErrors ?? false;
 	return {
 		name: "ls",
 		label: "ls",
@@ -136,30 +138,56 @@ export function createLsToolDefinition(
 							allowedRoots,
 							ops.realpath,
 							true,
+							redactPathErrors,
 						);
 						const dirPath = pathSnapshot.targetPath;
 						const effectiveLimit = limit ?? DEFAULT_LIMIT;
 
 						// Check if path exists.
 						if (!(await ops.exists(dirPath))) {
-							reject(new Error(`Path not found: ${dirPath}`));
+							reject(
+								redactFileError(
+									new Error(`Path not found: ${dirPath}`),
+									redactPathErrors,
+									"FILE_OPERATION_FAILED",
+								),
+							);
 							return;
 						}
 
 						// Check if path is a directory.
 						const stat = await ops.stat(dirPath);
 						if (!stat.isDirectory()) {
-							reject(new Error(`Not a directory: ${dirPath}`));
+							reject(
+								redactFileError(
+									new Error(`Not a directory: ${dirPath}`),
+									redactPathErrors,
+									"FILE_OPERATION_FAILED",
+								),
+							);
 							return;
 						}
-						await revalidateFilePathSnapshot(pathSnapshot, path || ".", allowedRoots, ops.realpath);
+						await revalidateFilePathSnapshot(
+							pathSnapshot,
+							path || ".",
+							allowedRoots,
+							ops.realpath,
+							redactPathErrors,
+						);
 
 						// Read directory entries.
 						let entries: string[];
 						try {
 							entries = await ops.readdir(dirPath);
-						} catch (e: any) {
-							reject(new Error(`Cannot read directory: ${e.message}`));
+						} catch (error) {
+							const message = error instanceof Error ? error.message : String(error);
+							reject(
+								redactFileError(
+									new Error(`Cannot read directory: ${message}`),
+									redactPathErrors,
+									"FILE_OPERATION_FAILED",
+								),
+							);
 							return;
 						}
 
@@ -184,6 +212,7 @@ export function createLsToolDefinition(
 									allowedRoots === undefined ? undefined : [dirPath],
 									ops.realpath,
 									true,
+									redactPathErrors,
 								);
 								const entryStat = await ops.stat(entrySnapshot.targetPath);
 								await revalidateFilePathSnapshot(
@@ -191,10 +220,13 @@ export function createLsToolDefinition(
 									entry,
 									allowedRoots === undefined ? undefined : [dirPath],
 									ops.realpath,
+									redactPathErrors,
 								);
 								if (entryStat.isDirectory()) suffix = "/";
 							} catch (error) {
-								if (allowedRoots !== undefined) throw error;
+								if (allowedRoots !== undefined) {
+									throw redactFileError(error, redactPathErrors, "FILE_OPERATION_FAILED");
+								}
 								// Skip entries we cannot stat.
 								continue;
 							}
@@ -231,9 +263,9 @@ export function createLsToolDefinition(
 							content: [{ type: "text", text: output }],
 							details: Object.keys(details).length > 0 ? details : undefined,
 						});
-					} catch (e: any) {
+					} catch (error) {
 						signal?.removeEventListener("abort", onAbort);
-						reject(e);
+						reject(redactFileError(error, redactPathErrors, "FILE_OPERATION_FAILED"));
 					}
 				})();
 			});

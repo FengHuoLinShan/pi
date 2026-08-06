@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { posix } from "node:path";
+import { posix, resolve } from "node:path";
 import type { CompletionReport, CompletionStatus } from "@earendil-works/pi-agent-core";
 import { minimatch } from "minimatch";
 import type { CodeGraphPath, CodeGraphSnapshot } from "./code-graph.ts";
@@ -96,6 +96,65 @@ export interface ImpactVerificationResult {
 	readonly verification?: GoalCompletionVerification;
 	readonly evidence: ImpactEvidenceBundle;
 	readonly reason?: string;
+}
+
+export interface ImpactGraphProvider {
+	sync(options?: { signal?: AbortSignal }): Promise<void>;
+	impactMap(
+		paths: readonly string[],
+		options?: { maxDepth?: number; maxPaths?: number; edgeKinds?: readonly string[] },
+	): CodeImpactMap;
+}
+
+const impactGraphProviders = new Map<string, ImpactGraphProvider>();
+
+/** Register a live graph supplied by the optional CodeGraph package for one logical workspace. */
+export function registerImpactGraphProvider(logicalRoot: string, provider: ImpactGraphProvider): () => void {
+	const key = resolve(logicalRoot);
+	if (impactGraphProviders.has(key)) throw new Error(`Impact graph provider is already registered for ${key}`);
+	impactGraphProviders.set(key, provider);
+	return () => {
+		if (impactGraphProviders.get(key) === provider) impactGraphProviders.delete(key);
+	};
+}
+
+export function getImpactGraphProvider(logicalRoot: string): ImpactGraphProvider | undefined {
+	return impactGraphProviders.get(resolve(logicalRoot));
+}
+
+/** Parse `git status --porcelain=v1 -z` without shell quoting ambiguities. */
+export function parseGitChangedPaths(output: string): string[] {
+	const records = output.split("\0");
+	if (records.at(-1) === "") records.pop();
+	const paths = new Set<string>();
+	for (let index = 0; index < records.length; index++) {
+		const record = records[index]!;
+		if (record.length < 4 || record[2] !== " ") throw new Error("Git returned malformed porcelain status");
+		const status = record.slice(0, 2);
+		paths.add(normalizeWorkspacePath(record.slice(3)));
+		if (status.includes("R") || status.includes("C")) {
+			const source = records[++index];
+			if (!source) throw new Error("Git returned an incomplete rename or copy status");
+			paths.add(normalizeWorkspacePath(source));
+		}
+	}
+	return [...paths].sort(compareStrings);
+}
+
+export async function collectGitChangedPaths(
+	logicalRoot: string,
+	execute: GoalCompletionExecutor,
+	signal?: AbortSignal,
+): Promise<string[]> {
+	const result = await execute("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+		cwd: logicalRoot,
+		timeout: 30_000,
+		signal,
+	});
+	if (result.killed) throw new Error("Git change discovery was interrupted");
+	if (result.code !== 0)
+		throw new Error(result.stderr.trim() || `Git change discovery exited with code ${result.code}`);
+	return parseGitChangedPaths(result.stdout);
 }
 
 function compareStrings(left: string, right: string): number {
@@ -356,10 +415,12 @@ export function planImpactVerification(
 	const covered = coveredFiles(selected, impact.affectedFiles);
 	const uncoveredFiles = impact.affectedFiles.filter((path) => !covered.has(path));
 	const usedFallback = selected.some((check) => check.check.selection.mode === "fallback");
+	const missingRequiredFallback = fallbackReasons.length > 0 && !usedFallback;
 	return {
 		catalogRevision: catalog.configRevision,
 		impact,
-		coverage: uncoveredFiles.length > 0 ? "uncovered" : usedFallback ? "fallback" : "complete",
+		coverage:
+			uncoveredFiles.length > 0 || missingRequiredFallback ? "uncovered" : usedFallback ? "fallback" : "complete",
 		selected,
 		uncoveredFiles,
 	};
@@ -394,11 +455,19 @@ export async function verifyImpactPlan(
 ): Promise<ImpactVerificationResult> {
 	const plan = planImpactVerification(catalog, impact);
 	if (plan.coverage === "uncovered") {
+		const reason =
+			plan.uncoveredFiles.length > 0
+				? `No configured check covers: ${plan.uncoveredFiles.join(", ")}`
+				: plan.impact.truncated
+					? "Impact graph traversal was truncated and no fallback check is configured"
+					: plan.impact.unindexedChangedFiles.length > 0
+						? `No fallback check covers unindexed changes: ${plan.impact.unindexedChangedFiles.join(", ")}`
+						: "Impact verification coverage is incomplete";
 		return {
 			status: "blocked",
 			plan,
 			evidence: evidenceBundle(plan),
-			reason: `No configured check covers: ${plan.uncoveredFiles.join(", ")}`,
+			reason,
 		};
 	}
 	if (plan.selected.length === 0) {

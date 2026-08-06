@@ -18,6 +18,7 @@ import {
 	type FileRevision,
 	type FileRevisionState,
 	readRevisionState,
+	redactFileError,
 	revalidateFilePathSnapshot,
 } from "./file-transaction.ts";
 import { resolveToCwd } from "./path-utils.ts";
@@ -220,6 +221,7 @@ export function createWriteToolDefinition(
 ): ToolDefinition<typeof writeSchema, WriteToolDetails> {
 	const ops = options?.operations ?? defaultWriteOperations;
 	const allowedRoots = options?.allowedRoots?.map((root) => resolveToCwd(root, cwd));
+	const redactPathErrors = options?.redactPathErrors ?? false;
 	return {
 		name: "write",
 		label: "write",
@@ -239,65 +241,81 @@ export function createWriteToolDefinition(
 			_ctx?,
 		) {
 			const absolutePath = resolveToCwd(path, cwd);
-			return withFileMutationQueue(absolutePath, async () => {
-				// Do not reject from an abort event listener here: that would release the
-				// mutation queue while an in-flight filesystem operation may still finish.
-				// Checking signal.aborted after each await observes the same aborts while
-				// keeping the queue locked until the current operation has settled.
-				const throwIfAborted = (): void => {
-					if (signal?.aborted) throw new Error("Operation aborted");
-				};
+			try {
+				return await withFileMutationQueue(absolutePath, async () => {
+					// Do not reject from an abort event listener here: that would release the
+					// mutation queue while an in-flight filesystem operation may still finish.
+					// Checking signal.aborted after each await observes the same aborts while
+					// keeping the queue locked until the current operation has settled.
+					const throwIfAborted = (): void => {
+						if (signal?.aborted) throw new Error("Operation aborted");
+					};
 
-				throwIfAborted();
-				const pathSnapshot = await captureFilePathSnapshot(absolutePath, path, allowedRoots, ops.realpath, true);
-				throwIfAborted();
-				// Create parent directories if needed.
-				await ops.mkdir(dirname(pathSnapshot.targetPath));
-				await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath);
-				throwIfAborted();
-				const before = await readRevisionState(pathSnapshot.targetPath, ops.readFile);
-				assertExpectedRevision(path, expectedRevision, before.revision);
-				throwIfAborted();
-
-				// Write the file contents.
-				await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath);
-				const current = await readRevisionState(pathSnapshot.targetPath, ops.readFile);
-				if (before.revision !== "unknown") {
-					assertExpectedRevision(path, before.revision, current.revision);
-				}
-				throwIfAborted();
-				await ops.writeFile(pathSnapshot.targetPath, content);
-				throwIfAborted();
-
-				const intendedRevision = computeFileRevision(content);
-				const verified = await readRevisionState(pathSnapshot.targetPath, ops.readFile);
-				const afterRevision = verified.revision === "unknown" ? intendedRevision : verified.revision;
-				if (afterRevision !== intendedRevision) {
-					throw new Error(
-						`Could not verify write to ${path}: expected revision ${intendedRevision}, found ${afterRevision}.`,
+					throwIfAborted();
+					const pathSnapshot = await captureFilePathSnapshot(
+						absolutePath,
+						path,
+						allowedRoots,
+						ops.realpath,
+						true,
+						redactPathErrors,
 					);
-				}
+					throwIfAborted();
+					// Create parent directories if needed.
+					await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath, redactPathErrors);
+					await ops.mkdir(dirname(pathSnapshot.targetPath));
+					await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath, redactPathErrors);
+					throwIfAborted();
+					const before = await readRevisionState(pathSnapshot.targetPath, ops.readFile);
+					assertExpectedRevision(path, expectedRevision, before.revision, redactPathErrors);
+					throwIfAborted();
 
-				const previousContent = before.revision === "missing" ? "" : before.content?.toString("utf8");
-				const diffResult = previousContent === undefined ? undefined : generateDiffString(previousContent, content);
+					// Write the file contents.
+					await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath, redactPathErrors);
+					const current = await readRevisionState(pathSnapshot.targetPath, ops.readFile);
+					if (before.revision !== "unknown") {
+						assertExpectedRevision(path, before.revision, current.revision, redactPathErrors);
+					}
+					throwIfAborted();
+					await ops.writeFile(pathSnapshot.targetPath, content);
+					throwIfAborted();
+					await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath, redactPathErrors);
 
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Successfully wrote ${Buffer.byteLength(content, "utf8")} bytes to ${path}. Revision: ${before.revision} -> ${afterRevision}.`,
+					const intendedRevision = computeFileRevision(content);
+					const verified = await readRevisionState(pathSnapshot.targetPath, ops.readFile);
+					const afterRevision = verified.revision === "unknown" ? intendedRevision : verified.revision;
+					if (afterRevision !== intendedRevision) {
+						throw new Error(
+							`Could not verify write to ${path}: expected revision ${intendedRevision}, found ${afterRevision}.`,
+						);
+					}
+
+					const previousContent = before.revision === "missing" ? "" : before.content?.toString("utf8");
+					const diffResult =
+						previousContent === undefined ? undefined : generateDiffString(previousContent, content);
+
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Successfully wrote ${Buffer.byteLength(content, "utf8")} bytes to ${path}. Revision: ${before.revision} -> ${afterRevision}.`,
+							},
+						],
+						details: {
+							beforeRevision: before.revision,
+							afterRevision,
+							diff: diffResult?.diff,
+							patch:
+								previousContent === undefined
+									? undefined
+									: generateUnifiedPatch(path, previousContent, content),
+							firstChangedLine: diffResult?.firstChangedLine,
 						},
-					],
-					details: {
-						beforeRevision: before.revision,
-						afterRevision,
-						diff: diffResult?.diff,
-						patch:
-							previousContent === undefined ? undefined : generateUnifiedPatch(path, previousContent, content),
-						firstChangedLine: diffResult?.firstChangedLine,
-					},
-				};
-			});
+					};
+				});
+			} catch (error) {
+				throw redactFileError(error, redactPathErrors, "FILE_OPERATION_FAILED");
+			}
 		},
 		renderCall(args, theme, context) {
 			const renderArgs = args as { path?: string; file_path?: string; content?: string } | undefined;

@@ -13,6 +13,7 @@ import {
 	captureFilePathSnapshot,
 	type FilePathOperations,
 	type FilePathPolicy,
+	redactFileError,
 	revalidateFilePathSnapshot,
 } from "./file-transaction.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
@@ -41,6 +42,7 @@ async function normalizeSearchResultPath(
 	searchPath: string,
 	operations: FindOperations,
 	policyEnabled: boolean,
+	redactPathErrors: boolean,
 ): Promise<string> {
 	const hadTrailingSlash = rawPath.endsWith("/") || rawPath.endsWith("\\");
 	const absolutePath = path.isAbsolute(rawPath) ? rawPath : path.resolve(searchPath, rawPath);
@@ -50,8 +52,15 @@ async function normalizeSearchResultPath(
 		policyEnabled ? [searchPath] : undefined,
 		operations.realpath,
 		true,
+		redactPathErrors,
 	);
-	await revalidateFilePathSnapshot(snapshot, rawPath, policyEnabled ? [searchPath] : undefined, operations.realpath);
+	await revalidateFilePathSnapshot(
+		snapshot,
+		rawPath,
+		policyEnabled ? [searchPath] : undefined,
+		operations.realpath,
+		redactPathErrors,
+	);
 	let relativePath = path.relative(searchPath, snapshot.targetPath) || ".";
 	if (hadTrailingSlash && !relativePath.endsWith(path.sep)) relativePath += path.sep;
 	return toPosixPath(relativePath);
@@ -153,6 +162,7 @@ export function createFindToolDefinition(
 ): ToolDefinition<typeof findSchema, FindToolDetails | undefined> {
 	const customOps = options?.operations;
 	const allowedRoots = options?.allowedRoots?.map((root) => resolveToCwd(root, cwd));
+	const redactPathErrors = options?.redactPathErrors ?? false;
 	return {
 		name: "find",
 		label: "find",
@@ -185,6 +195,8 @@ export function createFindToolDefinition(
 					stopChild?.();
 					settle(() => reject(new Error("Operation aborted")));
 				};
+				const sanitizeOperationError = (error: unknown): Error =>
+					redactFileError(error, redactPathErrors, "FILE_OPERATION_FAILED");
 				signal?.addEventListener("abort", onAbort, { once: true });
 
 				(async () => {
@@ -198,13 +210,28 @@ export function createFindToolDefinition(
 							allowedRoots,
 							ops.realpath,
 							true,
+							redactPathErrors,
 						);
 						const searchPath = pathSnapshot.targetPath;
 						if (!(await ops.exists(searchPath))) {
-							settle(() => reject(new Error(`Path not found: ${searchPath}`)));
+							settle(() =>
+								reject(
+									redactFileError(
+										new Error(`Path not found: ${searchPath}`),
+										redactPathErrors,
+										"FILE_OPERATION_FAILED",
+									),
+								),
+							);
 							return;
 						}
-						await revalidateFilePathSnapshot(pathSnapshot, searchDir || ".", allowedRoots, ops.realpath);
+						await revalidateFilePathSnapshot(
+							pathSnapshot,
+							searchDir || ".",
+							allowedRoots,
+							ops.realpath,
+							redactPathErrors,
+						);
 
 						// If custom operations provide glob(), use that instead of fd.
 						if (customOps?.glob) {
@@ -236,7 +263,13 @@ export function createFindToolDefinition(
 								results
 									.slice(0, effectiveLimit)
 									.map((resultPath) =>
-										normalizeSearchResultPath(resultPath, searchPath, ops, allowedRoots !== undefined),
+										normalizeSearchResultPath(
+											resultPath,
+											searchPath,
+											ops,
+											allowedRoots !== undefined,
+											redactPathErrors,
+										),
 									),
 							);
 							const resultLimitReached = relativized.length >= effectiveLimit;
@@ -334,7 +367,7 @@ export function createFindToolDefinition(
 
 						child.on("error", (error) => {
 							cleanup();
-							settle(() => reject(new Error(`Failed to run fd: ${error.message}`)));
+							settle(() => reject(sanitizeOperationError(new Error(`Failed to run fd: ${error.message}`))));
 						});
 
 						child.on("close", async (code) => {
@@ -367,7 +400,13 @@ export function createFindToolDefinition(
 										.map((rawLine) => rawLine.replace(/\r$/, "").trim())
 										.filter((line) => line.length > 0)
 										.map((line) =>
-											normalizeSearchResultPath(line, searchPath, ops, allowedRoots !== undefined),
+											normalizeSearchResultPath(
+												line,
+												searchPath,
+												ops,
+												allowedRoots !== undefined,
+												redactPathErrors,
+											),
 										),
 								);
 
@@ -397,16 +436,15 @@ export function createFindToolDefinition(
 									}),
 								);
 							} catch (error) {
-								settle(() => reject(error instanceof Error ? error : new Error(String(error))));
+								settle(() => reject(sanitizeOperationError(error)));
 							}
 						});
-					} catch (e) {
+					} catch (error) {
 						if (signal?.aborted) {
 							settle(() => reject(new Error("Operation aborted")));
 							return;
 						}
-						const error = e instanceof Error ? e : new Error(String(e));
-						settle(() => reject(error));
+						settle(() => reject(sanitizeOperationError(error)));
 					}
 				})();
 			});

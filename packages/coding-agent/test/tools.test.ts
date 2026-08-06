@@ -489,14 +489,15 @@ describe("Coding Agent Tools", () => {
 		});
 
 		it("should respect timeout", async () => {
-			await expect(bashTool.execute("test-call-10", { command: "sleep 5", timeout: 1 })).rejects.toThrow(
+			await expect(bashTool.execute("test-call-10", { command: "sleep 5", timeoutMs: 1_000 })).rejects.toThrow(
 				/timed out/i,
 			);
 		});
 
 		it("should include full output path for truncated timeout and abort errors", async () => {
 			for (const testCase of [
-				{ error: "timeout:5", expected: "Command timed out after 5 seconds" },
+				{ error: "timeout:5", expected: "Command timed out after 5000 ms" },
+				{ error: "timeout:not-seconds", expected: "Command timed out after an unspecified timeout ms" },
 				{ error: "aborted", expected: "Command aborted" },
 			]) {
 				const operations: BashOperations = {
@@ -683,10 +684,11 @@ describe("Coding Agent Tools", () => {
 			const output = getTextOutput(result);
 
 			expect(result.details?.truncation?.totalLines).toBe(4000);
-			expect(result.details?.truncation?.outputLines).toBe(2000);
-			expect(output).toContain("line-2001");
+			expect(result.details?.truncation?.outputLines).toBe(200);
+			expect(output).toContain("line-3801");
 			expect(output).toContain("line-4000");
-			expect(output).toMatch(/\[Showing lines 2001-4000 of 4000\. Full output: /);
+			expect(output).toMatch(/\[Showing lines 3801-4000 of 4000\. Full output: /);
+			expect(output).not.toContain("line-3800");
 			expect(output).not.toContain("4001");
 		});
 
@@ -805,6 +807,37 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain("[1 matches limit reached. Use limit=2 for more, or refine pattern]");
 			// Ensure second match is not present
 			expect(output).not.toContain("match two");
+		});
+
+		it("should cap context-expanded results by output line count", async () => {
+			const testFile = join(testDir, "many-context-matches.txt");
+			const content = Array.from({ length: 100 }, (_, index) => {
+				const matchNumber = index + 1;
+				return [
+					`before-a ${matchNumber}`,
+					`before-b ${matchNumber}`,
+					`hit needle-${matchNumber}`,
+					`after-a ${matchNumber}`,
+					`after-b ${matchNumber}`,
+					`gap ${matchNumber}`,
+				].join("\n");
+			}).join("\n");
+			writeFileSync(testFile, content);
+
+			const result = await grepTool.execute("test-call-context-output-limit", {
+				pattern: "hit needle-",
+				path: testFile,
+				context: 2,
+				limit: 100,
+			});
+			const output = getTextOutput(result);
+
+			expect(result.details?.truncation?.truncatedBy).toBe("lines");
+			expect(result.details?.truncation?.outputLines).toBe(200);
+			expect(result.details?.truncation?.totalLines).toBe(500);
+			expect(output).toContain("hit needle-1");
+			expect(output).not.toContain("hit needle-100");
+			expect(output).toContain("200 output lines limit reached");
 		});
 
 		it("should treat flag-like patterns as search text", async () => {

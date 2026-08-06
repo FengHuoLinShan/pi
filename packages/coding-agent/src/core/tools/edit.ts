@@ -28,6 +28,7 @@ import {
 	type FilePathOperations,
 	type FilePathPolicy,
 	type FileRevision,
+	redactFileError,
 	revalidateFilePathSnapshot,
 } from "./file-transaction.ts";
 import { resolveToCwd } from "./path-utils.ts";
@@ -311,6 +312,7 @@ export function createEditToolDefinition(
 ): ToolDefinition<typeof editSchema, EditToolDetails | undefined, EditRenderState> {
 	const ops = options?.operations ?? defaultEditOperations;
 	const allowedRoots = options?.allowedRoots?.map((root) => resolveToCwd(root, cwd));
+	const redactPathErrors = options?.redactPathErrors ?? false;
 	return {
 		name: "edit",
 		label: "edit",
@@ -332,78 +334,92 @@ export function createEditToolDefinition(
 			const { path, edits, expectedRevision } = validateEditInput(input);
 			const absolutePath = resolveToCwd(path, cwd);
 
-			return withFileMutationQueue(absolutePath, async () => {
-				// Do not reject from an abort event listener here: that would release the
-				// mutation queue while an in-flight filesystem operation may still finish.
-				// Checking signal.aborted after each await observes the same aborts while
-				// keeping the queue locked until the current operation has settled.
-				const throwIfAborted = (): void => {
-					if (signal?.aborted) throw new Error("Operation aborted");
-				};
+			try {
+				return await withFileMutationQueue(absolutePath, async () => {
+					// Do not reject from an abort event listener here: that would release the
+					// mutation queue while an in-flight filesystem operation may still finish.
+					// Checking signal.aborted after each await observes the same aborts while
+					// keeping the queue locked until the current operation has settled.
+					const throwIfAborted = (): void => {
+						if (signal?.aborted) throw new Error("Operation aborted");
+					};
 
-				throwIfAborted();
-				const pathSnapshot = await captureFilePathSnapshot(absolutePath, path, allowedRoots, ops.realpath, true);
-				throwIfAborted();
-
-				// Check if file exists.
-				try {
-					await ops.access(pathSnapshot.targetPath);
-				} catch (error: unknown) {
 					throwIfAborted();
-					const errorMessage =
-						error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
-					throw new Error(`Could not edit file: ${path}. ${errorMessage}.`);
-				}
-				throwIfAborted();
-
-				// Read the file.
-				const buffer = await ops.readFile(pathSnapshot.targetPath);
-				const rawContent = buffer.toString("utf-8");
-				const beforeRevision = computeFileRevision(buffer);
-				assertExpectedRevision(path, expectedRevision, beforeRevision);
-				throwIfAborted();
-
-				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
-				const { bom, text: content } = stripBom(rawContent);
-				const originalEnding = detectLineEnding(content);
-				const normalizedContent = normalizeToLF(content);
-				const { newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
-				throwIfAborted();
-
-				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
-				await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath);
-				const currentBuffer = await ops.readFile(pathSnapshot.targetPath);
-				assertExpectedRevision(path, beforeRevision, computeFileRevision(currentBuffer));
-				throwIfAborted();
-				await ops.writeFile(pathSnapshot.targetPath, finalContent);
-				throwIfAborted();
-				const verifiedBuffer = await ops.readFile(pathSnapshot.targetPath);
-				const afterRevision = computeFileRevision(verifiedBuffer);
-				const intendedRevision = computeFileRevision(finalContent);
-				if (afterRevision !== intendedRevision) {
-					throw new Error(
-						`Could not verify edit of ${path}: expected revision ${intendedRevision}, found ${afterRevision}.`,
+					const pathSnapshot = await captureFilePathSnapshot(
+						absolutePath,
+						path,
+						allowedRoots,
+						ops.realpath,
+						true,
+						redactPathErrors,
 					);
-				}
+					throwIfAborted();
 
-				const diffResult = generateDiffString(rawContent, finalContent);
-				const patch = generateUnifiedPatch(path, rawContent, finalContent);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Successfully replaced ${edits.length} block(s) in ${path}. Revision: ${beforeRevision} -> ${afterRevision}.`,
+					// Check if file exists.
+					try {
+						await ops.access(pathSnapshot.targetPath);
+					} catch (error: unknown) {
+						throwIfAborted();
+						const errorMessage =
+							error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
+						throw new Error(`Could not edit file: ${path}. ${errorMessage}.`);
+					}
+					throwIfAborted();
+					await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath, redactPathErrors);
+					throwIfAborted();
+
+					// Read the file.
+					const buffer = await ops.readFile(pathSnapshot.targetPath);
+					const rawContent = buffer.toString("utf-8");
+					const beforeRevision = computeFileRevision(buffer);
+					assertExpectedRevision(path, expectedRevision, beforeRevision, redactPathErrors);
+					throwIfAborted();
+
+					// Strip BOM before matching. The model will not include an invisible BOM in oldText.
+					const { bom, text: content } = stripBom(rawContent);
+					const originalEnding = detectLineEnding(content);
+					const normalizedContent = normalizeToLF(content);
+					const { newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+					throwIfAborted();
+
+					const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+					await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath, redactPathErrors);
+					const currentBuffer = await ops.readFile(pathSnapshot.targetPath);
+					assertExpectedRevision(path, beforeRevision, computeFileRevision(currentBuffer), redactPathErrors);
+					throwIfAborted();
+					await ops.writeFile(pathSnapshot.targetPath, finalContent);
+					throwIfAborted();
+					await revalidateFilePathSnapshot(pathSnapshot, path, allowedRoots, ops.realpath, redactPathErrors);
+					const verifiedBuffer = await ops.readFile(pathSnapshot.targetPath);
+					const afterRevision = computeFileRevision(verifiedBuffer);
+					const intendedRevision = computeFileRevision(finalContent);
+					if (afterRevision !== intendedRevision) {
+						throw new Error(
+							`Could not verify edit of ${path}: expected revision ${intendedRevision}, found ${afterRevision}.`,
+						);
+					}
+
+					const diffResult = generateDiffString(rawContent, finalContent);
+					const patch = generateUnifiedPatch(path, rawContent, finalContent);
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Successfully replaced ${edits.length} block(s) in ${path}. Revision: ${beforeRevision} -> ${afterRevision}.`,
+							},
+						],
+						details: {
+							diff: diffResult.diff,
+							patch,
+							beforeRevision,
+							afterRevision,
+							firstChangedLine: diffResult.firstChangedLine,
 						},
-					],
-					details: {
-						diff: diffResult.diff,
-						patch,
-						beforeRevision,
-						afterRevision,
-						firstChangedLine: diffResult.firstChangedLine,
-					},
-				};
-			});
+					};
+				});
+			} catch (error) {
+				throw redactFileError(error, redactPathErrors, "FILE_OPERATION_FAILED");
+			}
 		},
 		renderCall(args, theme, context) {
 			const component = getEditCallRenderComponent(context.state, context.lastComponent);
@@ -425,6 +441,7 @@ export function createEditToolDefinition(
 				void computeEditsDiff(previewInput.path, previewInput.edits, context.cwd, {
 					operations: ops,
 					allowedRoots,
+					redactPathErrors,
 				}).then((preview) => {
 					if (component.previewArgsKey === requestKey) {
 						setEditPreview(component, preview, requestKey);

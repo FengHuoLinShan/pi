@@ -26,6 +26,7 @@ export {
 	parseSkillBlock,
 	type SessionStats,
 } from "./core/agent-session.ts";
+export * from "./core/architecture-fitness.ts";
 export * from "./core/artifact-store.ts";
 export { readStoredCredential } from "./core/auth-storage.ts";
 export * from "./core/code-graph.ts";
@@ -59,6 +60,7 @@ export {
 	shouldCompact,
 	validateCompactionTokenSettings,
 } from "./core/compaction/index.ts";
+export * from "./core/engineering-memory-session.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
 export {
 	type BoundaryAttestation,
@@ -228,6 +230,7 @@ export { DefaultPackageManager } from "./core/package-manager.ts";
 export * from "./core/process-runtime.ts";
 export * from "./core/process-session.ts";
 export * from "./core/process-session-verifier.ts";
+export * from "./core/remote-process-session-backend.ts";
 export type {
 	LazyExtensionActivationResult,
 	LazyExtensionInfo,
@@ -237,6 +240,7 @@ export type {
 	ResourceLoader,
 } from "./core/resource-loader.ts";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
+export * from "./core/reviewable-patch-stack.ts";
 // SDK for programmatic usage
 export {
 	AgentSessionRuntime,
@@ -318,6 +322,16 @@ export {
 	type SkillFrontmatter,
 } from "./core/skills.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";
+export {
+	loadTaskEnvelope,
+	summarizeTaskEnvelope,
+	type TaskEnvelope,
+	type TaskEnvelopeCommandPolicy,
+	type TaskEnvelopePrivacy,
+	type TaskEnvelopeV1,
+	type ValidatedTaskEnvelope,
+	validateTaskEnvelope,
+} from "./core/task-envelope.ts";
 export { type EditDiffResult, generateDiffString, generateUnifiedPatch } from "./core/tools/edit-diff.ts";
 // Tools
 export {
@@ -385,6 +399,7 @@ export {
 	type ProjectTrustStoreEntry,
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
+export * from "./core/verified-work-runtime.ts";
 export * from "./core/work-graph.ts";
 export * from "./core/work-graph-session.ts";
 export * from "./core/working-set-session.ts";

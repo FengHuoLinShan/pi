@@ -100,6 +100,45 @@ describe("workspace-overlay built-in extension", () => {
 		expect(readFileSync(join(reopened.overlay.getWorkingDirectory(), "tracked.txt"), "utf8")).toBe("overlay\n");
 	});
 
+	it("replaces a cached patch stack when a reopened overlay has a new base snapshot", async () => {
+		const fixture = createFixture("session-rebased");
+		const first = await openCliWorkspaceOverlay(fixture);
+		writeFileSync(join(fixture.workspaceRoot, "tracked.txt"), "new base\n");
+		writeFileSync(join(first.overlay.getWorkingDirectory(), "tracked.txt"), "new base\n");
+		const replacement = await openCliWorkspaceOverlay({ ...fixture, sessionId: "session-rebased-source" });
+		const firstMetadataPath = join(fixture.agentDir, "workspace-overlays", fixture.sessionId, "overlay.json");
+		const replacementMetadataPath = join(
+			fixture.agentDir,
+			"workspace-overlays",
+			"session-rebased-source",
+			"overlay.json",
+		);
+		const firstMetadata = JSON.parse(readFileSync(firstMetadataPath, "utf8")) as Record<string, unknown>;
+		const replacementMetadata = JSON.parse(readFileSync(replacementMetadataPath, "utf8")) as Record<string, unknown>;
+		writeFileSync(
+			firstMetadataPath,
+			`${JSON.stringify(
+				{
+					...firstMetadata,
+					baseSnapshotId: replacementMetadata.baseSnapshotId,
+					baseSnapshot: replacementMetadata.baseSnapshot,
+				},
+				null,
+				2,
+			)}\n`,
+		);
+
+		const reopened = await openCliWorkspaceOverlay(fixture);
+		expect(reopened.overlay.getId()).toBe(first.overlay.getId());
+		expect(reopened.overlay.getBaseSnapshotId()).toBe(replacement.overlay.getBaseSnapshotId());
+		expect(reopened.overlay.getBaseSnapshotId()).not.toBe(first.overlay.getBaseSnapshotId());
+		writeFileSync(join(reopened.overlay.getWorkingDirectory(), "tracked.txt"), "pending\n");
+		const extension = setupExtension(fixture.sessionId);
+
+		await expect(extension.command("stack", extension.ctx)).resolves.toBeUndefined();
+		expect(extension.notify).toHaveBeenCalledWith(expect.stringContaining("pending"), "info");
+	});
+
 	it("reviews and atomically applies the captured PatchSet before shutdown", async () => {
 		const fixture = createFixture("session-apply");
 		const opened = await openCliWorkspaceOverlay(fixture);
@@ -118,6 +157,34 @@ describe("workspace-overlay built-in extension", () => {
 			expect.objectContaining({ version: 1, appliedPaths: ["tracked.txt"] }),
 		);
 		expect(extension.shutdown).toHaveBeenCalledTimes(1);
+	});
+
+	it("captures and approves reviewable patch checkpoints", async () => {
+		const fixture = createFixture("session-stack");
+		const opened = await openCliWorkspaceOverlay(fixture);
+		writeFileSync(join(opened.overlay.getWorkingDirectory(), "tracked.txt"), "checkpoint\n");
+		const extension = setupExtension(fixture.sessionId);
+
+		await extension.command("stack", extension.ctx);
+		expect(extension.notify).toHaveBeenCalledWith(expect.stringContaining("pending"), "info");
+		await extension.command("approve", extension.ctx);
+		expect(extension.confirm).toHaveBeenCalledWith(
+			"Approve patch layer?",
+			expect.stringContaining("1 cumulative path(s)"),
+		);
+		expect(extension.notify).toHaveBeenCalledWith(expect.stringContaining("Approved patch layer"), "info");
+	});
+
+	it("does not fall back to another layer when an explicit layer id is unknown", async () => {
+		const fixture = createFixture("session-unknown-layer");
+		const opened = await openCliWorkspaceOverlay(fixture);
+		writeFileSync(join(opened.overlay.getWorkingDirectory(), "tracked.txt"), "checkpoint\n");
+		const extension = setupExtension(fixture.sessionId);
+
+		await extension.command("approve missing-layer", extension.ctx);
+
+		expect(extension.notify).toHaveBeenCalledWith("Unknown patch layer: missing-layer", "warning");
+		expect(extension.confirm).not.toHaveBeenCalled();
 	});
 
 	it("blocks session switches while the overlay has pending changes", async () => {

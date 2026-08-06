@@ -1,5 +1,6 @@
 import { Session, SessionRuntimeEventStore } from "@earendil-works/pi-agent-core";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type Message } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { AgentHarnessSessionStorageAdapter } from "../src/core/agent-harness-session-adapter.ts";
 import { CodingAgentHarnessRuntime } from "../src/core/coding-agent-harness-runtime.ts";
@@ -82,6 +83,52 @@ describe("CodingAgentHarnessRuntime", () => {
 
 		expect(newMessageRoles).toEqual(["user", "assistant", "toolResult"]);
 		expect(secondRequestText).toEqual(["replacement"]);
+	});
+
+	it("finishes the production runtime turn when a later provider guard stops the run", async () => {
+		const models = createModels();
+		const faux = fauxProvider({ provider: `coding-harness-guard-after-tool-${++fauxCount}` });
+		models.setProvider(faux.provider);
+		const parameters = Type.Object({});
+		let guardCalls = 0;
+		const runtime = new CodingAgentHarnessRuntime({
+			models,
+			sessionManager: SessionManager.inMemory(process.cwd()),
+			cwd: process.cwd(),
+			initialState: {
+				systemPrompt: "test",
+				model: faux.getModel(),
+				thinkingLevel: "off",
+				tools: [
+					{
+						name: "large_result",
+						label: "Large result",
+						description: "Return a result",
+						parameters,
+						async execute() {
+							return { content: [{ type: "text" as const, text: "large" }], details: {} };
+						},
+					},
+				],
+			},
+			shouldStopBeforeModelRequest: () => ++guardCalls === 2,
+			streamFn: (model, context, options) => models.streamSimple(model, context, options),
+		});
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("large_result", {}, { id: "call-large" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("must not be requested"),
+		]);
+		await runtime.initialize();
+
+		await runtime.prompt("run the tool");
+
+		expect(faux.state.callCount).toBe(1);
+		const state = runtime.harness.runtimeEvents?.getState();
+		expect(state).toBeDefined();
+		expect(Object.values(state?.turns ?? {}).map((turn) => turn.status)).toEqual(["finished", "finished"]);
+		expect(Object.values(state?.operations ?? {}).map((operation) => operation.status)).toEqual(["finished"]);
+		expect(Object.values(state?.turns ?? {}).some((turn) => turn.status === "active")).toBe(false);
+		expect(Object.values(state?.operations ?? {}).some((operation) => operation.status === "active")).toBe(false);
 	});
 
 	it("dispatches message_end only after the message is persisted", async () => {

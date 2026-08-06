@@ -9,30 +9,80 @@ import { theme } from "../../modes/interactive/theme/theme.ts";
 import { getShellConfig, getShellEnv } from "../../utils/shell.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import { localProcessRuntime } from "../process-runtime.ts";
+import type { TaskEnvelopeCommandPolicy } from "../task-envelope.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
+import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult } from "./truncate.ts";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
+const BASH_MAX_OUTPUT_LINES = 200;
 
-function resolveTimeoutMs(timeout: number | undefined): number | undefined {
+function resolveOperationsTimeoutMs(timeout: number | undefined): number | undefined {
 	if (timeout === undefined) return undefined;
 	if (!Number.isFinite(timeout) || timeout <= 0) {
-		throw new Error("Invalid timeout: must be a finite number of seconds");
+		throw new Error("Invalid internal timeout: must be a finite number of seconds");
 	}
 
 	const timeoutMs = timeout * 1000;
 	if (timeoutMs > MAX_TIMEOUT_MS) {
-		throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
+		throw new Error(`Invalid internal timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
 	}
 	return timeoutMs;
 }
 
+function resolveRequestedTimeoutMs(timeoutMs: number | undefined): number | undefined {
+	if (timeoutMs === undefined) return undefined;
+	if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMEOUT_MS) {
+		throw new Error(`Invalid timeoutMs: must be a positive integer no greater than ${MAX_TIMEOUT_MS}`);
+	}
+	return timeoutMs;
+}
+
+function assertCommandPolicy(policy: Readonly<TaskEnvelopeCommandPolicy> | undefined): void {
+	if (!policy) return;
+	for (const [name, value, maximum] of [
+		["defaultTimeoutMs", policy.defaultTimeoutMs, MAX_TIMEOUT_MS],
+		["maxTimeoutMs", policy.maxTimeoutMs, MAX_TIMEOUT_MS],
+		["expectedHangMaxTimeoutMs", policy.expectedHangMaxTimeoutMs, 30_000],
+	] as const) {
+		if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0 || value > maximum)) {
+			throw new Error(`Invalid commandPolicy.${name}: must be a positive integer no greater than ${maximum}`);
+		}
+	}
+	if (
+		policy.defaultTimeoutMs !== undefined &&
+		policy.maxTimeoutMs !== undefined &&
+		policy.defaultTimeoutMs > policy.maxTimeoutMs
+	) {
+		throw new Error("Invalid commandPolicy.defaultTimeoutMs: must not exceed maxTimeoutMs");
+	}
+	if (
+		policy.expectedHangMaxTimeoutMs !== undefined &&
+		policy.maxTimeoutMs !== undefined &&
+		policy.expectedHangMaxTimeoutMs > policy.maxTimeoutMs
+	) {
+		throw new Error("Invalid commandPolicy.expectedHangMaxTimeoutMs: must not exceed maxTimeoutMs");
+	}
+}
+
+function parseBackendTimeoutMs(message: string): number | undefined {
+	const payload = message.slice("timeout:".length);
+	if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(payload)) return undefined;
+	const seconds = Number(payload);
+	const timeoutMs = seconds * 1000;
+	return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : undefined;
+}
+
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	timeoutMs: Type.Optional(
+		Type.Integer({ minimum: 1, maximum: MAX_TIMEOUT_MS, description: "Timeout in milliseconds (optional)" }),
+	),
+	expectedHang: Type.Optional(
+		Type.Boolean({ description: "Treat reaching an authorized task-envelope timeout as expected completion" }),
+	),
 });
 
 export type BashToolInput = Static<typeof bashSchema>;
@@ -40,6 +90,10 @@ export type BashToolInput = Static<typeof bashSchema>;
 export interface BashToolDetails {
 	truncation?: TruncationResult;
 	fullOutputPath?: string;
+	requestedTimeoutMs?: number;
+	effectiveTimeoutMs?: number;
+	expectedHang?: boolean;
+	completionReason?: "completed" | "expected-timeout";
 }
 
 /**
@@ -75,7 +129,7 @@ export interface BashOperations {
 export function createLocalBashOperations(options?: { shellPath?: string }): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
-			const timeoutMs = resolveTimeoutMs(timeout);
+			const timeoutMs = resolveOperationsTimeoutMs(timeout);
 			if (signal?.aborted) {
 				throw new Error("aborted");
 			}
@@ -128,6 +182,8 @@ export interface BashToolOptions {
 	shellPath?: string;
 	/** Hook to adjust command, cwd, or env before execution */
 	spawnHook?: BashSpawnHook;
+	/** Millisecond command limits supplied by a validated task envelope. */
+	commandPolicy?: Readonly<TaskEnvelopeCommandPolicy>;
 }
 
 const BASH_PREVIEW_LINES = 5;
@@ -157,10 +213,10 @@ function formatDuration(ms: number): string {
 	return `${(ms / 1000).toFixed(1)}s`;
 }
 
-function formatBashCall(args: { command?: string; timeout?: number } | undefined): string {
+function formatBashCall(args: { command?: string; timeoutMs?: number } | undefined): string {
 	const command = str(args?.command);
-	const timeout = args?.timeout as number | undefined;
-	const timeoutSuffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
+	const timeoutMs = args?.timeoutMs as number | undefined;
+	const timeoutSuffix = timeoutMs ? theme.fg("muted", ` (requested timeoutMs ${timeoutMs} ms)`) : "";
 	const commandDisplay = command === null ? invalidArgText(theme) : command ? command : theme.fg("toolOutput", "...");
 	return theme.fg("toolTitle", theme.bold(`$ ${commandDisplay}`)) + timeoutSuffix;
 }
@@ -240,6 +296,20 @@ function rebuildBashResultRenderComponent(
 		component.addChild(new Text(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`, 0, 0));
 	}
 
+	if (result.details?.effectiveTimeoutMs !== undefined) {
+		const requested =
+			result.details.requestedTimeoutMs === undefined
+				? ""
+				: `Requested timeoutMs: ${result.details.requestedTimeoutMs} ms; `;
+		component.addChild(
+			new Text(
+				`\n${theme.fg("muted", `[${requested}Effective timeoutMs: ${result.details.effectiveTimeoutMs} ms]`)}`,
+				0,
+				0,
+			),
+		);
+	}
+
 	if (startedAt !== undefined) {
 		const label = options.isPartial ? "Elapsed" : "Took";
 		const endTime = endedAt ?? Date.now();
@@ -251,25 +321,49 @@ export function createBashToolDefinition(
 	cwd: string,
 	options?: BashToolOptions,
 ): ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> {
+	assertCommandPolicy(options?.commandPolicy);
 	const ops = options?.operations ?? createLocalBashOperations({ shellPath: options?.shellPath });
 	const commandPrefix = options?.commandPrefix;
 	const spawnHook = options?.spawnHook;
+	const commandPolicy = options?.commandPolicy;
 	return {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${BASH_MAX_OUTPUT_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in milliseconds.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
+		promptGuidelines: [
+			"Use read for source contents and built-in grep, find, or ls when enabled; otherwise keep shell discovery to paths or line-number-only matches. Do not use shell rg/grep context flags or pipelines as a bulk file reader.",
+			"Keep shell discovery output bounded, then use read with exact non-overlapping ranges for the source content you need.",
+		],
 		parameters: bashSchema,
 		async execute(
 			_toolCallId,
-			{ command, timeout }: { command: string; timeout?: number },
+			{ command, timeoutMs, expectedHang }: { command: string; timeoutMs?: number; expectedHang?: boolean },
 			signal?: AbortSignal,
 			onUpdate?,
 			_ctx?,
 		) {
+			const requestedTimeoutMs = resolveRequestedTimeoutMs(timeoutMs);
+			const expectedHangMaxTimeoutMs = commandPolicy?.expectedHangMaxTimeoutMs;
+			if (expectedHang && expectedHangMaxTimeoutMs === undefined) {
+				throw new Error("expectedHang is not authorized by the task envelope command policy");
+			}
+			const policyTimeoutMs = requestedTimeoutMs ?? commandPolicy?.defaultTimeoutMs;
+			const effectiveTimeoutMs = expectedHang
+				? Math.min(
+						policyTimeoutMs ?? MAX_TIMEOUT_MS,
+						commandPolicy?.maxTimeoutMs ?? MAX_TIMEOUT_MS,
+						expectedHangMaxTimeoutMs ?? MAX_TIMEOUT_MS,
+						30_000,
+					)
+				: commandPolicy
+					? policyTimeoutMs === undefined
+						? undefined
+						: Math.min(policyTimeoutMs, commandPolicy.maxTimeoutMs ?? MAX_TIMEOUT_MS)
+					: requestedTimeoutMs;
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
-			const output = new OutputAccumulator({ tempFilePrefix: "pi-bash" });
+			const output = new OutputAccumulator({ maxLines: BASH_MAX_OUTPUT_LINES, tempFilePrefix: "pi-bash" });
 			let acceptingOutput = true;
 			let updateTimer: NodeJS.Timeout | undefined;
 			let updateDirty = false;
@@ -334,9 +428,17 @@ export function createBashToolDefinition(
 			const formatOutput = (snapshot: Awaited<ReturnType<typeof finishOutput>>, emptyText = "(no output)") => {
 				const truncation = snapshot.truncation;
 				let text = snapshot.content || emptyText;
-				let details: BashToolDetails | undefined;
+				let details: BashToolDetails | undefined =
+					requestedTimeoutMs !== undefined || effectiveTimeoutMs !== undefined
+						? {
+								requestedTimeoutMs,
+								effectiveTimeoutMs,
+								expectedHang: expectedHang || undefined,
+								completionReason: "completed",
+							}
+						: undefined;
 				if (truncation.truncated) {
-					details = { truncation, fullOutputPath: snapshot.fullOutputPath };
+					details = { ...details, truncation, fullOutputPath: snapshot.fullOutputPath };
 					const startLine = truncation.totalLines - truncation.outputLines + 1;
 					const endLine = truncation.totalLines;
 					if (truncation.lastLinePartial) {
@@ -359,19 +461,30 @@ export function createBashToolDefinition(
 					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
 						onData: handleData,
 						signal,
-						timeout,
+						timeout: effectiveTimeoutMs === undefined ? undefined : effectiveTimeoutMs / 1000,
 						env: spawnContext.env,
 					});
 					exitCode = result.exitCode;
 				} catch (err) {
 					const snapshot = await finishOutput();
 					const { text } = formatOutput(snapshot, "");
-					if (err instanceof Error && err.message === "aborted") {
+					if (signal?.aborted || (err instanceof Error && err.message === "aborted")) {
 						throw new Error(appendStatus(text, "Command aborted"));
 					}
 					if (err instanceof Error && err.message.startsWith("timeout:")) {
-						const timeoutSecs = err.message.split(":")[1];
-						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
+						if (expectedHang && commandPolicy) {
+							const { details } = formatOutput(snapshot, "");
+							return {
+								content: [
+									{ type: "text" as const, text: appendStatus(text, "Command reached its expected timeout") },
+								],
+								details: { ...details, completionReason: "expected-timeout" as const },
+							};
+						}
+						const reportedTimeoutMs = effectiveTimeoutMs ?? parseBackendTimeoutMs(err.message);
+						throw new Error(
+							appendStatus(text, `Command timed out after ${reportedTimeoutMs ?? "an unspecified timeout"} ms`),
+						);
 					}
 					throw err;
 				}

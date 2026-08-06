@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
@@ -14,6 +15,11 @@ import {
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.ts";
 import type { SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
+import {
+	assertValidatedTaskEnvelope,
+	authorizeTaskEnvelopeResourceLoader,
+	type ValidatedTaskEnvelope,
+} from "./task-envelope.ts";
 import type { WorkspaceOverlay } from "./workspace-overlay.ts";
 
 /**
@@ -43,6 +49,7 @@ export interface CreateAgentSessionServicesOptions {
 	extensionFlagValues?: Map<string, boolean | string>;
 	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
 	resourceLoaderReloadOptions?: ResourceLoaderReloadOptions;
+	taskEnvelope?: ValidatedTaskEnvelope;
 }
 
 /**
@@ -77,6 +84,7 @@ export interface AgentSessionServices {
 	modelRuntime: ModelRuntime;
 	settingsManager: SettingsManager;
 	resourceLoader: ResourceLoader;
+	taskEnvelope?: ValidatedTaskEnvelope;
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 }
 
@@ -136,7 +144,11 @@ function applyExtensionFlagValues(
 export async function createAgentSessionServices(
 	options: CreateAgentSessionServicesOptions,
 ): Promise<AgentSessionServices> {
+	if (options.taskEnvelope) assertValidatedTaskEnvelope(options.taskEnvelope);
 	const cwd = resolvePath(options.cwd);
+	if (options.taskEnvelope && (await realpath(cwd)) !== options.taskEnvelope.targetCwd) {
+		throw new Error("cwd must match taskEnvelope.targetCwd");
+	}
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getAgentDir();
 	const modelRuntime =
 		options.modelRuntime ??
@@ -147,10 +159,20 @@ export async function createAgentSessionServices(
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const resourceLoader = new DefaultResourceLoader({
 		...(options.resourceLoaderOptions ?? {}),
+		...(options.taskEnvelope
+			? {
+					taskEnvelopeIsolation: true,
+					noExtensions: true,
+					additionalExtensionPaths: [],
+					extensionFactories: [],
+					extensionsOverride: undefined,
+				}
+			: {}),
 		cwd,
 		agentDir,
 		settingsManager,
 	});
+	if (options.taskEnvelope) authorizeTaskEnvelopeResourceLoader(resourceLoader, options.taskEnvelope);
 	await resourceLoader.reload(options.resourceLoaderReloadOptions);
 
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
@@ -188,6 +210,7 @@ export async function createAgentSessionServices(
 		modelRuntime,
 		settingsManager,
 		resourceLoader,
+		taskEnvelope: options.taskEnvelope,
 		diagnostics,
 	};
 }
@@ -217,6 +240,7 @@ export async function createAgentSessionFromServices(
 		noTools: options.noTools,
 		customTools: options.customTools,
 		workspaceOverlay: options.workspaceOverlay,
+		taskEnvelope: options.services.taskEnvelope,
 		sessionStartEvent: options.sessionStartEvent,
 	});
 }

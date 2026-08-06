@@ -3,6 +3,7 @@ import type { Component, KeybindingsManager, TUI } from "@earendil-works/pi-tui"
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { execCommand } from "../../core/exec.ts";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../core/extensions/index.ts";
+import { ReviewablePatchStack } from "../../core/reviewable-patch-stack.ts";
 import {
 	WorkspaceOverlay,
 	type WorkspaceOverlayApplyResult,
@@ -15,6 +16,7 @@ import { stripAnsi } from "../../utils/ansi.ts";
 export const WORKSPACE_OVERLAY_FLAG = "workspace-overlay";
 const STATUS_KEY = "workspace-overlay";
 const overlayBySessionId = new Map<string, WorkspaceOverlay>();
+const patchStackBySessionId = new Map<string, ReviewablePatchStack>();
 
 export interface CliWorkspaceOverlayOpenResult {
 	overlay: WorkspaceOverlay;
@@ -83,6 +85,7 @@ function getOverlay(sessionId: string): WorkspaceOverlay | undefined {
 
 function unregisterOverlay(sessionId: string): void {
 	overlayBySessionId.delete(sessionId);
+	patchStackBySessionId.delete(sessionId);
 }
 
 async function initializeOverlayGit(overlay: WorkspaceOverlay): Promise<string | undefined> {
@@ -137,6 +140,22 @@ export async function openCliWorkspaceOverlay(options: {
 
 	const gitWarning = await initializeOverlayGit(opened.overlay);
 	overlayBySessionId.set(options.sessionId, opened.overlay);
+	const currentStack = patchStackBySessionId.get(options.sessionId);
+	const currentStackSnapshot = currentStack?.snapshot();
+	if (
+		!currentStackSnapshot ||
+		currentStackSnapshot.overlayId !== opened.overlay.getId() ||
+		currentStackSnapshot.baseSnapshotId !== opened.overlay.getBaseSnapshotId() ||
+		currentStackSnapshot.state !== "active"
+	) {
+		patchStackBySessionId.set(
+			options.sessionId,
+			new ReviewablePatchStack({
+				overlayId: opened.overlay.getId(),
+				baseSnapshotId: opened.overlay.getBaseSnapshotId(),
+			}),
+		);
+	}
 	return { ...opened, gitWarning };
 }
 
@@ -182,7 +201,7 @@ async function showReview(
 
 async function currentPatchSet(
 	ctx: ExtensionCommandContext,
-): Promise<{ overlay: WorkspaceOverlay; patchSet: WorkspacePatchSet } | undefined> {
+): Promise<{ overlay: WorkspaceOverlay; patchSet: WorkspacePatchSet; patchStack: ReviewablePatchStack } | undefined> {
 	const overlay = getOverlay(ctx.sessionManager.getSessionId());
 	if (!overlay) {
 		ctx.ui.notify(`Workspace overlay is not active. Start pi with --${WORKSPACE_OVERLAY_FLAG}.`, "warning");
@@ -192,7 +211,20 @@ async function currentPatchSet(
 		ctx.ui.notify(`Workspace overlay is ${overlay.getState()}`, "warning");
 		return undefined;
 	}
-	return { overlay, patchSet: await overlay.createPatchSet() };
+	const patchStack = patchStackBySessionId.get(ctx.sessionManager.getSessionId());
+	if (!patchStack) {
+		ctx.ui.notify("Workspace patch stack is unavailable for this overlay", "error");
+		return undefined;
+	}
+	const patchSet = await overlay.createPatchSet();
+	if (patchSet.entries.length > 0) {
+		const stack = patchStack.snapshot();
+		patchStack.capture(patchSet, {
+			title: `Overlay checkpoint ${stack.layers.length + 1}`,
+			summary: `${patchSet.entries.length} cumulative changed path(s)`,
+		});
+	}
+	return { overlay, patchSet, patchStack };
 }
 
 export default function workspaceOverlayExtension(pi: ExtensionAPI): void {
@@ -223,9 +255,22 @@ Built-in file, search, and bash tools run in a persistent workspace overlay. The
 		if (!overlay || overlay.getState() !== "active") return;
 		try {
 			const patchSet = await overlay.createPatchSet();
+			const patchStack = patchStackBySessionId.get(ctx.sessionManager.getSessionId());
+			if (patchStack && patchSet.entries.length > 0) {
+				const stack = patchStack.snapshot();
+				patchStack.capture(patchSet, {
+					title: `Agent checkpoint ${stack.layers.length + 1}`,
+					summary: `${patchSet.entries.length} cumulative changed path(s)`,
+				});
+			}
+			const stack = patchStack?.snapshot();
 			ctx.ui.setStatus(
 				STATUS_KEY,
-				patchSet.entries.length === 0 ? "overlay clean" : `overlay ${patchSet.entries.length} changed`,
+				patchSet.entries.length === 0
+					? "overlay clean"
+					: `overlay ${patchSet.entries.length} changed · stack ${
+							stack?.layers.filter((layer) => layer.status === "approved").length ?? 0
+						}/${stack?.layers.length ?? 0} reviewed`,
 			);
 		} catch {
 			ctx.ui.setStatus(STATUS_KEY, "overlay error");
@@ -272,20 +317,95 @@ Built-in file, search, and bash tools run in a persistent workspace overlay. The
 	pi.registerCommand("overlay", {
 		description: "Review, apply, discard, or inspect the transactional workspace overlay",
 		handler: async (args, ctx) => {
-			const action = args.trim() || "review";
+			const [action = "review", layerArgument] = args.trim().split(/\s+/, 2);
 			const current = await currentPatchSet(ctx);
 			if (!current) return;
-			const { overlay, patchSet } = current;
+			const { overlay, patchSet, patchStack } = current;
+			const stack = patchStack.snapshot();
 
 			if (action === "status") {
 				ctx.ui.notify(
-					`Workspace overlay ${overlay.getState()}: ${patchSet.entries.length} changed path(s); ${displayText(overlay.getWorkingDirectory())}`,
+					`Workspace overlay ${overlay.getState()}: ${patchSet.entries.length} changed path(s); patch stack ${stack.layers.filter((layer) => layer.status === "approved").length}/${stack.layers.length} reviewed; ${displayText(overlay.getWorkingDirectory())}`,
+					"info",
+				);
+				return;
+			}
+			if (action === "stack") {
+				ctx.ui.notify(
+					stack.layers.length === 0
+						? "Workspace patch stack has no checkpoints"
+						: stack.layers
+								.map(
+									(layer, index) =>
+										`${index + 1}. ${layer.status} ${layer.id} · ${displayText(layer.title)} · ${layer.patchSet.entries.length} path(s)`,
+								)
+								.join("\n"),
 					"info",
 				);
 				return;
 			}
 			if (action === "review") {
-				await showReview(patchSet, overlay, ctx);
+				const layer = layerArgument ? stack.layers.find((candidate) => candidate.id === layerArgument) : undefined;
+				if (layerArgument && !layer) {
+					ctx.ui.notify(`Unknown patch layer: ${displayText(layerArgument)}`, "warning");
+					return;
+				}
+				await showReview(layer?.patchSet ?? patchSet, overlay, ctx);
+				return;
+			}
+			if (action === "approve") {
+				const layer = layerArgument
+					? stack.layers.find((candidate) => candidate.id === layerArgument)
+					: [...stack.layers].reverse().find((candidate) => candidate.status === "pending");
+				if (layerArgument && !layer) {
+					ctx.ui.notify(`Unknown patch layer: ${displayText(layerArgument)}`, "warning");
+					return;
+				}
+				if (!layer) {
+					ctx.ui.notify("Workspace patch stack has no pending layer to approve", "warning");
+					return;
+				}
+				if (layer.status !== "pending") {
+					ctx.ui.notify(`Patch layer ${layer.id} is already ${layer.status}`, "warning");
+					return;
+				}
+				await showReview(layer.patchSet, overlay, ctx);
+				if (
+					!ctx.hasUI ||
+					!(await ctx.ui.confirm(
+						"Approve patch layer?",
+						`Approve ${displayText(layer.title)} with ${layer.patchSet.entries.length} cumulative path(s)?`,
+					))
+				) {
+					return;
+				}
+				patchStack.review(layer.id, "approved", patchStack.snapshot().revision);
+				ctx.ui.notify(`Approved patch layer ${layer.id}`, "info");
+				return;
+			}
+			if (action === "reject") {
+				const layer = layerArgument
+					? stack.layers.find((candidate) => candidate.id === layerArgument)
+					: [...stack.layers].reverse().find((candidate) => candidate.status === "pending");
+				if (layerArgument && !layer) {
+					ctx.ui.notify(`Unknown patch layer: ${displayText(layerArgument)}`, "warning");
+					return;
+				}
+				if (!layer) {
+					ctx.ui.notify("Workspace patch stack has no pending layer to reject", "warning");
+					return;
+				}
+				if (
+					!ctx.hasUI ||
+					!(await ctx.ui.confirm(
+						"Reject patch layer?",
+						`Reject ${displayText(layer.title)} and block stack application?`,
+					))
+				) {
+					return;
+				}
+				patchStack.review(layer.id, "rejected", patchStack.snapshot().revision);
+				ctx.ui.notify(`Rejected patch layer ${layer.id}; discard the overlay or revise the workflow`, "warning");
 				return;
 			}
 			if (action === "apply") {
@@ -306,7 +426,11 @@ Built-in file, search, and bash tools run in a persistent workspace overlay. The
 
 				let result: WorkspaceOverlayApplyResult;
 				try {
-					result = await overlay.applyPatchSet(patchSet);
+					patchStack.approveAll(
+						patchStack.snapshot().revision,
+						"Approved through final cumulative PatchSet review",
+					);
+					result = await patchStack.apply(overlay, patchStack.snapshot().revision);
 				} catch (error) {
 					ctx.ui.notify(
 						`Workspace overlay apply failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -318,6 +442,8 @@ Built-in file, search, and bash tools run in a persistent workspace overlay. The
 					pi.appendEntry("workspace-overlay-applied-v1", {
 						version: 1,
 						overlayId: overlay.getId(),
+						patchStackId: patchStack.snapshot().id,
+						patchStackRevision: patchStack.snapshot().revision,
 						patchSetId: result.patchSetId,
 						applyId: result.applyId,
 						appliedPaths: result.appliedPaths,
@@ -354,7 +480,10 @@ Built-in file, search, and bash tools run in a persistent workspace overlay. The
 				return;
 			}
 
-			ctx.ui.notify("Usage: /overlay [review|status|apply|discard]", "warning");
+			ctx.ui.notify(
+				"Usage: /overlay [review [layer-id]|stack|approve [layer-id]|reject [layer-id]|status|apply|discard]",
+				"warning",
+			);
 		},
 	});
 }

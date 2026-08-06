@@ -82,6 +82,7 @@ export {
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type ExecutionBoundary, filterBoundaryEnvironment, resolveExecutionBoundary } from "../execution-boundary.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
+import { assertValidatedTaskEnvelope, type ValidatedTaskEnvelope } from "../task-envelope.ts";
 import type { WorkspaceOverlay } from "../workspace-overlay.ts";
 import { type BashToolOptions, createBashTool, createBashToolDefinition } from "./bash.ts";
 import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.ts";
@@ -101,6 +102,8 @@ export interface ToolsOptions {
 	boundary?: ExecutionBoundary;
 	/** Run built-in tools against an explicit materialized workspace overlay. */
 	overlay?: WorkspaceOverlay;
+	/** Restrict built-in tools according to a validated task envelope. */
+	taskEnvelope?: ValidatedTaskEnvelope;
 	read?: ReadToolOptions;
 	bash?: BashToolOptions;
 	write?: WriteToolOptions;
@@ -140,11 +143,92 @@ function assertBoundaryOptionsAreNotOverridden(options: ToolsOptions, toolNames:
 	}
 }
 
+function assertTaskEnvelopeOptionsAreNotOverridden(options: ToolsOptions): void {
+	for (const toolName of allToolNames) {
+		if (options[toolName]?.operations) {
+			throw new Error(`Cannot override ${toolName}.operations when a task envelope is configured`);
+		}
+	}
+	for (const toolName of ["read", "edit", "write", "grep", "find", "ls"] as const) {
+		if (options[toolName]?.allowedRoots !== undefined) {
+			throw new Error(`Cannot override ${toolName}.allowedRoots when a task envelope is configured`);
+		}
+	}
+	if (options.bash?.spawnHook) {
+		throw new Error("Cannot override bash.spawnHook when a task envelope is configured");
+	}
+}
+
+function sameRootSet(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length && left.every((root) => right.includes(root));
+}
+
+function applyTaskEnvelopeScope(
+	options: ToolsOptions,
+	taskEnvelope: ValidatedTaskEnvelope | undefined,
+	toolNames: readonly ToolName[],
+): ToolsOptions {
+	if (!taskEnvelope) return options;
+	const resolved: ToolsOptions = { ...options, taskEnvelope: undefined };
+	const readableRoots = [...taskEnvelope.readableRoots];
+	const writableRoots = [...taskEnvelope.writableRoots];
+	if (toolNames.includes("read")) {
+		resolved.read = { ...options.read, allowedRoots: readableRoots, redactPathErrors: true };
+	}
+	if (toolNames.includes("grep")) {
+		resolved.grep = { ...options.grep, allowedRoots: readableRoots, redactPathErrors: true };
+	}
+	if (toolNames.includes("find")) {
+		resolved.find = { ...options.find, allowedRoots: readableRoots, redactPathErrors: true };
+	}
+	if (toolNames.includes("ls")) {
+		resolved.ls = { ...options.ls, allowedRoots: readableRoots, redactPathErrors: true };
+	}
+	if (toolNames.includes("edit")) {
+		resolved.edit = { ...options.edit, allowedRoots: writableRoots, redactPathErrors: true };
+	}
+	if (toolNames.includes("write")) {
+		resolved.write = { ...options.write, allowedRoots: writableRoots, redactPathErrors: true };
+	}
+	if (toolNames.includes("bash")) {
+		resolved.bash = { ...options.bash, commandPolicy: taskEnvelope.commandPolicy };
+	}
+	return resolved;
+}
+
+function applyTaskEnvelopeCommandPolicy(
+	options: ToolsOptions,
+	taskEnvelope: ValidatedTaskEnvelope,
+	toolNames: readonly ToolName[],
+): ToolsOptions {
+	const resolved: ToolsOptions = { ...options, taskEnvelope: undefined };
+	if (toolNames.includes("read")) resolved.read = { ...options.read, redactPathErrors: true };
+	if (toolNames.includes("grep")) resolved.grep = { ...options.grep, redactPathErrors: true };
+	if (toolNames.includes("find")) resolved.find = { ...options.find, redactPathErrors: true };
+	if (toolNames.includes("ls")) resolved.ls = { ...options.ls, redactPathErrors: true };
+	if (toolNames.includes("edit")) resolved.edit = { ...options.edit, redactPathErrors: true };
+	if (toolNames.includes("write")) resolved.write = { ...options.write, redactPathErrors: true };
+	if (toolNames.includes("bash")) {
+		resolved.bash = { ...options.bash, commandPolicy: taskEnvelope.commandPolicy };
+	}
+	return resolved;
+}
+
 function resolveToolsContext(
 	cwd: string,
 	options: ToolsOptions | undefined,
 	toolNames: readonly ToolName[],
 ): { cwd: string; options: ToolsOptions | undefined } {
+	if (options?.taskEnvelope) {
+		assertValidatedTaskEnvelope(options.taskEnvelope);
+		if (cwd !== options.taskEnvelope.targetCwd) {
+			throw new Error("cwd must exactly match taskEnvelope.targetCwd");
+		}
+		if (options.overlay) {
+			throw new Error("taskEnvelope cannot be combined with workspace overlay");
+		}
+		assertTaskEnvelopeOptionsAreNotOverridden(options);
+	}
 	if (options?.boundary && options.overlay) {
 		throw new Error("executionBoundary and workspace overlay cannot be configured together");
 	}
@@ -170,11 +254,23 @@ function resolveToolsContext(
 		if (toolNames.includes("ls")) {
 			resolved.ls = { ...options.ls, allowedRoots: [workingDirectory] };
 		}
-		return { cwd: workingDirectory, options: resolved };
+		return { cwd: workingDirectory, options: applyTaskEnvelopeScope(resolved, options.taskEnvelope, toolNames) };
 	}
-	if (!options?.boundary) return { cwd, options };
+	if (!options?.boundary) {
+		return options
+			? { cwd, options: applyTaskEnvelopeScope(options, options.taskEnvelope, toolNames) }
+			: { cwd, options };
+	}
 	assertBoundaryOptionsAreNotOverridden(options, toolNames);
 	const boundary = resolveExecutionBoundary(options.boundary, toolNames);
+	if (
+		options.taskEnvelope &&
+		(boundary.cwd !== options.taskEnvelope.targetCwd ||
+			!sameRootSet(boundary.readableRoots, options.taskEnvelope.readableRoots) ||
+			!sameRootSet(boundary.writableRoots, options.taskEnvelope.writableRoots))
+	) {
+		throw new Error("executionBoundary filesystem scope must exactly match taskEnvelope authorization");
+	}
 	const resolved: ToolsOptions = { ...options, boundary: undefined };
 
 	if (toolNames.includes("read")) {
@@ -230,7 +326,12 @@ function resolveToolsContext(
 		};
 	}
 
-	return { cwd: boundary.cwd, options: resolved };
+	return {
+		cwd: boundary.cwd,
+		options: options.taskEnvelope
+			? applyTaskEnvelopeCommandPolicy(resolved, options.taskEnvelope, toolNames)
+			: resolved,
+	};
 }
 
 export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {

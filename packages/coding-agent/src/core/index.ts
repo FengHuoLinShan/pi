@@ -89,5 +89,6 @@ export * from "./harness-recovery-report.ts";
 export * from "./process-session-verifier.ts";
 export * from "./shadow-runs.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";
+export * from "./task-envelope.ts";
 export * from "./workspace-change-discipline-verifier.ts";
 export * from "./workspace-overlay.ts";

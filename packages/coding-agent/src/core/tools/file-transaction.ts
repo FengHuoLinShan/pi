@@ -14,6 +14,39 @@ export interface FilePathOperations {
 export interface FilePathPolicy {
 	/** Optional roots that the tool may access. Paths are resolved relative to the tool cwd. */
 	allowedRoots?: string[];
+	/** Replace path-bearing errors with stable restricted-mode diagnostics. Default: false. */
+	redactPathErrors?: boolean;
+}
+
+export type RestrictedFileErrorCode =
+	| "FILE_PATH_DENIED"
+	| "FILE_PATH_CHANGED"
+	| "FILE_REVISION_INVALID"
+	| "FILE_REVISION_CONFLICT"
+	| "FILE_OPERATION_FAILED";
+
+class RestrictedFileError extends Error {
+	readonly code: RestrictedFileErrorCode;
+
+	constructor(code: RestrictedFileErrorCode, message: string) {
+		super(`${code}: ${message}`);
+		this.code = code;
+	}
+}
+
+const restrictedFileErrorMessages: Record<RestrictedFileErrorCode, string> = {
+	FILE_PATH_DENIED: "File path access was denied. Use a path within the authorized workspace.",
+	FILE_PATH_CHANGED: "File path authorization changed during the operation. Re-read the target and retry.",
+	FILE_REVISION_INVALID: "Expected revision is invalid. Re-read the target and use the returned revision.",
+	FILE_REVISION_CONFLICT: "File revision changed. Re-read the target and retry with the returned revision.",
+	FILE_OPERATION_FAILED: "File operation failed. Verify the path is authorized, re-read the target, and retry.",
+};
+
+export function redactFileError(error: unknown, redactPathErrors: boolean, code: RestrictedFileErrorCode): Error {
+	const normalized = error instanceof Error ? error : new Error(String(error));
+	if (!redactPathErrors || normalized.message === "Operation aborted") return normalized;
+	if (normalized instanceof RestrictedFileError) return normalized;
+	return new RestrictedFileError(code, restrictedFileErrorMessages[code]);
 }
 
 export interface FilePathSnapshot {
@@ -82,29 +115,34 @@ export async function captureFilePathSnapshot(
 	allowedRoots: string[] | undefined,
 	realpathOperation: FilePathOperations["realpath"],
 	canonicalizeTarget: boolean,
+	redactPathErrors = false,
 ): Promise<FilePathSnapshot> {
-	if (!realpathOperation) {
-		if (allowedRoots !== undefined) {
-			if (allowedRoots.length === 0) {
-				assertAllowedPath(displayPath, absolutePath, [], true);
+	try {
+		if (!realpathOperation) {
+			if (allowedRoots !== undefined) {
+				if (allowedRoots.length === 0) {
+					assertAllowedPath(displayPath, absolutePath, [], true);
+				}
+				throw new Error(
+					`File path policy for ${displayPath} requires operations.realpath so symlink boundaries can be verified.`,
+				);
 			}
-			throw new Error(
-				`File path policy for ${displayPath} requires operations.realpath so symlink boundaries can be verified.`,
-			);
+			return { requestedPath: absolutePath, targetPath: absolutePath, canonicalRoots: [] };
 		}
-		return { requestedPath: absolutePath, targetPath: absolutePath, canonicalRoots: [] };
-	}
 
-	const canonicalRoots = await Promise.all(
-		(allowedRoots ?? []).map((root) => canonicalizeExistingOrPlannedPath(root, realpathOperation)),
-	);
-	const canonicalTarget = await canonicalizeExistingOrPlannedPath(absolutePath, realpathOperation);
-	assertAllowedPath(displayPath, canonicalTarget, canonicalRoots, allowedRoots !== undefined);
-	return {
-		requestedPath: absolutePath,
-		targetPath: canonicalizeTarget ? canonicalTarget : absolutePath,
-		canonicalRoots,
-	};
+		const canonicalRoots = await Promise.all(
+			(allowedRoots ?? []).map((root) => canonicalizeExistingOrPlannedPath(root, realpathOperation)),
+		);
+		const canonicalTarget = await canonicalizeExistingOrPlannedPath(absolutePath, realpathOperation);
+		assertAllowedPath(displayPath, canonicalTarget, canonicalRoots, allowedRoots !== undefined);
+		return {
+			requestedPath: absolutePath,
+			targetPath: canonicalizeTarget ? canonicalTarget : absolutePath,
+			canonicalRoots,
+		};
+	} catch (error) {
+		throw redactFileError(error, redactPathErrors, "FILE_PATH_DENIED");
+	}
 }
 
 export async function revalidateFilePathSnapshot(
@@ -112,23 +150,28 @@ export async function revalidateFilePathSnapshot(
 	displayPath: string,
 	allowedRoots: string[] | undefined,
 	realpathOperation: FilePathOperations["realpath"],
+	redactPathErrors = false,
 ): Promise<void> {
-	if (!realpathOperation) return;
-	const currentRoots = await Promise.all(
-		(allowedRoots ?? []).map((root) => canonicalizeExistingOrPlannedPath(root, realpathOperation)),
-	);
-	if (
-		currentRoots.length !== snapshot.canonicalRoots.length ||
-		currentRoots.some((root, index) => root !== snapshot.canonicalRoots[index])
-	) {
-		throw new Error(`File path policy changed while operating on ${displayPath}. Re-run the operation.`);
-	}
-	const currentTarget = await canonicalizeExistingOrPlannedPath(snapshot.requestedPath, realpathOperation);
-	assertAllowedPath(displayPath, currentTarget, currentRoots, allowedRoots !== undefined);
-	if (currentTarget !== snapshot.targetPath) {
-		throw new Error(
-			`File path changed while operating on ${displayPath}: expected ${snapshot.targetPath}, found ${currentTarget}. Re-read the file and retry.`,
+	try {
+		if (!realpathOperation) return;
+		const currentRoots = await Promise.all(
+			(allowedRoots ?? []).map((root) => canonicalizeExistingOrPlannedPath(root, realpathOperation)),
 		);
+		if (
+			currentRoots.length !== snapshot.canonicalRoots.length ||
+			currentRoots.some((root, index) => root !== snapshot.canonicalRoots[index])
+		) {
+			throw new Error(`File path policy changed while operating on ${displayPath}. Re-run the operation.`);
+		}
+		const currentTarget = await canonicalizeExistingOrPlannedPath(snapshot.requestedPath, realpathOperation);
+		assertAllowedPath(displayPath, currentTarget, currentRoots, allowedRoots !== undefined);
+		if (currentTarget !== snapshot.targetPath) {
+			throw new Error(
+				`File path changed while operating on ${displayPath}: expected ${snapshot.targetPath}, found ${currentTarget}. Re-read the file and retry.`,
+			);
+		}
+	} catch (error) {
+		throw redactFileError(error, redactPathErrors, "FILE_PATH_CHANGED");
 	}
 }
 
@@ -136,16 +179,25 @@ export function assertExpectedRevision(
 	displayPath: string,
 	expectedRevision: string | undefined,
 	actualRevision: FileRevisionState,
+	redactPathErrors = false,
 ): void {
 	if (expectedRevision === undefined) return;
 	if (expectedRevision !== "missing" && !/^sha256:[0-9a-f]{64}$/.test(expectedRevision)) {
-		throw new Error(
-			`Invalid expected revision for ${displayPath}: use "missing" or copy the complete sha256:<64 lowercase hex> token, including the "sha256:" prefix, returned by read, edit, or write.`,
+		throw redactFileError(
+			new Error(
+				`Invalid expected revision for ${displayPath}: use "missing" or copy the complete sha256:<64 lowercase hex> token, including the "sha256:" prefix, returned by read, edit, or write.`,
+			),
+			redactPathErrors,
+			"FILE_REVISION_INVALID",
 		);
 	}
 	if (expectedRevision === actualRevision) return;
-	throw new Error(
-		`File revision conflict for ${displayPath}: expected ${expectedRevision}, found ${actualRevision}. Re-read the file and retry.`,
+	throw redactFileError(
+		new Error(
+			`File revision conflict for ${displayPath}: expected ${expectedRevision}, found ${actualRevision}. Re-read the file and retry.`,
+		),
+		redactPathErrors,
+		"FILE_REVISION_CONFLICT",
 	);
 }
 

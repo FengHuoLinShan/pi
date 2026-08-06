@@ -10,6 +10,7 @@ import {
 	type ExecutionBoundary,
 } from "../src/core/execution-boundary.ts";
 import {
+	NodeProcessSessionBackend,
 	type ProcessBackendCallbacks,
 	type ProcessBackendHandle,
 	type ProcessBackendStartRequest,
@@ -83,7 +84,65 @@ class FakeProcessBackend implements ProcessSessionBackend {
 	}
 }
 
+class EagerOutputBackend extends FakeProcessBackend {
+	acknowledgedDuringStart: boolean | undefined;
+	outputAcknowledgment: Promise<void> | undefined;
+
+	override async start(
+		request: ProcessBackendStartRequest,
+		callbacks: ProcessBackendCallbacks,
+	): Promise<ProcessBackendHandle> {
+		const handle = await super.start(request, callbacks);
+		let acknowledged = false;
+		this.outputAcknowledgment = Promise.resolve(callbacks.onOutput("stdout", Buffer.from("eager"), 1)).then(() => {
+			acknowledged = true;
+		});
+		await Promise.resolve();
+		this.acknowledgedDuringStart = acknowledged;
+		return handle;
+	}
+}
+
 describe("ProcessSessionManager", () => {
+	it("does not acknowledge eager backend output before persisting process start", async () => {
+		const directory = await createTempDirectory();
+		const artifactStore = await createArtifactStore(directory);
+		const backend = new EagerOutputBackend();
+		const { manager } = await ProcessSessionManager.open({
+			root: join(directory, "processes"),
+			allowedRoots: [directory],
+			artifactStore,
+			backend,
+		});
+
+		const started = await manager.start({ command: "fake" });
+		await backend.outputAcknowledgment;
+		await manager.flush();
+
+		expect(backend.acknowledgedDuringStart).toBe(false);
+		expect(started.backendHandle?.cursor).toBe(1);
+		expect((await manager.readOutput(started.id)).toString()).toBe("eager");
+	});
+
+	it("treats termination of an owned process that already exited as successful cleanup", async () => {
+		const backend = new NodeProcessSessionBackend();
+		let resolveExit: (() => void) | undefined;
+		const exited = new Promise<void>((resolvePromise) => {
+			resolveExit = resolvePromise;
+		});
+		const handle = await backend.start(
+			{ command: process.execPath, args: ["-e", ""], cwd: process.cwd(), env: process.env },
+			{
+				onOutput: () => {},
+				onExit: () => resolveExit?.(),
+			},
+		);
+
+		await exited;
+
+		await expect(backend.terminate(handle)).resolves.toBeUndefined();
+	});
+
 	it("persists local process output as artifact references and records exit", async () => {
 		const directory = await createTempDirectory();
 		const artifactStore = await createArtifactStore(directory);
